@@ -521,20 +521,23 @@ class ServerState:
         """Capture the current streaming state of all modules.
         Uses flattening to produce a state dict that can be restored in-place
         to preserve CUDA graph memory addresses.
+
+        The infer lock is released before the deep clone so the GPU thread
+        can resume audio frames while the copy runs. A held lock during the
+        full clone backs up the inbound PCM queue and drops audio.
         """
         from .modules.streaming import _flatten_streaming_state
         with self._infer_lock:
-            # get_streaming_state returns {module_name: dataclass_instance}
             state = self.lm_gen.get_streaming_state()
-            state_dict = {}
-            metadata = {}
-            # Flatten into a dict of tensors and metadata
+            state_dict: dict = {}
+            metadata: dict = {}
             _flatten_streaming_state(state_dict, metadata, state, prefix="")
-            
-            # Deep copy the tensors so the snapshot is immutable
-            snapshot = {k: v.detach().clone() for k, v in state_dict.items()}
-            snapshot.update(metadata)
-            return snapshot
+            # Detach inside the lock (no copy); clone outside so the GPU
+            # thread can resume audio frames while the deep copy runs.
+            detached = {k: v.detach() for k, v in state_dict.items()}
+        snapshot = {k: v.clone() for k, v in detached.items()}
+        snapshot.update(metadata)
+        return snapshot
 
     async def handle_vision_frame(
         self,
@@ -592,22 +595,13 @@ class ServerState:
                 "data": base64_data
             })
 
+            # generation_config knobs accepted by /v1beta/interactions are minimal; the thinking budget defaults are applied.
             payload = {
-                # Flash 3.5 has stronger vision than Flash-Lite (better on
-                # small HUD text, distant objects, multi-element scenes).
-                # The latency premium people quote comes from thinking-on
-                # defaults; with thinking pinned to minimal we get sub-1 s
-                # TTFT and the better vision quality.
                 "model": "gemini-3.5-flash",
                 "input": input_parts,
                 "generation_config": {
                     "max_output_tokens": 50,
-                    # Thinking-on Gemini 3.x has multi-second TTFT (Puter
-                    # measured 11 s on Gemini 3.5 Flash with medium). One
-                    # sentence of scene description does not need
-                    # reasoning depth, so we pin to minimal.
-                    "thinking": {"thinking_level": "minimal"}
-                }
+                },
             }
             if prev_id:
                 payload["previous_interaction_id"] = prev_id
@@ -1170,20 +1164,27 @@ class ServerState:
                     snapshots = self._session_snapshots.get(session_id, [])
                     if not snapshots:
                         clog.log("warning", "rewind requested but no snapshots available")
+                        try:
+                            session.send_notice("Rewind: no snapshot yet (wait a few seconds)")
+                        except Exception:
+                            pass
                         return
-                    _, state_dict = snapshots[-1]
-                    clog.log("info", "rewinding to latest snapshot (inplace)")
+                    snap_ts, state_dict = snapshots[-1]
+                    age_sec = max(0.0, time.monotonic() - snap_ts)
+                    clog.log("info", f"rewinding to snapshot from {age_sec:.0f} s ago")
 
                     def _do_rewind():
                         with self._infer_lock:
-                            # set_streaming_state_inplace consumes the
-                            # dict it's given. Pass a shallow copy so the
-                            # snapshot stays reusable on the next rewind.
-                            self.lm_gen.set_streaming_state_inplace(
-                                dict(state_dict)
-                            )
+                            # set_streaming_state_inplace consumes the dict it's given.
+                            # Pass a shallow copy so the snapshot stays reusable on the
+                            # next rewind.
+                            self.lm_gen.set_streaming_state_inplace(dict(state_dict))
 
                     await loop.run_in_executor(None, _do_rewind)
+                    try:
+                        session.send_notice(f"Rewound to snapshot from {age_sec:.0f} s ago")
+                    except Exception:
+                        pass
                 elif mtype == "vision_frame":
                     base64_data = msg.get("data", "")
                     if base64_data:
@@ -1285,6 +1286,21 @@ class ServerState:
             if not session.is_alive():
                 clog.log("info", "client disconnected during warmup")
                 return
+
+            # Capture a baseline snapshot before the user can interact, so the
+            # Rewind button always has something to restore even in the first
+            # 30 s of the session (snapshot_task otherwise only fires at +30 s).
+            try:
+                baseline = await loop.run_in_executor(None, self._take_snapshot)
+                self._session_snapshots.setdefault(session_id, []).append(
+                    (time.monotonic(), baseline)
+                )
+                clog.log("info", "baseline snapshot captured")
+            except Exception as exc:
+                clog.log(
+                    "warning",
+                    f"baseline snapshot failed: {type(exc).__name__}: {exc}",
+                )
 
             session.send_ready()
             # Tell the client whether the vision pipeline is reachable so
@@ -3389,8 +3405,9 @@ def main():
         function sendRewind() {
             if (controlChannel && controlChannel.readyState === 'open') {
                 controlChannel.send(JSON.stringify({ type: 'rewind' }));
-                const originalText = transcript.textContent;
-                transcript.textContent = "[Rewinding to last stable state...]\\n" + originalText;
+                // Outcome arrives as a notice toast (success or "no snapshot
+                // yet"). No optimistic transcript scribble; it lied when the
+                // rewind didn't actually fire.
             }
         }
 
