@@ -96,7 +96,7 @@ fi
 # The repo is license-gated, so the HF_TOKEN must be passed in explicitly;
 # without it the download 401s and the server stalls on the first request.
 log "pre-fetching personaplex model weights (~7GB)..."
-uv run --frozen python -c "import os; from huggingface_hub import snapshot_download; snapshot_download('nvidia/personaplex-7b-v1', token=os.environ.get('HF_TOKEN'))"
+HF_HUB_DISABLE_PROGRESS_BARS=1 uv run --frozen python -c "import os; from huggingface_hub import snapshot_download; snapshot_download('nvidia/personaplex-7b-v1', token=os.environ.get('HF_TOKEN'))"
 
 if [ -z "${GEMINI_API_KEY:-}" ]; then
     log "WARN: GEMINI_API_KEY is not set. Vision features will be disabled."

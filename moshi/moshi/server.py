@@ -27,6 +27,7 @@
 import argparse
 import asyncio
 from collections import deque
+import datetime
 import json
 import random
 import os
@@ -776,9 +777,11 @@ class ServerState:
             # Refresh halfway through the TTL so we never serve creds that
             # are about to expire mid-session.
             self._ice_cache_expires_at = now + ttl_seconds / 2
+            refresh_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=ttl_seconds // 2)
             logger.info(
-                f"Cloudflare TURN creds minted (ttl={ttl_seconds}s, "
-                f"refresh at +{ttl_seconds // 2}s)"
+                "Cloudflare TURN creds minted (ttl=%ds, refresh at %s)",
+                ttl_seconds,
+                refresh_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
             )
             return servers, False
 
@@ -1460,6 +1463,12 @@ def main():
         f"Static path does not exist: {static_path}."
     logger.info(f"static_path = {static_path}")
     args.device = torch_auto_device(args.device)
+    logger.info(
+        "torch=%s cuda_available=%s device=%s",
+        torch.__version__,
+        torch.cuda.is_available(),
+        torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+    )
 
     seed_all(42424242)
 
@@ -1497,8 +1506,9 @@ def main():
     logger.info("loading mimi")
     if args.mimi_weight is None:
         args.mimi_weight = hf_hub_download(args.hf_repo, loaders.MIMI_NAME, token=hf_token)
+    t = time.monotonic()
     mimi = loaders.get_mimi(args.mimi_weight, args.device)
-    logger.info("mimi loaded")
+    logger.info("mimi loaded in %.1f s", time.monotonic() - t)
 
     if args.tokenizer is None:
         args.tokenizer = hf_hub_download(args.hf_repo, loaders.TEXT_TOKENIZER_NAME, token=hf_token)
@@ -1507,9 +1517,10 @@ def main():
     logger.info("loading moshi")
     if args.moshi_weight is None:
         args.moshi_weight = hf_hub_download(args.hf_repo, loaders.MOSHI_NAME, token=hf_token)
+    t = time.monotonic()
     lm = loaders.get_moshi_lm(args.moshi_weight, device=args.device, cpu_offload=args.cpu_offload)
     lm.eval()
-    logger.info("moshi loaded")
+    logger.info("moshi loaded in %.1f s", time.monotonic() - t)
     # Surface the inner-monologue yield token so a mismatch with the
     # checkpoint's actual padding semantics is obvious at boot. If
     # padding_bonus silently does nothing, it's usually because this piece is
@@ -1538,7 +1549,13 @@ def main():
         save_voice_prompt_embeddings=False
     )
     logger.info("warming up the model")
+    t = time.monotonic()
     state.warmup()
+    logger.info("warmup complete in %.1f s", time.monotonic() - t)
+    logger.info(
+        "vision: %s",
+        "enabled" if state._gemini_api_key else "disabled (no GEMINI_API_KEY)",
+    )
 
     # Pre-warm Cloudflare TURN credentials so the very first session
     # after boot does not pay the credential mint round-trip. The
