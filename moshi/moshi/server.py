@@ -145,6 +145,16 @@ PAD_STREAK_REREQUEST_EVERY = 62
 COLLAPSE_TRIGGER_THRESHOLD = 3
 COLLAPSE_WINDOW_SEC = 30.0
 
+# Cooldown between auto-rewinds. Without this, a wobbling model state
+# can re-trigger pad-force right after a restore (the snapshotted state
+# is itself the wobbling state) and produce a rewind storm.
+AUTO_REWIND_MIN_INTERVAL_SEC = 60.0
+
+# If Gemini returns N consecutive non-2xx responses, auto-disable vision
+# for the rest of the session and tell the client. Stops the server from
+# silently retrying a broken schema for the full session lifetime.
+VISION_AUTO_DISABLE_THRESHOLD = 3
+
 
 class ServerState:
     """Per-process state: models, locks, vision pipeline, session bookkeeping.
@@ -247,6 +257,20 @@ class ServerState:
         # pad streak will set it again). If we ever move to no-GIL
         # Python, swap for threading.Event for explicit memory ordering.
         self._vision_request_pending: bool = False
+        # Inject-window edge detection: track transitions so we can
+        # notify the client ("Injecting context...") and log on open/close.
+        self._inject_active: bool = False
+        # Auto-rewind cooldown bookkeeping. Updated on a successful
+        # rewind; checked before the next would fire.
+        self._last_rewind_at: float = 0.0
+        # Gemini consecutive-error counter for the auto-disable path.
+        # Reset on every 2xx success and on session start.
+        self._gemini_consecutive_errors: int = 0
+        self._vision_force_disabled: bool = False
+        # Per-session toggle: when set by cfg.vision_in_transcript the
+        # server echoes each Gemini description into the main transcript
+        # with a [vision] prefix for debugging context-injection.
+        self._vision_in_transcript: bool = False
         # Live sessions awaiting trickled candidates. Keyed by the
         # opaque session_id returned in the offer response. Entries are
         # cleared in _run_rtc_session's finally block.
@@ -466,42 +490,87 @@ class ServerState:
                     self._collapse_triggers.popleft()
                 self._collapse_triggers.append(now)
                 if len(self._collapse_triggers) >= COLLAPSE_TRIGGER_THRESHOLD:
-                    sid = self._active_session_id
-                    snapshots = self._session_snapshots.get(sid, []) if sid else []
-                    if snapshots:
-                        _, state_dict = snapshots[-1]
-                        # set_streaming_state_inplace pops entries from
-                        # the dict it's given. Pass a fresh shallow copy
-                        # so subsequent rewinds still find the keys.
-                        self.lm_gen.set_streaming_state_inplace(
-                            dict(state_dict)
-                        )
+                    # Cooldown: the snapshotted state itself is often the
+                    # wobbling state, so back-to-back rewinds would storm.
+                    cooldown_left = AUTO_REWIND_MIN_INTERVAL_SEC - (now - self._last_rewind_at)
+                    if cooldown_left > 0:
                         logger.warning(
-                            "auto-rewind: %d pad-force triggers in %.0fs, "
-                            "restored latest snapshot",
-                            len(self._collapse_triggers),
-                            COLLAPSE_WINDOW_SEC,
+                            "auto-rewind suppressed by cooldown (%.0f s remaining)",
+                            cooldown_left,
                         )
                         self._collapse_triggers.clear()
-                        sess = self._active_session
-                        loop = self._main_loop
-                        if sess is not None and loop is not None:
-                            # DataChannel sends touch the asyncio loop's
-                            # SCTP transport; aiortc is not thread-safe.
-                            # Schedule the send back on the loop thread.
-                            try:
-                                loop.call_soon_threadsafe(
-                                    sess.send_notice,
-                                    "Auto-rewind: model wobbled, "
-                                    "restored recent snapshot",
-                                )
-                            except Exception as exc:
-                                logger.warning(
-                                    "auto-rewind notice scheduling failed: %s: %s",
-                                    type(exc).__name__,
-                                    exc,
-                                )
+                    else:
+                        sid = self._active_session_id
+                        snapshots = self._session_snapshots.get(sid, []) if sid else []
+                        if snapshots:
+                            _, state_dict = snapshots[-1]
+                            # set_streaming_state_inplace pops entries from
+                            # the dict it's given. Pass a fresh shallow copy
+                            # so subsequent rewinds still find the keys.
+                            self.lm_gen.set_streaming_state_inplace(
+                                dict(state_dict)
+                            )
+                            # Clear the safety-net state too. Otherwise
+                            # _pad_force_remaining (12 frames of forced pad)
+                            # carries over and the rewound state immediately
+                            # re-triggers the streak.
+                            self.lm_gen._pad_force_remaining = 0
+                            self.lm_gen._non_pad_streak = 0
+                            self._last_rewind_at = now
+                            logger.warning(
+                                "auto-rewind: %d pad-force triggers in %.0fs, "
+                                "restored latest snapshot",
+                                len(self._collapse_triggers),
+                                COLLAPSE_WINDOW_SEC,
+                            )
+                            self._collapse_triggers.clear()
+                            sess = self._active_session
+                            loop = self._main_loop
+                            if sess is not None and loop is not None:
+                                # DataChannel sends touch the asyncio loop's
+                                # SCTP transport; aiortc is not thread-safe.
+                                # Schedule the send back on the loop thread.
+                                try:
+                                    loop.call_soon_threadsafe(
+                                        sess.send_notice,
+                                        "Auto-rewind: model wobbled, "
+                                        "restored recent snapshot",
+                                    )
+                                except Exception as exc:
+                                    logger.warning(
+                                        "auto-rewind notice scheduling failed: %s: %s",
+                                        type(exc).__name__,
+                                        exc,
+                                    )
             self._prev_pad_force_remaining = pad_force
+
+            # --- inject window edge detection ------------------------
+            # Surface inject-window open/close so the client can label
+            # the brief audio gating ("Injecting context...") and so the
+            # server log records what the user is hearing.
+            now_inject_active = self._vision_inject_steps > 0
+            if now_inject_active != self._inject_active:
+                self._inject_active = now_inject_active
+                if now_inject_active:
+                    logger.info(
+                        "vision inject window opened (%d tokens queued)",
+                        len(self._vision_pending),
+                    )
+                else:
+                    logger.info("vision inject window closed")
+                sess = self._active_session
+                loop = self._main_loop
+                if sess is not None and loop is not None:
+                    try:
+                        loop.call_soon_threadsafe(
+                            sess.send_inject_status, now_inject_active
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "send_inject_status scheduling failed: %s: %s",
+                            type(exc).__name__,
+                            exc,
+                        )
 
             # --- server-driven vision cadence ------------------------
             # When the model just entered a pad streak (silence), ask the
@@ -559,6 +628,11 @@ class ServerState:
         """
         if not self._gemini_api_key:
             return
+        # Auto-disable kicks in after VISION_AUTO_DISABLE_THRESHOLD
+        # consecutive non-2xx responses (handled below). Once tripped,
+        # short-circuit until the next session starts.
+        if self._vision_force_disabled:
+            return
 
         # In-flight guard to prevent overlapping calls from corrupting the chain
         if session_id in self._vision_in_flight:
@@ -600,12 +674,19 @@ class ServerState:
                 "data": base64_data
             })
 
-            # generation_config knobs accepted by /v1beta/interactions are minimal; the thinking budget defaults are applied.
             payload = {
                 "model": "gemini-3.5-flash",
                 "input": input_parts,
                 "generation_config": {
                     "max_output_tokens": 50,
+                    # Gemini 3.5 Flash defaults to medium thinking which
+                    # adds 1-3 s TTFT. `thinking_level` lives directly
+                    # in generation_config (NOT nested under a `thinking`
+                    # object; that was the earlier 400 with "Unknown
+                    # parameter 'thinking'"). If this also 400s the
+                    # consecutive-error counter below will auto-disable
+                    # vision and surface the error to the client.
+                    "thinking_level": "minimal",
                 },
             }
             if prev_id:
@@ -614,6 +695,7 @@ class ServerState:
             headers = {"Api-Revision": "2026-05-20"}
             async with self._http_session.post(url, json=payload, headers=headers) as resp:
                 if resp.status == 200:
+                    self._gemini_consecutive_errors = 0
                     data = await resp.json()
                     new_id = data.get("id")
                     if new_id:
@@ -661,6 +743,12 @@ class ServerState:
                             sess = self._active_session
                             if sess is not None:
                                 sess.send_vision_caption(text)
+                                # Optional: echo the description into the
+                                # main transcript with a [vision] prefix
+                                # so the user can see what context the
+                                # model is getting fed.
+                                if self._vision_in_transcript:
+                                    sess.send_text(f" [vision] {text} ")
                         except Exception as exc:
                             clog.log(
                                 "warning",
@@ -703,6 +791,22 @@ class ServerState:
                     err_text = await resp.text()
                     clog.log("warning", f"Gemini Interactions error ({resp.status}): {err_text}")
                     self._interaction_ids.pop(session_id, None)
+                    self._gemini_consecutive_errors += 1
+                    if self._gemini_consecutive_errors >= VISION_AUTO_DISABLE_THRESHOLD:
+                        self._vision_force_disabled = True
+                        clog.log(
+                            "warning",
+                            f"vision auto-disabled after {self._gemini_consecutive_errors} consecutive errors",
+                        )
+                        try:
+                            sess = self._active_session
+                            if sess is not None:
+                                sess.send_vision_status(False)
+                                sess.send_notice(
+                                    f"Vision auto-disabled after {VISION_AUTO_DISABLE_THRESHOLD} consecutive errors: {err_text[:120]}"
+                                )
+                        except Exception:
+                            pass
         except Exception as exc:
             clog.log(
                 "warning",
@@ -1159,6 +1263,7 @@ class ServerState:
             self._vision_system_prompt = (
                 cfg.vision_prompt.strip() or DEFAULT_VISION_SYSTEM_PROMPT
             )
+            self._vision_in_transcript = bool(cfg.vision_in_transcript)
             # Expose the session and id so vision-side coroutines can push
             # captions back to the client, and so the executor-side
             # collapse detector can find the right snapshot list.
@@ -1170,6 +1275,12 @@ class ServerState:
             self._collapse_triggers.clear()
             self._prev_pad_force_remaining = 0
             self._vision_request_pending = False
+            self._inject_active = False
+            self._last_rewind_at = 0.0
+            # Reset auto-disable so a previous session's vision failures
+            # don't carry over and silently block this session's calls.
+            self._gemini_consecutive_errors = 0
+            self._vision_force_disabled = False
 
             # System prompts are 10-25 s of synchronous Mimi+LM steps
             # (longer for raw-audio voice prompts because every prompt
@@ -1257,7 +1368,11 @@ class ServerState:
                 try:
                     await warmup_done.wait()
                     while session.is_alive():
-                        await asyncio.sleep(30.0)
+                        # Snapshots cost a brief audio-frame stall (lock
+                        # held during tensor clone). 60 s keeps that hit
+                        # to once per minute; rewinds still target a
+                        # state from within the last minute.
+                        await asyncio.sleep(60.0)
                         if not session.is_alive():
                             break
                         clog.log("info", "taking session snapshot")
@@ -2121,6 +2236,11 @@ def main():
                             <label><input type="checkbox" id="autoGainToggle"> Auto gain control</label>
                         </div>
                         <div class="toggle-row-hint">Off by default. Browser AGC can cause amplitude swings that confuse Moshi at 24 kHz.</div>
+                        <div class="slider-group-title">Vision</div>
+                        <div class="toggle-row">
+                            <label><input type="checkbox" id="visionInTranscriptToggle"> Echo vision context in transcript</label>
+                        </div>
+                        <div class="toggle-row-hint">Adds Gemini's scene descriptions inline in the AI response with a [vision] prefix. Useful for debugging whether vision context is shaping replies.</div>
                         <div class="slider-group-title">Reproducibility</div>
                         <div class="seed-row">
                             <div class="slider-label">
@@ -2313,6 +2433,8 @@ def main():
         let visionFrameIntervalMs = 5000;  // fallback only; server drives most frames
         let visionLastSentAt = 0;
         let visionStatusTickTimer = null;
+        let visionInjecting = false;
+        let lastRewindClickAt = 0;
 
         // Per-call cost estimate for Gemini 3.5 Flash with our payload
         // shape (~500 input tokens including transcript context, 50
@@ -2448,6 +2570,7 @@ def main():
         const echoCancelToggle = document.getElementById('echoCancelToggle');
         const noiseSuppToggle = document.getElementById('noiseSuppToggle');
         const autoGainToggle = document.getElementById('autoGainToggle');
+        const visionInTranscriptToggle = document.getElementById('visionInTranscriptToggle');
 
         const MIC_DEFAULTS = { echoCancel: true, noiseSupp: true, autoGain: false };
         try {
@@ -2457,7 +2580,14 @@ def main():
             if (n !== null) noiseSuppToggle.checked = n === '1';
             const g = localStorage.getItem('pp_autoGain');
             if (g !== null) autoGainToggle.checked = g === '1';
+            const vt = localStorage.getItem('pp_visionInTranscript');
+            if (vt !== null && visionInTranscriptToggle) visionInTranscriptToggle.checked = vt === '1';
         } catch (e) {}
+        if (visionInTranscriptToggle) {
+            visionInTranscriptToggle.addEventListener('change', () => {
+                try { localStorage.setItem('pp_visionInTranscript', visionInTranscriptToggle.checked ? '1' : '0'); } catch (e) {}
+            });
+        }
 
         function getMicConstraints() {
             return {
@@ -2854,6 +2984,7 @@ def main():
                 voice_prompt: voiceParam,
                 text_prompt: textPromptInput.value || '',
                 vision_prompt: (visionPromptInput && visionPromptInput.value) || '',
+                vision_in_transcript: !!(visionInTranscriptToggle && visionInTranscriptToggle.checked),
                 audio_temperature: parseFloat(audioTempSlider.value),
                 text_temperature: parseFloat(textTempSlider.value),
                 text_topk: parseInt(textTopkSlider.value, 10),
@@ -2928,6 +3059,12 @@ def main():
                 // quiet). Honor the request via the normal automatic
                 // capture path; motion gate still applies.
                 if (visionStream && !visionPaused) captureFrame(false);
+            } else if (msg.type === 'vision_inject') {
+                // Server has begun (or finished) drip-feeding a Gemini
+                // description into the model's text channel. Surface it
+                // so the user knows why audio briefly stops.
+                visionInjecting = !!msg.active;
+                updateVisionStatus();
             } else if (msg.type === 'notice') {
                 showNoticeToast(msg.text || '');
             } else if (msg.type === 'error') {
@@ -3268,8 +3405,24 @@ def main():
                     pauseBtn.textContent = 'Pause Vision';
                 }
                 visionPaused = false;
+                visionInjecting = false;
                 const meta = document.getElementById('visionMeta');
                 if (meta) meta.classList.add('visible');
+                // Reveal the captions history panel up-front with a
+                // placeholder so users see *something* before the first
+                // Gemini response lands (which can take several seconds).
+                const log = document.getElementById('captionsLog');
+                const entries = document.getElementById('captionsLogEntries');
+                if (log && entries) {
+                    log.classList.add('visible');
+                    if (entries.children.length === 0) {
+                        const placeholder = document.createElement('div');
+                        placeholder.className = 'captions-log-entry placeholder';
+                        placeholder.innerHTML = '<span class="text" style="color: #9a8a6a; font-style: italic;"></span>';
+                        placeholder.querySelector('.text').textContent = 'Awaiting first scene description...';
+                        entries.appendChild(placeholder);
+                    }
+                }
                 visionFramesSent = 0;
                 updateVisionCost();
 
@@ -3310,7 +3463,12 @@ def main():
             if (pauseBtn) pauseBtn.style.display = 'none';
             const meta = document.getElementById('visionMeta');
             if (meta) meta.classList.remove('visible');
+            const log = document.getElementById('captionsLog');
+            const entries = document.getElementById('captionsLogEntries');
+            if (log) log.classList.remove('visible');
+            if (entries) entries.innerHTML = '';
             visionPaused = false;
+            visionInjecting = false;
             if (visionStatusTickTimer) {
                 clearInterval(visionStatusTickTimer);
                 visionStatusTickTimer = null;
@@ -3376,6 +3534,7 @@ def main():
         function updateVisionStatus() {
             const el = document.getElementById('visionStatus');
             if (!el) return;
+            if (visionInjecting) { el.textContent = 'Injecting context...'; return; }
             if (visionPaused) { el.textContent = 'Paused'; return; }
             if (!visionLastSentAt) { el.textContent = 'Idle'; return; }
             const age = Math.max(0, Math.round((performance.now() - visionLastSentAt) / 1000));
@@ -3434,6 +3593,13 @@ def main():
             const entries = document.getElementById('captionsLogEntries');
             const log = document.getElementById('captionsLog');
             if (!entries || !log) return;
+            // Drop the "Awaiting first scene description..." placeholder
+            // that was seeded in toggleVision so users had something to
+            // look at before the first Gemini response arrived.
+            const first = entries.firstChild;
+            if (first && first.classList && first.classList.contains('placeholder')) {
+                entries.removeChild(first);
+            }
             const ts = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
             const div = document.createElement('div');
             div.className = 'captions-log-entry';
@@ -3476,6 +3642,12 @@ def main():
         }
 
         function sendRewind() {
+            // 1 s debounce so a frustrated click-storm can't saturate
+            // _infer_lock on the server (each rewind acquires the lock
+            // to apply set_streaming_state_inplace).
+            const now = performance.now();
+            if (now - lastRewindClickAt < 1000) return;
+            lastRewindClickAt = now;
             if (controlChannel && controlChannel.readyState === 'open') {
                 controlChannel.send(JSON.stringify({ type: 'rewind' }));
                 // Outcome arrives as a notice toast (success or "no snapshot

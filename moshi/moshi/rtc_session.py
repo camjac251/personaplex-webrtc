@@ -198,6 +198,7 @@ class SessionConfig:
     voice_prompt: str = ""
     text_prompt: str = ""
     vision_prompt: str = ""
+    vision_in_transcript: bool = False
     seed: Optional[int] = None
     audio_temperature: float = 0.7
     text_temperature: float = 0.7
@@ -472,6 +473,14 @@ class RTCSession:
                 json.dumps({"type": "vision_status", "enabled": bool(enabled)})
             )
 
+    def send_inject_status(self, active: bool) -> None:
+        """Tell the client whether a vision-context inject window is open.
+        Lets the UI show the user why audio briefly drops."""
+        if self._control and self._control.readyState == "open":
+            self._control.send(
+                json.dumps({"type": "vision_inject", "active": bool(active)})
+            )
+
     def send_request_vision_frame(self) -> None:
         """Ask the client to capture and send a fresh vision frame now."""
         if self._control and self._control.readyState == "open":
@@ -541,6 +550,7 @@ class RTCSession:
                     voice_prompt=str(payload.get("voice_prompt", "")),
                     text_prompt=str(payload.get("text_prompt", "")),
                     vision_prompt=str(payload.get("vision_prompt", "")),
+                    vision_in_transcript=bool(payload.get("vision_in_transcript", False)),
                     seed=seed,
                     audio_temperature=float(payload.get("audio_temperature", 0.7)),
                     text_temperature=float(payload.get("text_temperature", 0.7)),
