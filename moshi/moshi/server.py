@@ -720,20 +720,28 @@ class ServerState:
                         )
                         self._interaction_ids.pop(session_id, None)
                     
-                    # Defensive .get() chain. Provider can change the
-                    # shape between calls; log the unexpected case so we
-                    # don't silently swallow a schema drift.
-                    candidates = data.get("candidates") or []
-                    text = ""
-                    if candidates:
-                        content = candidates[0].get("content") or {}
-                        parts = content.get("parts") or []
-                        if parts:
-                            text = (parts[0].get("text") or "").strip()
+                    # Interactions API "new schema" (opt-in today via
+                    # Api-Revision: 2026-05-20, default 2026-05-26).
+                    # Shape: {"id": "...", "steps": [{"type":
+                    #   "model_output", "content": [{"type": "text",
+                    #   "text": "..."}]}, ...]}
+                    # Earlier steps may be thoughts or tool calls;
+                    # concatenate text from every model_output step's
+                    # text-typed content blocks. This is what the SDK
+                    # `interaction.output_text` convenience surfaces.
+                    steps = data.get("steps") or []
+                    text_parts: list[str] = []
+                    for step in steps:
+                        if step.get("type") != "model_output":
+                            continue
+                        for block in step.get("content") or []:
+                            if block.get("type") == "text":
+                                text_parts.append(block.get("text") or "")
+                    text = "".join(text_parts).strip()
                     if not text:
                         clog.log(
                             "warning",
-                            f"Gemini returned no text (candidates={len(candidates)})",
+                            f"Gemini returned no text (steps={len(steps)})",
                         )
                     else:
                         clog.log("info", f"vision: {text}")
