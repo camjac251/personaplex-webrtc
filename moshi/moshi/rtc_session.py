@@ -197,6 +197,7 @@ class SessionConfig:
 
     voice_prompt: str = ""
     text_prompt: str = ""
+    vision_prompt: str = ""
     seed: Optional[int] = None
     audio_temperature: float = 0.7
     text_temperature: float = 0.7
@@ -258,6 +259,7 @@ class RTCSession:
         self._control_tasks: set[asyncio.Task] = set()
         self._closed = asyncio.Event()
         self._on_config: Optional[Callable[[SessionConfig], Awaitable[None]]] = None
+        self._on_message: Optional[Callable[[dict], Awaitable[None]]] = None
         self._ready_sent = False
 
         @self._pc.on("track")
@@ -293,6 +295,11 @@ class RTCSession:
         self, handler: Callable[[SessionConfig], Awaitable[None]]
     ) -> None:
         self._on_config = handler
+
+    def set_message_handler(
+        self, handler: Callable[[dict], Awaitable[None]]
+    ) -> None:
+        self._on_message = handler
 
     async def negotiate(self, offer: RTCSessionDescription) -> RTCSessionDescription:
         """Set remote offer, build answer, return immediately.
@@ -451,6 +458,34 @@ class RTCSession:
         if self._control and self._control.readyState == "open":
             self._control.send(json.dumps({"type": "text", "v": text}))
 
+    def send_vision_caption(self, text: str) -> None:
+        """Push the latest vision-side scene description to the client UI."""
+        if self._control and self._control.readyState == "open":
+            self._control.send(
+                json.dumps({"type": "vision_caption", "text": text})
+            )
+
+    def send_vision_status(self, enabled: bool) -> None:
+        """Tell the client whether vision is available server-side."""
+        if self._control and self._control.readyState == "open":
+            self._control.send(
+                json.dumps({"type": "vision_status", "enabled": bool(enabled)})
+            )
+
+    def send_request_vision_frame(self) -> None:
+        """Ask the client to capture and send a fresh vision frame now."""
+        if self._control and self._control.readyState == "open":
+            self._control.send(
+                json.dumps({"type": "request_vision_frame"})
+            )
+
+    def send_notice(self, text: str) -> None:
+        """Server-side notice surfaced as a transient toast in the client UI."""
+        if self._control and self._control.readyState == "open":
+            self._control.send(
+                json.dumps({"type": "notice", "text": text})
+            )
+
     def send_ready(self) -> None:
         if self._ready_sent:
             return
@@ -505,6 +540,7 @@ class RTCSession:
                 cfg = SessionConfig(
                     voice_prompt=str(payload.get("voice_prompt", "")),
                     text_prompt=str(payload.get("text_prompt", "")),
+                    vision_prompt=str(payload.get("vision_prompt", "")),
                     seed=seed,
                     audio_temperature=float(payload.get("audio_temperature", 0.7)),
                     text_temperature=float(payload.get("text_temperature", 0.7)),
@@ -523,13 +559,9 @@ class RTCSession:
                 return
             if self._on_config is not None:
                 await self._on_config(cfg)
+        elif self._on_message is not None:
+            await self._on_message(payload)
         else:
-            # 'reset' was intentionally not implemented: mid-session resets
-            # racing the executor's GPU thread is the same hazard the
-            # original WebSocket handler's lock + shield carefully avoided
-            # at session boundaries. If/when we want it, route through the
-            # process loop between frames so the reset shares a thread
-            # with the inference work.
             self._log("warning", f"control: unknown type {kind!r}")
 
     async def _inbound_loop(self, track: MediaStreamTrack) -> None:

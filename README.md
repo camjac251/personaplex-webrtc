@@ -26,13 +26,14 @@ WebRTC media is UDP. RunPod's `*.proxy.runpod.net` is Cloudflare-fronted and onl
 
 ### 3. RunPod secrets
 
-In the RunPod console, go to **Secrets** -> **Create secret** and add three:
+In the RunPod console, go to **Secrets** -> **Create secret** and add the following. `GEMINI_API_KEY` is optional and only required if you want the Vision feature.
 
 | Secret name | Value |
 |---|---|
 | `HF_TOKEN` | HuggingFace Read token |
 | `TURN_KEY_ID` | Cloudflare Turn Token ID |
 | `TURN_KEY_API_TOKEN` | Cloudflare API Token |
+| `GEMINI_API_KEY` | Google AI Studio key (optional; enables Vision) |
 
 ### 4. Pod template
 
@@ -62,6 +63,7 @@ bash -c "curl -sL https://raw.githubusercontent.com/camjac251/Personaplex-runpod
 | `HF_TOKEN` | `{{ RUNPOD_SECRET_HF_TOKEN }}` |
 | `TURN_KEY_ID` | `{{ RUNPOD_SECRET_TURN_KEY_ID }}` |
 | `TURN_KEY_API_TOKEN` | `{{ RUNPOD_SECRET_TURN_KEY_API_TOKEN }}` |
+| `GEMINI_API_KEY` | `{{ RUNPOD_SECRET_GEMINI_API_KEY }}` (optional) |
 
 ### 5. Launch and connect
 
@@ -84,6 +86,21 @@ Pre-packaged voice embeddings:
 
 You can also upload 10-30 s of clean audio for any speaker via the **Clone a voice** panel. Mono or stereo, any common format. The model uses it as a voice prefix and continues in that timbre. Not zero-shot perfect, but recognisable.
 
+## Vision (optional)
+
+Adds situational awareness from a screen share or virtual camera. Frames are sent to **Gemini 3.5 Flash** via the Interactions API; the one-sentence scene description is drip-fed into the model's text channel during natural silence windows so PersonaPlex stays contextually aware of what you're seeing without speaking the description aloud.
+
+Enable it by providing `GEMINI_API_KEY` and clicking **Add Vision** in the UI. Without the key the button stays disabled and a toast explains why.
+
+Controls:
+
+- **Add Vision / Stop Vision**: start or end the capture stream.
+- **Pause Vision / Resume Vision**: keep the stream open but stop sending frames.
+- **Capture Now**: force a high-detail frame send immediately (bypasses motion gate and pause).
+- **Rewind**: restore the last KV-cache snapshot if the model gets stuck. Auto-rewind also fires when the safety net trips 3+ times in 30 s.
+
+The **Vision Prompt** textarea in the config panel customizes the system prompt sent to Gemini at the start of each session. Frames are motion-gated client-side so static scenes don't waste calls. A live cost meter and a rolling caption history sit below the preview. The fallback frame interval is configurable; most frames are server-requested when the model just went silent, so the timer rarely fires in practice.
+
 ## Hardware
 
 Tested on RTX 4090 (24 GB) with the default RunPod driver. Any modern NVIDIA card with 12 GB+ VRAM should work. Smaller cards can run with CPU offload at the cost of latency.
@@ -101,11 +118,19 @@ Browser AEC, noise suppression, and AGC handle echo and ambient noise. Backgroun
 
 Single-session: `self.lock` in `ServerState` enforces one peer connection at a time. A second connect attempt while a session is live returns HTTP 409 `session_busy` instead of hanging.
 
+Vision path (when `GEMINI_API_KEY` is set and the user enables it):
+
+1. Browser motion-gates each captured frame and sends a base64 JPEG over the `control` DataChannel.
+2. Server forwards the frame to Gemini 3.5 Flash via the Interactions API. Conversation state chains turn-to-turn through `previous_interaction_id`, so the model has long-term memory of prior frames.
+3. The one-sentence description is tokenised and queued in `ServerState._vision_pending`.
+4. `_process_audio_frame` drains one queued token per Mimi frame, but only when the model has been in a PAD streak for at least two frames. Outbound PCM is zeroed for the duration so the model never tries to speak the injection.
+5. The caption is mirrored to the browser as a subtitle and added to the rolling history log.
+
 ## Known issues
 
 These come from the upstream model, not the RunPod packaging:
 
-- **Response looping**: under certain prompts the model can repeat itself. The repetition penalty / context window sliders in the Advanced panel usually break the loop.
+- **Response looping**: under certain prompts the model can repeat itself. The repetition penalty, padding bonus, and max-turn-length sliders in the Advanced panel ship with sane defaults that mitigate this; auto-rewind also catches rare cases where the safety net fires repeatedly.
 - **Pipeline efficiency**: GPU utilisation is occasionally spiky; some kernels are not yet optimised.
 
 Core model issues belong upstream at [NVIDIA/personaplex](https://github.com/NVIDIA/personaplex/issues). Bugs in the RunPod packaging or WebRTC client belong here.

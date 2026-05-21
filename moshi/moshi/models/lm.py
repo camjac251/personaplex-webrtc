@@ -32,18 +32,17 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
-from os.path import splitext
+from os.path import splitext, exists
 import logging
 import numpy as np
 import sys
-from typing import Optional, Union, List, Tuple, Callable, Iterator
+from typing import Optional, Union, List, Tuple, Iterator
 import sphn
 import torch
-from tqdm.auto import tqdm
 
 from ..utils.sampling import sample_token, apply_repetition_penalty
 from ..utils.compile import CUDAGraphed
-from ..modules.streaming import StreamingStateDict, StreamingContainer, StreamingModule, load_streaming_state
+from ..modules.streaming import StreamingContainer, StreamingModule, load_streaming_state
 from ..modules.transformer import (
     StreamingTransformer,
     create_norm_fn,
@@ -1072,12 +1071,31 @@ class LMGen(StreamingModule[_LMGenState]):
         self.voice_prompt_embeddings = None
 
     def load_voice_prompt_embeddings(self, path: str):
-        self.voice_prompt = path
-        state = torch.load(path)
+        # First try to load full streaming state if available
+        base_path = splitext(path)[0]
+        state_path = base_path + ".safetensors"
+        meta_path = base_path + ".json"
+        
+        if exists(state_path) and exists(meta_path):
+            logger.info("loading full streaming state from %s", state_path)
+            full_state = load_streaming_state(state_path, meta_path, device=self.device)
+            self.set_streaming_state_inplace(full_state)
+            # Mark that we have loaded the full state so _step_voice_prompt_core can skip replay
+            self.voice_prompt_embeddings = [] # Non-None but empty to signal "loaded"
+            # Clone the cache so a subsequent reset_streaming() doesn't
+            # zero out our reference. The legacy .pt path (below) builds
+            # a fresh tensor via .to(self.device), so it doesn't need this.
+            self.voice_prompt_cache = self._streaming_state.cache.clone()
+            self.voice_prompt = path
+            return
 
+        # Fallback to legacy .pt loading (replay required)
+        logger.info("loading legacy voice prompt embeddings from %s", path)
+        data = torch.load(path, map_location="cpu", weights_only=True)
         self.voice_prompt_audio = None
-        self.voice_prompt_embeddings = state["embeddings"].to(self.lm_model.device)
-        self.voice_prompt_cache = state["cache"].to(self.lm_model.device)
+        self.voice_prompt_embeddings = data["embeddings"].to(self.device)
+        self.voice_prompt_cache = data["cache"].to(self.device)
+        self.voice_prompt = path
 
     def _encode_zero_frame(self) -> torch.Tensor:
         return torch.as_tensor(
@@ -1147,16 +1165,24 @@ class LMGen(StreamingModule[_LMGenState]):
             yield
 
             if self.save_voice_prompt_embeddings:
-                # Offset int(self._streaming_state.offset) is not needed since calling step() for len(voice_prompt_frame_tokens)
-                # and calling step_embeddings() for len(voice_prompt_embeddings) will increment offset by the same amount
+                # Save full streaming state (tensors + metadata) to bypass replay next time.
+                # We use .pt extension for compatibility with existing logic but store full state.
+                base_path = splitext(self.voice_prompt)[0]
+                state_path = base_path + ".safetensors"
+                meta_path = base_path + ".json"
+                
+                # Also save the legacy .pt format for backward compatibility if needed, 
+                # or just use it as a marker.
                 torch.save(
                     {
                         "embeddings": torch.stack(saved_embeddings, dim=0).detach().cpu(),
-                        "cache": self._streaming_state.cache
+                        "cache": self._streaming_state.cache,
+                        "full_state_available": True
                     },
-                    splitext(self.voice_prompt)[0] + ".pt",
+                    base_path + ".pt",
                 )
-        print('Done loading voice prompt.')
+                self.save_streaming_state(state_path, meta_path)
+        logger.info("done loading voice prompt")
 
     def _step_voice_prompt(self, mimi):
         # Sync path intentionally does not support `is_alive` / disconnect checks.
@@ -1178,7 +1204,7 @@ class LMGen(StreamingModule[_LMGenState]):
                 text_token=self.zero_text_code,
                 input_tokens=self._encode_sine_frame(),
             )
-        print('Done loading audio silence.')
+        logger.info("done loading audio silence")
 
     def _step_audio_silence(self):
         # Sync path intentionally does not support `is_alive` / disconnect checks.
@@ -1198,7 +1224,7 @@ class LMGen(StreamingModule[_LMGenState]):
                 text_token=text_prompt_token,
                 input_tokens=self._encode_sine_frame(),
             )
-        print('Done loading text prompt.')
+        logger.info("done loading text prompt")
 
 
     def _step_text_prompt(self):

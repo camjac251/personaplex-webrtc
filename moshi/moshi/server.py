@@ -26,7 +26,7 @@
 
 import argparse
 import asyncio
-from dataclasses import dataclass
+from collections import deque
 import json
 import random
 import os
@@ -34,6 +34,7 @@ from pathlib import Path
 import tarfile
 import secrets
 import sys
+import threading
 import time
 from typing import Literal, Optional
 
@@ -47,7 +48,7 @@ import torch
 
 from aiortc import RTCSessionDescription
 
-from .models import loaders, MimiModel, LMModel, LMGen
+from .models import loaders, MimiModel, LMGen
 from .models.lm import MAX_REPETITION_CONTEXT
 from .rtc_session import DEFAULT_STUN_FALLBACK, RTCSession, SessionConfig
 from .utils.connection import create_ssl_context, get_lan_ip
@@ -100,33 +101,82 @@ UPLOAD_ALLOWED_EXT = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
 # MP3 (allowed by the 20 MB byte cap) would be a self-DoS.
 UPLOAD_MAX_VOICE_PROMPT_SECONDS = 60.0
 
+# Default system prompt for the vision side. Generic by design: the user
+# can override it via the SessionConfig.vision_prompt field (surfaced as a
+# textarea in the embedded UI).
+DEFAULT_VISION_SYSTEM_PROMPT = (
+    "You are an observer. Describe exactly what is happening in this scene "
+    "in one short sentence. Keep it brief and factual. You have memory of "
+    "prior frames in this session; use them to track movement and changes."
+)
 
-@dataclass
+# How many recent assistant text fragments to keep around for the Gemini
+# transcript-context window. ~80 fragments is roughly the last 6-8 seconds
+# of model speech.
+TRANSCRIPT_BUFFER_MAX = 80
+
+# Vision-context tokens are pushed into _vision_pending and drained
+# one per audio frame (Mimi runs at ~12.5 Hz) only while the model is
+# in a pad streak. Cap the queue so a steady Gemini stream cannot let
+# context lag arbitrarily far behind reality.
+VISION_QUEUE_MAX = 64
+
+# Wait for N consecutive PAD text tokens before starting a vision
+# inject. Ensures we interrupt during natural silence, not mid-word.
+# Pulled from NVIDIA/personaplex PR #69's `LIVE_PROMPT_BOUNDARY_STREAK`.
+LIVE_PROMPT_BOUNDARY_STREAK = 2
+
+# Hard cap on how many tokens we'll inject in one window before forcing
+# a return to normal generation. ~4 s at 12.5 Hz.
+LIVE_PROMPT_MAX_STEPS = 48
+
+# Auto-rewind: if the LM safety net (max_turn_text_tokens) triggers this
+# many times within COLLAPSE_WINDOW_SEC, treat that as a sign the model
+# is wobbling and restore the latest snapshot in-place. The thresholds
+# are conservative; healthy sessions never get close.
+COLLAPSE_TRIGGER_THRESHOLD = 3
+COLLAPSE_WINDOW_SEC = 30.0
+
+
 class ServerState:
-    mimi: MimiModel
-    text_tokenizer: sentencepiece.SentencePieceProcessor
-    lm_gen: LMGen
-    lock: asyncio.Lock
+    """Per-process state: models, locks, vision pipeline, session bookkeeping.
 
-    def __init__(self, mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
-                 lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
+    Single-session by design: ``self.lock`` (asyncio.Lock) gates concurrent
+    connect attempts; ``self._infer_lock`` (threading.Lock) guards lm_gen
+    state against concurrent mutation from the executor thread and from
+    event-loop coroutines.
+    """
+
+    def __init__(self, mimi: MimiModel, lm_gen: LMGen, text_tokenizer: sentencepiece.SentencePieceProcessor,
+                 device: str | torch.device, voice_prompt_dir: str | None = None,
                  uploads_dir: str | None = None,
                  save_voice_prompt_embeddings: bool = False):
         self.mimi = mimi
+        self.lm_gen = lm_gen
         self.text_tokenizer = text_tokenizer
         self.device = device
         self.voice_prompt_dir = voice_prompt_dir
         self.uploads_dir = uploads_dir
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
-        self.lm_gen = LMGen(lm,
-                            audio_silence_frame_cnt=int(0.5 * self.mimi.frame_rate),
-                            sample_rate=self.mimi.sample_rate,
-                            device=device,
-                            frame_rate=self.mimi.frame_rate,
-                            save_voice_prompt_embeddings=save_voice_prompt_embeddings,
-        )
-        
+        # Session gate: one RTC session at a time. asyncio.Lock so
+        # negotiation and teardown can await without blocking the loop.
         self.lock = asyncio.Lock()
+        # Guards lm_gen state against concurrent mutation. Held by the
+        # executor thread inside _process_audio_frame, and by the rewind,
+        # snapshot, and vision-injection paths (which dispatch to the
+        # executor before acquiring) so they cannot interleave with an
+        # in-flight step().
+        self._infer_lock = threading.Lock()
+        # Set in _run_rtc_session for the lifetime of an active session.
+        # Lets vision-side coroutines push captions back to the client
+        # without plumbing a session reference through every call site.
+        self._active_session: Optional["RTCSession"] = None
+        # Stashed asyncio loop reference. Set in _run_rtc_session once the
+        # loop is known; cleared in finally. Used by the executor thread
+        # (which doesn't own the loop) to schedule DataChannel sends via
+        # call_soon_threadsafe rather than touching aiortc directly.
+        self._main_loop: Optional[asyncio.AbstractEventLoop] = None
+
         # Strong refs to long-running session tasks. asyncio holds only
         # weak references to tasks created via create_task; without this
         # set, the runner task that owns the lock can be garbage-collected
@@ -140,10 +190,57 @@ class ServerState:
         self._ice_cache: Optional[list[dict]] = None
         self._ice_cache_expires_at: float = 0.0
         self._ice_cache_lock = asyncio.Lock()
+        # Gemini state. _interaction_ids chains turns via the Interactions
+        # API's previous_interaction_id; _vision_in_flight prevents
+        # overlapping calls from corrupting that chain.
+        self._gemini_api_key = os.environ.get("GEMINI_API_KEY", "").strip() or None
+        self._http_session: Optional[aiohttp.ClientSession] = None
+        self._interaction_ids: dict[str, str] = {}
+        self._vision_in_flight: set[str] = set()
+        # Vision-context inject state. _vision_pending holds tokens waiting
+        # to be drip-fed into the model's text channel during pad streaks.
+        # _vision_pad_streak counts how many recent natural text emissions
+        # have been PAD; once it crosses LIVE_PROMPT_BOUNDARY_STREAK we
+        # start consuming the queue one token per outer audio frame, with
+        # outbound audio gated to silence for those frames. Reset on each
+        # new session in _run_rtc_session.
+        self._vision_pending: deque[int] = deque()
+        self._vision_pad_streak: int = 0
+        self._vision_inject_steps: int = 0
+        # Per-session system prompt for Gemini. Set in _run_rtc_session
+        # from cfg.vision_prompt (or DEFAULT_VISION_SYSTEM_PROMPT if blank).
+        self._vision_system_prompt: str = DEFAULT_VISION_SYSTEM_PROMPT
+        # Rolling buffer of recent assistant text fragments. Included in
+        # every Gemini call so the vision side knows what the model has
+        # been saying, and can prioritize / not contradict it.
+        self._transcript_recent: deque[str] = deque(maxlen=TRANSCRIPT_BUFFER_MAX)
+        # Active session id for the single live session; lets executor-
+        # side code (collapse detection / rewind) reach into per-session
+        # state without plumbing through.
+        self._active_session_id: Optional[str] = None
+        # Collapse detection: timestamps of recent _pad_force_remaining
+        # transitions (i.e. max_turn_text_tokens safety net firings). When
+        # the count in the last COLLAPSE_WINDOW_SEC crosses the threshold,
+        # we auto-rewind to the latest snapshot.
+        self._collapse_triggers: deque[float] = deque(maxlen=16)
+        self._prev_pad_force_remaining: int = 0
+        # Flag set by _process_audio_frame (executor thread) when the
+        # model just entered a natural pad streak; a cadence task on the
+        # event loop drains it and asks the client for a fresh vision
+        # frame. A plain bool is safe here under CPython's GIL: writes
+        # and reads are atomic at the bytecode boundary, and the worst
+        # outcome of a missed flip is one skipped vision request (next
+        # pad streak will set it again). If we ever move to no-GIL
+        # Python, swap for threading.Event for explicit memory ordering.
+        self._vision_request_pending: bool = False
         # Live sessions awaiting trickled candidates. Keyed by the
         # opaque session_id returned in the offer response. Entries are
         # cleared in _run_rtc_session's finally block.
         self._candidate_sessions: dict[str, "RTCSession"] = {}
+        # Rewind history: session_id -> [(monotonic_ts, flattened_state_dict)].
+        # State dicts hold tensor clones so the snapshot doesn't follow the
+        # live model.
+        self._session_snapshots: dict[str, list[tuple[float, dict]]] = {}
         self.mimi.streaming_forever(1)
         self.lm_gen.streaming_forever(1)
     
@@ -263,25 +360,321 @@ class ServerState:
     @torch.no_grad()
     def _process_audio_frame(self, chunk_np):
         """Run GPU inference for one audio frame. Called from thread executor
-        so the asyncio event loop stays responsive during GPU work."""
+        so the asyncio event loop stays responsive during GPU work.
+
+        Also runs the vision-context inject state machine: when the queue
+        is non-empty and the model has been in a PAD streak for at least
+        LIVE_PROMPT_BOUNDARY_STREAK frames, force one queued token onto
+        the text channel and zero the outbound audio for that frame.
+        Drip cadence is one token per outer call to match Mimi's 12.5 Hz.
+        """
         chunk = torch.from_numpy(chunk_np).to(device=self.device)[None, None]
         codes = self.mimi.encode(chunk)
         results = []
-        for c in range(codes.shape[-1]):
-            tokens = self.lm_gen.step(codes[:, :, c: c + 1])
-            if tokens is None:
-                continue
-            assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
-            main_pcm = self.mimi.decode(tokens[:, 1:9])
-            main_pcm = main_pcm.cpu()
-            pcm_np = main_pcm[0, 0].numpy()
-            text_token = tokens[0, 0, 0].item()
-            text = None
-            if text_token not in (0, 3):
-                _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
-                text = _text.replace("▁", " ")
-            results.append((pcm_np, text))
+        pad_id = self.lm_gen.lm_model.text_padding_token_id
+
+        with self._infer_lock:
+            prev_pad_streak = self._vision_pad_streak
+            # Decide once per outer call whether to inject this frame.
+            inject_token: Optional[int] = None
+            if (
+                self._vision_pending
+                and self._vision_pad_streak >= LIVE_PROMPT_BOUNDARY_STREAK
+            ):
+                if self._vision_inject_steps < LIVE_PROMPT_MAX_STEPS:
+                    inject_token = self._vision_pending.popleft()
+                    self._vision_inject_steps += 1
+                else:
+                    # Cap hit mid-window; drop the rest as stale and let
+                    # the next Gemini response repopulate fresh.
+                    self._vision_pending.clear()
+                    self._vision_inject_steps = 0
+            else:
+                # Idle: no inject this frame.
+                self._vision_inject_steps = 0
+
+            for c in range(codes.shape[-1]):
+                # Only force a token on the first inner iteration so the
+                # drip cadence stays at one per outer call regardless of
+                # how many Mimi codes a chunk emits.
+                forced_text = None
+                if inject_token is not None and c == 0:
+                    forced_text = torch.tensor(
+                        [[inject_token]], device=self.device, dtype=torch.long
+                    )
+
+                tokens = self.lm_gen.step(codes[:, :, c: c + 1], text_token=forced_text)
+                if tokens is None:
+                    continue
+                assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
+                main_pcm = self.mimi.decode(tokens[:, 1:9])
+                main_pcm = main_pcm.cpu()
+                pcm_np = main_pcm[0, 0].numpy()
+
+                # Audio gate: silence outbound PCM while we're injecting
+                # so the listener never hears the model trying to speak
+                # the forced text.
+                if forced_text is not None:
+                    pcm_np = np.zeros_like(pcm_np)
+
+                text_token = tokens[0, 0, 0].item()
+
+                # Track pad streak on natural emissions only. Forced
+                # tokens don't represent the model's intent to be silent.
+                if forced_text is None:
+                    if text_token == pad_id:
+                        self._vision_pad_streak += 1
+                    else:
+                        self._vision_pad_streak = 0
+
+                text = None
+                # Don't surface forced tokens in the visible transcript.
+                if forced_text is None and text_token not in (0, 3):
+                    _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
+                    text = _text.replace("▁", " ")
+                    # Keep a short rolling tail of natural text for the
+                    # vision-side transcript-context window.
+                    if text:
+                        self._transcript_recent.append(text)
+                results.append((pcm_np, text))
+
+            # --- collapse detection ----------------------------------
+            # _pad_force_remaining transitions 0 -> >0 when the LM safety
+            # net (max_turn_text_tokens) kicks in. Three of those inside
+            # a short window means the model is wobbling; restore the
+            # latest snapshot in place. Cheap, runs in the lock we
+            # already hold.
+            pad_force = self.lm_gen._pad_force_remaining
+            if pad_force > 0 and self._prev_pad_force_remaining == 0:
+                now = time.monotonic()
+                cutoff = now - COLLAPSE_WINDOW_SEC
+                while self._collapse_triggers and self._collapse_triggers[0] < cutoff:
+                    self._collapse_triggers.popleft()
+                self._collapse_triggers.append(now)
+                if len(self._collapse_triggers) >= COLLAPSE_TRIGGER_THRESHOLD:
+                    sid = self._active_session_id
+                    snapshots = self._session_snapshots.get(sid, []) if sid else []
+                    if snapshots:
+                        _, state_dict = snapshots[-1]
+                        # set_streaming_state_inplace pops entries from
+                        # the dict it's given. Pass a fresh shallow copy
+                        # so subsequent rewinds still find the keys.
+                        self.lm_gen.set_streaming_state_inplace(
+                            dict(state_dict)
+                        )
+                        logger.warning(
+                            "auto-rewind: %d pad-force triggers in %.0fs, "
+                            "restored latest snapshot",
+                            len(self._collapse_triggers),
+                            COLLAPSE_WINDOW_SEC,
+                        )
+                        self._collapse_triggers.clear()
+                        sess = self._active_session
+                        loop = self._main_loop
+                        if sess is not None and loop is not None:
+                            # DataChannel sends touch the asyncio loop's
+                            # SCTP transport; aiortc is not thread-safe.
+                            # Schedule the send back on the loop thread.
+                            try:
+                                loop.call_soon_threadsafe(
+                                    sess.send_notice,
+                                    "Auto-rewind: model wobbled, "
+                                    "restored recent snapshot",
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "auto-rewind notice scheduling failed: %s: %s",
+                                    type(exc).__name__,
+                                    exc,
+                                )
+            self._prev_pad_force_remaining = pad_force
+
+            # --- server-driven vision cadence ------------------------
+            # When the model just entered a pad streak (silence), ask the
+            # client to send a fresh frame. The cadence task on the event
+            # loop drains this flag and pushes the request_vision_frame
+            # control message.
+            if (
+                prev_pad_streak < LIVE_PROMPT_BOUNDARY_STREAK
+                and self._vision_pad_streak >= LIVE_PROMPT_BOUNDARY_STREAK
+            ):
+                self._vision_request_pending = True
         return results
+
+    def _take_snapshot(self) -> dict:
+        """Capture the current streaming state of all modules.
+        Uses flattening to produce a state dict that can be restored in-place
+        to preserve CUDA graph memory addresses.
+        """
+        from .modules.streaming import _flatten_streaming_state
+        with self._infer_lock:
+            # get_streaming_state returns {module_name: dataclass_instance}
+            state = self.lm_gen.get_streaming_state()
+            state_dict = {}
+            metadata = {}
+            # Flatten into a dict of tensors and metadata
+            _flatten_streaming_state(state_dict, metadata, state, prefix="")
+            
+            # Deep copy the tensors so the snapshot is immutable
+            snapshot = {k: v.detach().clone() for k, v in state_dict.items()}
+            snapshot.update(metadata)
+            return snapshot
+
+    async def handle_vision_frame(
+        self,
+        session_id: str,
+        base64_data: str,
+        clog: ColorizedLog,
+        detail: bool = False,
+    ):
+        """Send a frame to Gemini using the stateful Interactions API.
+
+        ``detail`` is set when the user explicitly requested this frame
+        (UI "Capture Now" button). The frame itself is encoded at higher
+        resolution on the client; we log it here for visibility.
+        """
+        if not self._gemini_api_key:
+            return
+
+        # In-flight guard to prevent overlapping calls from corrupting the chain
+        if session_id in self._vision_in_flight:
+            return
+        self._vision_in_flight.add(session_id)
+
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession()
+
+        try:
+            prev_id = self._interaction_ids.get(session_id)
+            url = f"https://generativelanguage.googleapis.com/v1beta/interactions?key={self._gemini_api_key}"
+
+            input_parts = []
+            if not prev_id:
+                input_parts.append({
+                    "type": "text",
+                    "text": self._vision_system_prompt,
+                })
+
+            # Pull a snapshot of recent assistant text and feed it to
+            # Gemini so the vision side knows what the model is currently
+            # talking about. Keeps the scene description aligned with the
+            # conversation. Skipped if empty or on the very first call
+            # (the system prompt already covers the cold-start case).
+            recent_snippet = "".join(list(self._transcript_recent)).strip()
+            if recent_snippet:
+                input_parts.append({
+                    "type": "text",
+                    "text": f"Recent assistant speech: {recent_snippet}",
+                })
+
+            if detail:
+                clog.log("info", "vision: detail frame (user-requested)")
+            
+            input_parts.append({
+                "type": "image",
+                "mime_type": "image/jpeg",
+                "data": base64_data
+            })
+
+            payload = {
+                # Flash 3.5 has stronger vision than Flash-Lite (better on
+                # small HUD text, distant objects, multi-element scenes).
+                # The latency premium people quote comes from thinking-on
+                # defaults; with thinking pinned to minimal we get sub-1 s
+                # TTFT and the better vision quality.
+                "model": "gemini-3.5-flash",
+                "input": input_parts,
+                "generation_config": {
+                    "max_output_tokens": 50,
+                    # Thinking-on Gemini 3.x has multi-second TTFT (Puter
+                    # measured 11 s on Gemini 3.5 Flash with medium). One
+                    # sentence of scene description does not need
+                    # reasoning depth, so we pin to minimal.
+                    "thinking": {"thinking_level": "minimal"}
+                }
+            }
+            if prev_id:
+                payload["previous_interaction_id"] = prev_id
+
+            headers = {"Api-Revision": "2026-05-20"}
+            async with self._http_session.post(url, json=payload, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    new_id = data.get("id")
+                    if new_id:
+                        self._interaction_ids[session_id] = new_id
+                    else:
+                        # Missing id means the Interactions chain is
+                        # effectively reset; drop the prior id so the
+                        # next call starts fresh with the system prompt.
+                        clog.log(
+                            "warning",
+                            "Gemini response missing 'id'; dropping chain",
+                        )
+                        self._interaction_ids.pop(session_id, None)
+                    
+                    # Defensive .get() chain. Provider can change the
+                    # shape between calls; log the unexpected case so we
+                    # don't silently swallow a schema drift.
+                    candidates = data.get("candidates") or []
+                    text = ""
+                    if candidates:
+                        content = candidates[0].get("content") or {}
+                        parts = content.get("parts") or []
+                        if parts:
+                            text = (parts[0].get("text") or "").strip()
+                    if not text:
+                        clog.log(
+                            "warning",
+                            f"Gemini returned no text (candidates={len(candidates)})",
+                        )
+                    else:
+                        clog.log("info", f"vision: {text}")
+                        # Surface the description to the client UI.
+                        # Non-blocking; failure is non-fatal but log it.
+                        try:
+                            sess = self._active_session
+                            if sess is not None:
+                                sess.send_vision_caption(text)
+                        except Exception as exc:
+                            clog.log(
+                                "warning",
+                                f"send_vision_caption failed: {type(exc).__name__}: {exc}",
+                            )
+                        # Inject the raw description. No `<system>` wrap:
+                        # PersonaPlex was trained with `<system>` only at
+                        # t=0, so embedding it mid-stream is the most
+                        # off-distribution part of the path. The empirical
+                        # community recipe (VAOS gist, jmanhype 2026-02)
+                        # drip-feeds the bare text at Mimi cadence and the
+                        # state machine in _process_audio_frame gates the
+                        # outbound audio while it does.
+                        tokens = self.text_tokenizer.encode(f" {text}")
+
+                        def _set_vision_context() -> None:
+                            with self._infer_lock:
+                                # Replace pending queue: latest scene wins.
+                                # An in-flight inject finishes its already-
+                                # popped tokens; the next window picks up
+                                # the fresh context.
+                                self._vision_pending.clear()
+                                self._vision_pending.extend(
+                                    tokens[:VISION_QUEUE_MAX]
+                                )
+
+                        loop = asyncio.get_event_loop()
+                        await loop.run_in_executor(None, _set_vision_context)
+                else:
+                    err_text = await resp.text()
+                    clog.log("warning", f"Gemini Interactions error ({resp.status}): {err_text}")
+                    self._interaction_ids.pop(session_id, None)
+        except Exception as exc:
+            clog.log(
+                "warning",
+                f"vision processing failed: {type(exc).__name__}: {exc}",
+            )
+        finally:
+            self._vision_in_flight.discard(session_id)
 
     def _resolve_voice_prompt_path(self, voice_prompt_filename: str) -> tuple[Optional[str], Optional[str]]:
         """Resolve the on-disk path for a voice prompt name.
@@ -709,6 +1102,30 @@ class ServerState:
 
             self.mimi.reset_streaming()
             self.lm_gen.reset_streaming()
+            # Reset the vision-inject state machine and the transcript
+            # buffer. Leftover state from a previous session would
+            # otherwise leak into this one.
+            with self._infer_lock:
+                self._vision_pending.clear()
+                self._vision_pad_streak = 0
+                self._vision_inject_steps = 0
+                self._transcript_recent.clear()
+            # Apply the per-session vision system prompt. Falls back to
+            # the generic default when the client didn't supply one.
+            self._vision_system_prompt = (
+                cfg.vision_prompt.strip() or DEFAULT_VISION_SYSTEM_PROMPT
+            )
+            # Expose the session and id so vision-side coroutines can push
+            # captions back to the client, and so the executor-side
+            # collapse detector can find the right snapshot list.
+            self._active_session = session
+            self._active_session_id = session_id
+            # Stash the loop so the executor thread can schedule sends.
+            self._main_loop = asyncio.get_event_loop()
+            # Reset collapse-detection state for the new session.
+            self._collapse_triggers.clear()
+            self._prev_pad_force_remaining = 0
+            self._vision_request_pending = False
 
             # System prompts are 10-25 s of synchronous Mimi+LM steps
             # (longer for raw-audio voice prompts because every prompt
@@ -728,6 +1145,91 @@ class ServerState:
             # release in finally.
             t_sp = time.monotonic()
             loop = asyncio.get_event_loop()
+
+            async def on_message(msg: dict):
+                mtype = msg.get("type")
+                if mtype == "rewind":
+                    snapshots = self._session_snapshots.get(session_id, [])
+                    if not snapshots:
+                        clog.log("warning", "rewind requested but no snapshots available")
+                        return
+                    _, state_dict = snapshots[-1]
+                    clog.log("info", "rewinding to latest snapshot (inplace)")
+
+                    def _do_rewind():
+                        with self._infer_lock:
+                            # set_streaming_state_inplace consumes the
+                            # dict it's given. Pass a shallow copy so the
+                            # snapshot stays reusable on the next rewind.
+                            self.lm_gen.set_streaming_state_inplace(
+                                dict(state_dict)
+                            )
+
+                    await loop.run_in_executor(None, _do_rewind)
+                elif mtype == "vision_frame":
+                    base64_data = msg.get("data", "")
+                    if base64_data:
+                        # Cap inbound frame size. Real frames at /2
+                        # downscale + JPEG 0.55 are well under 100 KB;
+                        # native + 0.8 detail mode stays under ~400 KB.
+                        # 600 KB headroom catches both without exposing
+                        # the server to a runaway client.
+                        if len(base64_data) > 600_000:
+                            clog.log(
+                                "warning",
+                                f"vision_frame too large: {len(base64_data)} chars; dropping",
+                            )
+                            return
+                        detail = bool(msg.get("detail", False))
+                        asyncio.create_task(
+                            self.handle_vision_frame(
+                                session_id, base64_data, clog, detail=detail
+                            )
+                        )
+
+            session.set_message_handler(on_message)
+
+            async def snapshot_task():
+                try:
+                    while session.is_alive():
+                        await asyncio.sleep(30.0)
+                        if not session.is_alive():
+                            break
+                        clog.log("info", "taking session snapshot")
+                        snap = await loop.run_in_executor(None, self._take_snapshot)
+                        history = self._session_snapshots.setdefault(session_id, [])
+                        history.append((time.monotonic(), snap))
+                        # Keep only last 5 snapshots
+                        if len(history) > 5:
+                            history.pop(0)
+                except asyncio.CancelledError:
+                    pass
+
+            self._session_tasks.add(asyncio.create_task(snapshot_task()))
+
+            async def cadence_task():
+                """Drain _vision_request_pending and ping the client.
+
+                The executor thread sets the flag when the model enters
+                a fresh pad streak. We poll at 5 Hz and dispatch.
+                """
+                try:
+                    while session.is_alive():
+                        await asyncio.sleep(0.2)
+                        if self._vision_request_pending and session.is_alive():
+                            self._vision_request_pending = False
+                            try:
+                                session.send_request_vision_frame()
+                            except Exception as exc:
+                                clog.log(
+                                    "warning",
+                                    f"send_request_vision_frame failed: "
+                                    f"{type(exc).__name__}: {exc}",
+                                )
+                except asyncio.CancelledError:
+                    pass
+
+            self._session_tasks.add(asyncio.create_task(cadence_task()))
             phases = (
                 ("voice_prompt", self.lm_gen._step_voice_prompt, (self.mimi,)),
                 ("audio_silence_a", self.lm_gen._step_audio_silence, ()),
@@ -767,6 +1269,16 @@ class ServerState:
                 return
 
             session.send_ready()
+            # Tell the client whether the vision pipeline is reachable so
+            # it can disable the Add Vision button (or warn the user) when
+            # the server has no GEMINI_API_KEY configured.
+            try:
+                session.send_vision_status(bool(self._gemini_api_key))
+            except Exception as exc:
+                clog.log(
+                    "warning",
+                    f"send_vision_status failed: {type(exc).__name__}: {exc}",
+                )
             session.start_processing()
             await session.wait_for_close()
 
@@ -781,9 +1293,25 @@ class ServerState:
         finally:
             if session_id is not None:
                 self._candidate_sessions.pop(session_id, None)
+                self._interaction_ids.pop(session_id, None)
+                self._session_snapshots.pop(session_id, None)
+                self._vision_in_flight.discard(session_id)
+            self._active_session = None
+            self._active_session_id = None
+            self._main_loop = None
             try:
                 await session.close()
             finally:
+                # Return cached-but-freed GPU blocks to the allocator so
+                # external observers (nvidia-smi, RunPod metrics) see VRAM
+                # drop back to baseline between sessions. The model
+                # weights and KV cache buffer stay resident; only the
+                # snapshot clones and transient allocations are released.
+                if torch.cuda.is_available():
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
                 self.lock.release()
                 clog.log("info", "session closed, lock released")
 
@@ -992,14 +1520,22 @@ def main():
         logger.info(f"text_padding_token_id={_pad_id} piece={_pad_piece!r} (target of padding_bonus)")
     except Exception as e:
         logger.warning(f"could not resolve text_padding_token_id: {e}")
+    
+    lm_gen = LMGen(lm,
+                        audio_silence_frame_cnt=int(0.5 * mimi.frame_rate),
+                        sample_rate=mimi.sample_rate,
+                        device=args.device,
+                        frame_rate=mimi.frame_rate,
+                        save_voice_prompt_embeddings=False)
+
     state = ServerState(
         mimi=mimi,
+        lm_gen=lm_gen,
         text_tokenizer=text_tokenizer,
-        lm=lm,
         device=args.device,
         voice_prompt_dir=args.voice_prompt_dir,
         uploads_dir=args.uploads_dir,
-        save_voice_prompt_embeddings=False,
+        save_voice_prompt_embeddings=False
     )
     logger.info("warming up the model")
     state.warmup()
@@ -1030,6 +1566,12 @@ def main():
     app.router.add_get("/api/rtc/candidates", state.handle_rtc_candidates_stream)
     app.router.add_get("/api/rtc/ice-servers", state.handle_ice_servers)
     app.router.add_post("/api/voice-upload", state.handle_voice_upload)
+
+    async def handle_favicon(_):
+        # Browser auto-requests /favicon.ico on every page; without a
+        # route the server logs a 404 noise line on every visit.
+        return web.Response(status=204)
+    app.router.add_get("/favicon.ico", handle_favicon)
     if static_path is not None:
         async def handle_root(_):
             return web.FileResponse(os.path.join(static_path, "index.html"))
@@ -1232,6 +1774,43 @@ def main():
         .upload-clear.visible { display: inline-block; }
         select:disabled { opacity: 0.55; cursor: not-allowed; }
         
+        /* Vision Preview */
+        .vision-container { display: none; width: 100%; max-width: 500px; margin: 0 auto 20px; border-radius: 16px; overflow: hidden; 
+                           border: 1px solid rgba(154, 122, 58, 0.35); box-shadow: 0 8px 24px rgba(0,0,0,0.15); background: #000; position: relative; }
+        .vision-container.active { display: block; }
+        .vision-video { width: 100%; display: block; transform: none !important; } /* Explicitly disable mirroring */
+        .vision-label { position: absolute; top: 12px; left: 12px; background: rgba(0,0,0,0.6); color: #fff; padding: 4px 10px; 
+                         border-radius: 6px; font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.1em; backdrop-filter: blur(4px); }
+        .vision-status { position: absolute; bottom: 12px; right: 12px; color: #fff; font-size: 0.7em; opacity: 0.8; }
+        .vision-caption { position: absolute; bottom: 12px; left: 12px; right: 90px; color: #fff; font-size: 0.85em;
+                          line-height: 1.3; text-shadow: 0 1px 3px rgba(0,0,0,0.85); opacity: 0;
+                          transition: opacity 0.25s ease; pointer-events: none; }
+        .vision-caption.visible { opacity: 1; }
+        .vision-meta { display: none; max-width: 500px; margin: 4px auto 8px; padding: 0 4px;
+                       font-size: 0.78em; color: #6a5a40; gap: 12px; align-items: center;
+                       justify-content: center; flex-wrap: wrap; }
+        .vision-meta.visible { display: flex; }
+        .vision-meta select { font-size: 0.92em; padding: 2px 6px; }
+        .captions-log { display: none; max-width: 500px; margin: 0 auto 12px; padding: 10px 14px;
+                        background: rgba(154, 122, 58, 0.06); border: 1px solid rgba(154, 122, 58, 0.18);
+                        border-radius: 10px; font-size: 0.8em; line-height: 1.5; max-height: 160px;
+                        overflow-y: auto; }
+        .captions-log.visible { display: block; }
+        .captions-log-title { font-weight: 600; color: #5a4a32; margin-bottom: 6px;
+                              text-transform: uppercase; font-size: 0.75em; letter-spacing: 0.08em; }
+        .captions-log-entry { color: #3a3329; }
+        .captions-log-entry .ts { color: #9a8a6a; margin-right: 6px; }
+        .notice-toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%);
+                        background: rgba(58, 51, 41, 0.95); color: #efe7d8; padding: 10px 18px;
+                        border-radius: 10px; font-size: 0.85em; box-shadow: 0 6px 18px rgba(0,0,0,0.25);
+                        opacity: 0; transition: opacity 0.25s ease; pointer-events: none; z-index: 9999; }
+        .notice-toast.visible { opacity: 1; }
+        
+        .btn-vision { background: #2f5d50; color: #fff; }
+        .btn-vision.active { background: #9a3b3b; }
+        .btn-rewind { background: rgba(255,255,255,0.9); color: #3a3329; border: 1px solid rgba(154, 122, 58, 0.4); }
+        .btn-rewind:hover { background: #efe7d8; }
+        
         /* Responsive */
         @media (max-width: 600px) {
             .chat-container { padding: 0 10px; }
@@ -1283,6 +1862,14 @@ def main():
                     </div>
                 </div>
                 
+                <div class="form-section">
+                    <div class="form-section-title">Vision Prompt</div>
+                    <div class="form-group">
+                        <textarea id="visionPrompt" maxlength="1000" placeholder="Prompt sent to the vision model alongside each captured frame.">You are an observer. Describe exactly what is happening in this scene in one short sentence. Keep it brief and factual. You have memory of prior frames in this session; use them to track movement and changes.</textarea>
+                        <div class="char-count"><span id="visionCharCount">0</span>/1000</div>
+                    </div>
+                </div>
+
                 <div class="form-section">
                     <div class="form-section-title">Voice</div>
                     <div class="form-group">
@@ -1387,17 +1974,17 @@ def main():
                         <div class="slider-row">
                             <div class="slider-label">
                                 <span>Padding bonus</span>
-                                <span class="slider-value" id="padBonusValue">0.0</span>
+                                <span class="slider-value" id="padBonusValue">1.5</span>
                             </div>
-                            <input type="range" id="padBonusSlider" min="0" max="6" step="0.1" value="0">
+                            <input type="range" id="padBonusSlider" min="0" max="6" step="0.1" value="1.5">
                             <div class="slider-hint">Biases the model toward silence tokens. 0 = off. 2-4 stops rambling by making it yield the turn sooner.</div>
                         </div>
                         <div class="slider-row">
                             <div class="slider-label">
                                 <span>Max turn length (tokens)</span>
-                                <span class="slider-value" id="maxTurnValue">0</span>
+                                <span class="slider-value" id="maxTurnValue">150</span>
                             </div>
-                            <input type="range" id="maxTurnSlider" min="0" max="2000" step="50" value="0">
+                            <input type="range" id="maxTurnSlider" min="0" max="2000" step="50" value="150">
                             <div class="slider-hint">Hard cap: after N consecutive non-silence text tokens, force pad for ~1 s. 0 = off. 500 ≈ 40 s sustained talk. Safety net under padding_bonus.</div>
                         </div>
                         <div class="slider-group-title">Microphone input</div>
@@ -1455,6 +2042,33 @@ def main():
             
             <div class="error-msg" id="convErrorMsg"></div>
             
+            <div class="vision-container" id="visionContainer">
+                <video class="vision-video" id="visionVideo" autoplay playsinline muted></video>
+                <div class="vision-label" id="visionLabel">Vision Off</div>
+                <div class="vision-status" id="visionStatus">Idle</div>
+                <div class="vision-caption" id="visionCaption"></div>
+            </div>
+            <div class="vision-meta" id="visionMeta">
+                <span id="visionCostDisplay">0 frames · ~$0.0000</span>
+                <span>·</span>
+                <label>
+                    Fallback every
+                    <select id="visionIntervalSelect">
+                        <option value="1000">1 s</option>
+                        <option value="3000">3 s</option>
+                        <option value="5000">5 s</option>
+                        <option value="10000">10 s</option>
+                        <option value="15000" selected>15 s</option>
+                        <option value="30000">30 s</option>
+                    </select>
+                </label>
+            </div>
+            <div class="captions-log" id="captionsLog">
+                <div class="captions-log-title">Vision history</div>
+                <div id="captionsLogEntries"></div>
+            </div>
+            <div class="notice-toast" id="noticeToast"></div>
+            
             <div class="visualizer-container">
                 <div class="visualizer ai" id="aiVisualizer">
                     <canvas class="visualizer-canvas" id="aiCanvas"></canvas>
@@ -1474,6 +2088,18 @@ def main():
             <div class="controls">
                 <button class="btn btn-danger" id="stopBtn" onclick="stopConversation()">
                     Disconnect
+                </button>
+                <button class="btn btn-vision" id="visionBtn" onclick="toggleVision()" title="Send screen/camera context to the model">
+                    Add Vision
+                </button>
+                <button class="btn btn-vision" id="captureNowBtn" onclick="forceCapture()" title="Force a high-detail frame send right now" style="display:none;">
+                    Capture Now
+                </button>
+                <button class="btn btn-rewind" id="visionPauseBtn" onclick="toggleVisionPause()" title="Pause automatic frame capture without releasing the stream" style="display:none;">
+                    Pause Vision
+                </button>
+                <button class="btn btn-rewind" id="rewindBtn" onclick="sendRewind()" title="Un-stick the model if it starts looping">
+                    Rewind
                 </button>
                 <button class="btn btn-primary" id="newConvBtn" onclick="newConversation()" style="display:none;">
                     New Conversation
@@ -1552,6 +2178,23 @@ def main():
         let sessionId = null;       // server-issued session id for trickle ICE
         let candidateStream = null; // EventSource for server-trickled candidates
         let pendingCandidates = []; // local candidates gathered before sessionId arrived
+        
+        // Vision / Rewind refs and state.
+        let visionStream = null;
+        let visionInterval = null;
+        let visionBtn = null;
+        let visionVideo = null;
+        let visionContainer = null;
+        let visionLabel = null;
+        let visionPaused = false;
+        let visionEnabledFromServer = true;  // assumed until server says otherwise
+        let visionFramesSent = 0;
+        let visionFrameIntervalMs = 15000;  // fallback only; server drives most frames
+
+        // Per-call cost estimate for Gemini 3.5 Flash with our payload
+        // shape (~500 input tokens including transcript context, 50
+        // output tokens, thinking minimal). Pricing reference May 2026.
+        const VISION_PER_CALL_USD = 0.0012;
         function markConnect(name) {
             if (!connectTimings) return;
             connectTimings[name] = Math.round(performance.now() - connectT0);
@@ -1598,6 +2241,27 @@ def main():
         const setupView = document.getElementById('setupView');
         const conversationView = document.getElementById('conversationView');
         const textPromptInput = document.getElementById('textPrompt');
+        const visionPromptInput = document.getElementById('visionPrompt');
+        const visionCharCount = document.getElementById('visionCharCount');
+
+        // Persist text and vision prompts across sessions. Restore first,
+        // then bind input handlers that write back to localStorage.
+        try {
+            const savedTextPrompt = localStorage.getItem('pp_textPrompt');
+            if (savedTextPrompt !== null) textPromptInput.value = savedTextPrompt;
+            const savedVisionPrompt = localStorage.getItem('pp_visionPrompt');
+            if (savedVisionPrompt !== null && visionPromptInput) {
+                visionPromptInput.value = savedVisionPrompt;
+            }
+        } catch (e) {}
+        textPromptInput.addEventListener('input', () => {
+            try { localStorage.setItem('pp_textPrompt', textPromptInput.value); } catch (e) {}
+        });
+        if (visionPromptInput) {
+            visionPromptInput.addEventListener('input', () => {
+                try { localStorage.setItem('pp_visionPrompt', visionPromptInput.value); } catch (e) {}
+            });
+        }
         const voicePromptSelect = document.getElementById('voicePrompt');
         const charCount = document.getElementById('charCount');
         const connectBtn = document.getElementById('connectBtn');
@@ -1624,8 +2288,10 @@ def main():
         // Initialize character count
         function updateCharCount() {
             charCount.textContent = textPromptInput.value.length;
+            if (visionCharCount) visionCharCount.textContent = visionPromptInput.value.length;
         }
         textPromptInput.addEventListener('input', updateCharCount);
+        if (visionPromptInput) visionPromptInput.addEventListener('input', updateCharCount);
         updateCharCount();
 
         // Advanced sampling sliders
@@ -1633,8 +2299,8 @@ def main():
             textTemp: 0.7, textTopk: 25,
             audioTemp: 0.7, audioTopk: 250,
             repPenalty: 1.2, repContext: 64,
-            padBonus: 0.0,
-            maxTurn: 0,
+            padBonus: 1.5,
+            maxTurn: 150,
         };
         const advancedToggle = document.getElementById('advancedToggle');
         const advancedBody = document.getElementById('advancedBody');
@@ -2060,6 +2726,7 @@ def main():
             return {
                 voice_prompt: voiceParam,
                 text_prompt: textPromptInput.value || '',
+                vision_prompt: (visionPromptInput && visionPromptInput.value) || '',
                 audio_temperature: parseFloat(audioTempSlider.value),
                 text_temperature: parseFloat(textTempSlider.value),
                 text_topk: parseInt(textTopkSlider.value, 10),
@@ -2112,6 +2779,25 @@ def main():
             } else if (msg.type === 'text') {
                 transcript.textContent += msg.v || '';
                 transcript.scrollTop = transcript.scrollHeight;
+            } else if (msg.type === 'vision_caption') {
+                showVisionCaption(msg.text || '');
+                addCaptionToLog(msg.text || '');
+            } else if (msg.type === 'vision_status') {
+                visionEnabledFromServer = !!msg.enabled;
+                if (!visionEnabledFromServer) {
+                    const btn = document.getElementById('visionBtn');
+                    if (btn) {
+                        btn.disabled = true;
+                        btn.title = 'Vision unavailable: server has no GEMINI_API_KEY';
+                    }
+                }
+            } else if (msg.type === 'request_vision_frame') {
+                // Server is asking for a fresh frame (model just went
+                // quiet). Honor the request via the normal automatic
+                // capture path; motion gate still applies.
+                if (visionStream && !visionPaused) captureFrame(false);
+            } else if (msg.type === 'notice') {
+                showNoticeToast(msg.text || '');
             } else if (msg.type === 'error') {
                 console.warn('server error:', msg.reason);
                 showError('Server error: ' + (msg.reason || 'unknown'), true);
@@ -2403,7 +3089,242 @@ def main():
             connectBtn.disabled = false;
             connectBtn.innerHTML = CONNECT_BTN_HTML;
             stopVisualizers();
+            stopVision();
             releaseMediaSession();
+        }
+
+        async function toggleVision() {
+            if (visionStream) {
+                stopVision();
+                return;
+            }
+            if (!visionEnabledFromServer) {
+                showNoticeToast('Vision unavailable: server has no GEMINI_API_KEY');
+                return;
+            }
+            try {
+                // Two paths: a virtual-camera source via getUserMedia, or
+                // native screen sharing via getDisplayMedia. The OK/Cancel
+                // dialog lets the user pick without us having to enumerate
+                // devices and guess what's plugged in.
+                const useWebcam = confirm("Click 'OK' for Webcam / Virtual Camera, or 'Cancel' for Native Screen Sharing.");
+
+                if (useWebcam) {
+                    visionStream = await navigator.mediaDevices.getUserMedia({ video: true });
+                } else {
+                    visionStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+                }
+
+                visionVideo = document.getElementById('visionVideo');
+                visionContainer = document.getElementById('visionContainer');
+                visionLabel = document.getElementById('visionLabel');
+                visionBtn = document.getElementById('visionBtn');
+
+                visionVideo.srcObject = visionStream;
+                visionContainer.classList.add('active');
+                visionBtn.classList.add('active');
+                visionBtn.textContent = 'Stop Vision';
+                visionLabel.textContent = 'Vision Active';
+
+                // Reveal the manual Capture Now and Pause buttons, plus
+                // the per-session meta row (cost meter + interval select).
+                const captureBtn = document.getElementById('captureNowBtn');
+                if (captureBtn) captureBtn.style.display = '';
+                const pauseBtn = document.getElementById('visionPauseBtn');
+                if (pauseBtn) {
+                    pauseBtn.style.display = '';
+                    pauseBtn.textContent = 'Pause Vision';
+                }
+                visionPaused = false;
+                const meta = document.getElementById('visionMeta');
+                if (meta) meta.classList.add('visible');
+                visionFramesSent = 0;
+                updateVisionCost();
+
+                // Most frames come from server-side requests; this is the
+                // fallback in case the server is silent for too long.
+                visionInterval = setInterval(() => {
+                    if (!visionPaused) captureFrame(false);
+                }, visionFrameIntervalMs);
+            } catch (err) {
+                console.error('Vision access denied:', err);
+                showError('Could not start vision: ' + err.message);
+            }
+        }
+
+        function stopVision() {
+            if (visionInterval) {
+                clearInterval(visionInterval);
+                visionInterval = null;
+            }
+            if (visionStream) {
+                visionStream.getTracks().forEach(t => t.stop());
+                visionStream = null;
+            }
+            if (visionContainer) visionContainer.classList.remove('active');
+            if (visionBtn) {
+                visionBtn.classList.remove('active');
+                visionBtn.textContent = 'Add Vision';
+            }
+            if (visionLabel) visionLabel.textContent = 'Vision Off';
+            const captureBtn = document.getElementById('captureNowBtn');
+            if (captureBtn) captureBtn.style.display = 'none';
+            const pauseBtn = document.getElementById('visionPauseBtn');
+            if (pauseBtn) pauseBtn.style.display = 'none';
+            const meta = document.getElementById('visionMeta');
+            if (meta) meta.classList.remove('visible');
+            visionPaused = false;
+        }
+
+        // Track the last sent frame so we can skip ones that haven't
+        // changed enough to warrant a vision-model call (motion-gating).
+        let visionLastFrameData = null;
+        const VISION_MOTION_THRESHOLD = 0.04; // mean abs delta on 0..1 scale
+
+        // Two-tier capture settings.
+        //   Automatic frames: /2 downscale, JPEG 0.55. Small HUD text
+        //     stays legible at typical FOV; payload stays small.
+        //   Detail frames (user-requested via Capture Now): native
+        //     resolution, JPEG 0.8. For when you specifically want
+        //     nametags / fine HUD readouts to be readable.
+        async function captureFrame(detail) {
+            if (!visionStream || !controlChannel || controlChannel.readyState !== 'open') return;
+
+            const divisor = detail ? 1 : 2;
+            const quality = detail ? 0.8 : 0.55;
+
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.max(160, Math.floor(visionVideo.videoWidth / divisor));
+            canvas.height = Math.max(90, Math.floor(visionVideo.videoHeight / divisor));
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(visionVideo, 0, 0, canvas.width, canvas.height);
+
+            // Motion gate: subsampled mean abs pixel delta. Detail frames
+            // bypass the gate since the user explicitly asked for one.
+            if (!detail) {
+                const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                if (visionLastFrameData && visionLastFrameData.length === frame.data.length) {
+                    let diff = 0;
+                    for (let i = 0; i < frame.data.length; i += 16) {
+                        diff += Math.abs(frame.data[i] - visionLastFrameData[i]);
+                    }
+                    const meanDelta = diff / (frame.data.length / 16) / 255;
+                    if (meanDelta < VISION_MOTION_THRESHOLD) return;
+                }
+                visionLastFrameData = new Uint8ClampedArray(frame.data);
+            }
+
+            const dataUrl = canvas.toDataURL('image/jpeg', quality);
+            const base64 = dataUrl.split(',')[1];
+
+            controlChannel.send(JSON.stringify({
+                type: 'vision_frame',
+                data: base64,
+                detail: !!detail,
+            }));
+            visionFramesSent += 1;
+            updateVisionCost();
+        }
+
+        function forceCapture() {
+            // Manual trigger: bypass motion gate and pause state, send a
+            // high-detail frame.
+            captureFrame(true);
+        }
+
+        // Bind the fallback-interval selector. Server-driven cadence
+        // does most of the work; this only fires when the server has
+        // been silent for too long.
+        (function bindVisionInterval() {
+            const sel = document.getElementById('visionIntervalSelect');
+            if (!sel) return;
+            try {
+                const saved = localStorage.getItem('pp_visionIntervalMs');
+                if (saved) {
+                    sel.value = saved;
+                    visionFrameIntervalMs = parseInt(saved, 10) || visionFrameIntervalMs;
+                }
+            } catch (e) {}
+            sel.addEventListener('change', () => {
+                visionFrameIntervalMs = parseInt(sel.value, 10) || 15000;
+                try { localStorage.setItem('pp_visionIntervalMs', String(visionFrameIntervalMs)); } catch (e) {}
+                // Restart the timer at the new cadence if vision is active.
+                if (visionInterval) {
+                    clearInterval(visionInterval);
+                    visionInterval = setInterval(() => {
+                        if (!visionPaused) captureFrame(false);
+                    }, visionFrameIntervalMs);
+                }
+            });
+        })();
+
+        // Fade-in a fresh vision caption, fade-out after a few seconds.
+        let visionCaptionTimer = null;
+        function showVisionCaption(text) {
+            const el = document.getElementById('visionCaption');
+            if (!el) return;
+            el.textContent = text;
+            el.classList.add('visible');
+            if (visionCaptionTimer) clearTimeout(visionCaptionTimer);
+            visionCaptionTimer = setTimeout(() => {
+                el.classList.remove('visible');
+            }, 8000);
+        }
+
+        // Rolling history of recent captions. Last 10 entries visible.
+        function addCaptionToLog(text) {
+            if (!text) return;
+            const entries = document.getElementById('captionsLogEntries');
+            const log = document.getElementById('captionsLog');
+            if (!entries || !log) return;
+            const ts = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            const div = document.createElement('div');
+            div.className = 'captions-log-entry';
+            div.innerHTML = '<span class="ts"></span><span class="text"></span>';
+            div.querySelector('.ts').textContent = ts;
+            div.querySelector('.text').textContent = text;
+            entries.prepend(div);
+            while (entries.children.length > 10) {
+                entries.removeChild(entries.lastChild);
+            }
+            log.classList.add('visible');
+        }
+
+        // Toast notification for transient server-side notices
+        // (auto-rewind, vision unavailable, etc.).
+        let noticeToastTimer = null;
+        function showNoticeToast(text) {
+            const el = document.getElementById('noticeToast');
+            if (!el || !text) return;
+            el.textContent = text;
+            el.classList.add('visible');
+            if (noticeToastTimer) clearTimeout(noticeToastTimer);
+            noticeToastTimer = setTimeout(() => {
+                el.classList.remove('visible');
+            }, 4500);
+        }
+
+        function updateVisionCost() {
+            const el = document.getElementById('visionCostDisplay');
+            if (!el) return;
+            const total = visionFramesSent * VISION_PER_CALL_USD;
+            el.textContent = visionFramesSent + ' frames · ~$' + total.toFixed(4);
+        }
+
+        function toggleVisionPause() {
+            visionPaused = !visionPaused;
+            const btn = document.getElementById('visionPauseBtn');
+            const status = document.getElementById('visionStatus');
+            if (btn) btn.textContent = visionPaused ? 'Resume Vision' : 'Pause Vision';
+            if (status) status.textContent = visionPaused ? 'Paused' : 'Idle';
+        }
+
+        function sendRewind() {
+            if (controlChannel && controlChannel.readyState === 'open') {
+                controlChannel.send(JSON.stringify({ type: 'rewind' }));
+                const originalText = transcript.textContent;
+                transcript.textContent = "[Rewinding to last stable state...]\\n" + originalText;
+            }
         }
 
         // Handle page unload
@@ -2453,6 +3374,21 @@ def main():
             loop.default_exception_handler(context)
         asyncio.get_event_loop().set_exception_handler(_handler)
     app.on_startup.append(_install_aioice_noise_filter)
+
+    async def _close_http_session(_app):
+        """Close the lazily-created Gemini HTTP client on shutdown so
+        aiohttp doesn't emit ResourceWarning at process exit."""
+        sess = getattr(state, "_http_session", None)
+        if sess is not None and not sess.closed:
+            try:
+                await sess.close()
+            except Exception as exc:
+                logger.warning(
+                    "closing gemini http session raised: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+    app.on_cleanup.append(_close_http_session)
 
     web.run_app(app, port=args.port, ssl_context=ssl_context)
 
