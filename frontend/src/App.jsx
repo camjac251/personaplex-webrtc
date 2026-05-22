@@ -319,6 +319,50 @@ function useToast() {
   }, []);
 }
 
+const FOCUSABLE_SELECTOR = [
+  "a[href]",
+  "button:not([disabled])",
+  "input:not([disabled])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  "[tabindex]:not([tabindex='-1'])",
+].join(",");
+
+function useDialogFocus() {
+  const ref = useRef(null);
+  useEffect(() => {
+    const previous = document.activeElement;
+    ref.current?.focus();
+    return () => previous?.focus?.();
+  }, []);
+  return ref;
+}
+
+function trapDialogKeydown(event, onClose) {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    onClose();
+    return;
+  }
+  if (event.key !== "Tab") return;
+  const focusable = Array.from(event.currentTarget.querySelectorAll(FOCUSABLE_SELECTOR)).filter(
+    (node) => node.offsetParent !== null || node === document.activeElement,
+  );
+  if (!focusable.length) {
+    event.preventDefault();
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
 function Info({ k }) {
   const meta = PARAM_INFO[k];
   const ref = useRef(null);
@@ -395,7 +439,7 @@ function Info({ k }) {
   );
 }
 
-function Listbox({ value, options, onChange, placeholder = "Select" }) {
+function Listbox({ value, options, onChange, placeholder = "Select", label = placeholder }) {
   const ref = useRef(null);
   const [open, setOpen] = useState(false);
   const current = options.find((option) => option.value === value);
@@ -416,6 +460,7 @@ function Listbox({ value, options, onChange, placeholder = "Select" }) {
         className={cls("lb-trigger", open && "open")}
         aria-haspopup="listbox"
         aria-expanded={open}
+        aria-label={label}
         onClick={() => setOpen((currentOpen) => !currentOpen)}
       >
         <span className="lb-trigger-label">{current?.label || placeholder}</span>
@@ -430,7 +475,7 @@ function Listbox({ value, options, onChange, placeholder = "Select" }) {
         </svg>
       </button>
       {open && (
-        <div className="lb-menu" role="listbox">
+        <div className="lb-menu" role="listbox" aria-label={label}>
           {options.map((option) => (
             <button
               key={option.value}
@@ -472,6 +517,7 @@ function ToggleRow({ name, desc, value, onChange, info }) {
         className={cls("switch", value && "on")}
         role="switch"
         aria-checked={value}
+        aria-label={name}
         onClick={() => onChange(!value)}
       />
     </div>
@@ -494,6 +540,7 @@ function MiniSlider({ label, value, onChange, min, max, step, format = (v) => v,
         max={max}
         step={step}
         value={value}
+        aria-label={label}
         onChange={(event) => onChange(Number(event.target.value))}
       />
     </div>
@@ -643,10 +690,12 @@ function App() {
   const [visionFramesSent, setVisionFramesSent] = useState(0);
   const [visionFramesGated, setVisionFramesGated] = useState(0);
   const [visionLastSentAt, setVisionLastSentAt] = useState(0);
+  const [visionClockMs, setVisionClockMs] = useState(0);
   const [visionIntervalMs, setVisionIntervalMs] = useStoredState("pp_visionIntervalMs", DEFAULTS.visionIntervalMs, Number);
   const [currentCaption, setCurrentCaption] = useState("");
   const [captionEntries, setCaptionEntries] = useState([]);
   const [inspectFrame, setInspectFrame] = useState(null);
+  const [visionSourceOpen, setVisionSourceOpen] = useState(false);
 
   const [preflightOpen, setPreflightOpen] = useState(false);
   const [preflight, setPreflight] = useState({ mic: "idle", out: "idle", turn: "idle" });
@@ -670,6 +719,7 @@ function App() {
   const mediaRecorderRef = useRef(null);
   const recordedChunksRef = useRef([]);
   const recordingUrlRef = useRef(null);
+  const cloneFileRef = useRef(null);
   const visionStreamRef = useRef(null);
   const visionIntervalRef = useRef(null);
   const visionStatusTickRef = useRef(null);
@@ -973,7 +1023,7 @@ function App() {
         }
       } else if (message.type === "request_vision_frame") {
         if (stateRef.current.visionOn && !stateRef.current.visionPaused) {
-          captureFrame(false, true);
+          captureFrame(false, false);
         }
       } else if (message.type === "vision_inject") {
         setVisionInjecting(!!message.active);
@@ -1233,27 +1283,23 @@ function App() {
         JSON.stringify({ type: "vision_frame", data: base64, detail: !!detail }),
       );
       setVisionFramesSent((count) => count + 1);
-      setVisionLastSentAt(performance.now());
+      const now = performance.now();
+      setVisionLastSentAt(now);
+      setVisionClockMs(now);
     },
     [],
   );
 
-  const startVision = useCallback(async () => {
+  const startVisionSource = useCallback(async (source) => {
     if (!isLive) return;
     if (!visionEnabledFromServer) {
       addNotice("warn", "Vision unavailable, server has no Gemini key");
       toast("Vision unavailable");
       return;
     }
-    if (visionStreamRef.current) {
-      stopVision();
-      addNotice("info", "Vision stopped");
-      return;
-    }
+    setVisionSourceOpen(false);
     try {
-      const useCamera = window.confirm(
-        "Click OK for webcam or virtual camera. Click Cancel for screen sharing.",
-      );
+      const useCamera = source === "camera";
       const stream = useCamera
         ? await navigator.mediaDevices.getUserMedia({ video: true })
         : await navigator.mediaDevices.getDisplayMedia({ video: true });
@@ -1265,19 +1311,32 @@ function App() {
       setCaptionEntries([]);
       addNotice("info", useCamera ? "Vision camera started" : "Vision screen share started");
       visionStatusTickRef.current = setInterval(() => {
-        setVisionLastSentAt((value) => value);
+        setVisionClockMs(performance.now());
       }, 1000);
     } catch (error) {
       addNotice("err", `Could not start vision: ${error.message || error}`);
     }
   }, [
     addNotice,
-    captureFrame,
     isLive,
-    stopVision,
     toast,
     visionEnabledFromServer,
   ]);
+
+  const startVision = useCallback(() => {
+    if (!isLive) return;
+    if (!visionEnabledFromServer) {
+      addNotice("warn", "Vision unavailable, server has no Gemini key");
+      toast("Vision unavailable");
+      return;
+    }
+    if (visionStreamRef.current) {
+      stopVision();
+      addNotice("info", "Vision stopped");
+      return;
+    }
+    setVisionSourceOpen(true);
+  }, [addNotice, isLive, stopVision, toast, visionEnabledFromServer]);
 
   useEffect(() => {
     if (visionOn && visionVideoRef.current && visionStreamRef.current) {
@@ -1485,12 +1544,12 @@ function App() {
   const turnTokens = Math.max(0, transcriptText.trim().split(/\s+/).filter(Boolean).length);
   const voiceDisplay = uploadedVoiceFilename ? uploadedVoiceLabel || "uploaded" : voice;
   const visionAge = visionLastSentAt
-    ? Math.max(0, Math.round((performance.now() - visionLastSentAt) / 1000))
+    ? Math.max(0, Math.round(((visionClockMs || performance.now()) - visionLastSentAt) / 1000))
     : null;
 
   return (
     <div className="shell">
-      <div className="topbar">
+      <header className="topbar">
         <div className="brand">
           <div className="brand-mark">
             <svg viewBox="0 0 12 12">
@@ -1529,10 +1588,10 @@ function App() {
             </span>
           </div>
         </div>
-      </div>
+      </header>
 
       <div className="body">
-        <div className="side">
+        <aside className="side" aria-label="Persona and voice settings">
           <div className="side-scroll">
             <div className="sect">
               <div className="sect-h">
@@ -1543,6 +1602,7 @@ function App() {
                 <span className="sect-sub">{presetId === "custom" ? "custom" : "preset"}</span>
               </div>
               <Listbox
+                label="Persona preset"
                 value={presetId}
                 options={[
                   ...PERSONA_PRESETS.map((preset) => ({
@@ -1561,6 +1621,7 @@ function App() {
               />
               <div style={{ height: 8 }} />
               <textarea
+                aria-label="System prompt"
                 value={textPrompt}
                 maxLength={2000}
                 onChange={(event) => {
@@ -1626,6 +1687,8 @@ function App() {
                       type="button"
                       key={item}
                       className={cls("voice", !uploadedVoiceFilename && voice === item && "active")}
+                      aria-pressed={!uploadedVoiceFilename && voice === item}
+                      aria-label={`Use voice ${item}`}
                       onClick={() => {
                         setVoice(item);
                         setUploadedVoiceFilename("");
@@ -1662,15 +1725,28 @@ function App() {
                 </div>
                 <span className="sect-sub">{uploadedVoiceFilename ? "active" : "optional"}</span>
               </div>
-              <label className="drop" htmlFor="cloneFile">
+              <label
+                className="drop"
+                htmlFor="cloneFile"
+                role="button"
+                tabIndex={0}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    cloneFileRef.current?.click();
+                  }
+                }}
+              >
                 <div className="t">{uploadedVoiceLabel || "Drop audio or click to upload"}</div>
                 <div>10 to 60 s, one clean speaker, common audio formats</div>
               </label>
               <input
+                ref={cloneFileRef}
                 id="cloneFile"
+                className="sr-only"
                 type="file"
                 accept="audio/*,.wav,.mp3,.flac,.ogg,.m4a,.opus,.aac"
-                style={{ display: "none" }}
+                aria-label="Upload voice reference clip"
                 onChange={(event) => uploadVoice(event.target.files?.[0])}
               />
               {uploadStatus && <div className={cls("upload-status", uploadKind)}>{uploadStatus}</div>}
@@ -1700,6 +1776,7 @@ function App() {
                 <span className="sect-sub">Gemini</span>
               </div>
               <textarea
+                aria-label="Vision prompt"
                 value={visionPrompt}
                 maxLength={1000}
                 onChange={(event) => setVisionPrompt(event.target.value)}
@@ -1724,6 +1801,7 @@ function App() {
               <div className="seed-row">
                 <input
                   type="number"
+                  aria-label="Seed value"
                   min={0}
                   max={2147483647}
                   value={seed}
@@ -1761,9 +1839,9 @@ function App() {
               </button>
             )}
           </div>
-        </div>
+        </aside>
 
-        <div className="stage">
+        <main className="stage">
           <div className="stage-head">
             <div className="l">
               <div>
@@ -1892,6 +1970,7 @@ function App() {
                         <button
                           type="button"
                           className="v-entry"
+                          aria-label={`Inspect frame from ${entry.ts}`}
                           key={`${entry.ts}-${index}`}
                           onClick={() => setInspectFrame(entry)}
                           title="Inspect source frame"
@@ -1917,6 +1996,7 @@ function App() {
                         max={30}
                         step={1}
                         value={visionIntervalMs / 1000}
+                        aria-label="Idle heartbeat interval"
                         onChange={(event) => setVisionIntervalMs(Number(event.target.value) * 1000)}
                       />
                     </div>
@@ -1930,6 +2010,7 @@ function App() {
                         className={cls("switch", visionInTranscript && "on")}
                         role="switch"
                         aria-checked={visionInTranscript}
+                        aria-label="Echo vision captions in transcript"
                         onClick={() => setVisionInTranscript(!visionInTranscript)}
                       />
                     </div>
@@ -1991,9 +2072,9 @@ function App() {
               {phase === "idle" && <span className="mono" style={{ fontSize: 10, letterSpacing: "0.16em", color: "var(--ink-4)" }}>STANDBY</span>}
             </div>
           </div>
-        </div>
+        </main>
 
-        <div className="cons">
+        <aside className="cons" aria-label="Session diagnostics">
           <div className="cons-sect">
             <div className="cons-h">A · Session</div>
             <Row label="Status" value={phase} dot={isLive ? "ok" : phase === "connecting" || phase === "warmup" ? "warn" : ""} />
@@ -2059,7 +2140,7 @@ function App() {
             <Row label="Client" value="React · Bun" />
             <Row label="License" value="NVIDIA OML" />
           </div>
-        </div>
+        </aside>
       </div>
       <audio ref={aiAudioRef} autoPlay playsInline style={{ display: "none" }} />
       {preflightOpen && (
@@ -2068,6 +2149,13 @@ function App() {
           done={preflightDone}
           onRun={runPreflight}
           onClose={() => setPreflightOpen(false)}
+        />
+      )}
+      {visionSourceOpen && (
+        <VisionSourceModal
+          onClose={() => setVisionSourceOpen(false)}
+          onCamera={() => startVisionSource("camera")}
+          onScreen={() => startVisionSource("screen")}
         />
       )}
       {inspectFrame && (
@@ -2155,6 +2243,7 @@ function Flow({ label, value, active, warn, branch }) {
 }
 
 function PreflightModal({ preflight, done, onRun, onClose }) {
+  const dialogRef = useDialogFocus();
   const rows = [
     { key: "mic", label: "Microphone", hint: "getUserMedia · echo cancellation follows your setting" },
     { key: "out", label: "Audio output", hint: "Short 440 Hz tone" },
@@ -2162,11 +2251,21 @@ function PreflightModal({ preflight, done, onRun, onClose }) {
   ];
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal" style={{ width: 380 }} onClick={(event) => event.stopPropagation()}>
+      <div
+        ref={dialogRef}
+        className="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="preflight-title"
+        tabIndex={-1}
+        style={{ width: 380 }}
+        onClick={(event) => event.stopPropagation()}
+        onKeyDown={(event) => trapDialogKeydown(event, onClose)}
+      >
         <div className="modal-h">
-          <span className="l">Pre-flight check</span>
+          <span id="preflight-title" className="l">Pre-flight check</span>
           <span className="meta">{done ? "complete" : "running"}</span>
-          <button type="button" className="x" onClick={onClose}>×</button>
+          <button type="button" className="x" aria-label="Close preflight" onClick={onClose}>×</button>
         </div>
         <div style={{ padding: "14px 18px", display: "flex", flexDirection: "column", gap: 10 }}>
           {rows.map((row) => {
@@ -2197,14 +2296,59 @@ function PreflightModal({ preflight, done, onRun, onClose }) {
   );
 }
 
-function FrameModal({ entry, onClose, onDetail }) {
+function VisionSourceModal({ onClose, onCamera, onScreen }) {
+  const dialogRef = useDialogFocus();
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal" onClick={(event) => event.stopPropagation()}>
+      <div
+        ref={dialogRef}
+        className="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="vision-source-title"
+        tabIndex={-1}
+        style={{ width: 360 }}
+        onClick={(event) => event.stopPropagation()}
+        onKeyDown={(event) => trapDialogKeydown(event, onClose)}
+      >
         <div className="modal-h">
-          <span className="l">Frame · {entry.ts}</span>
+          <span id="vision-source-title" className="l">Add vision</span>
+          <span className="meta">source</span>
+          <button type="button" className="x" aria-label="Close vision source picker" onClick={onClose}>×</button>
+        </div>
+        <div className="modal-choice">
+          <button className="source-choice" type="button" onClick={onCamera}>
+            <span className="source-k">Camera</span>
+            <span>Webcam or virtual camera</span>
+          </button>
+          <button className="source-choice" type="button" onClick={onScreen}>
+            <span className="source-k">Screen</span>
+            <span>Window, tab, or display</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function FrameModal({ entry, onClose, onDetail }) {
+  const dialogRef = useDialogFocus();
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div
+        ref={dialogRef}
+        className="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="frame-title"
+        tabIndex={-1}
+        onClick={(event) => event.stopPropagation()}
+        onKeyDown={(event) => trapDialogKeydown(event, onClose)}
+      >
+        <div className="modal-h">
+          <span id="frame-title" className="l">Frame · {entry.ts}</span>
           <span className="meta">jpeg</span>
-          <button type="button" className="x" onClick={onClose}>×</button>
+          <button type="button" className="x" aria-label="Close frame inspector" onClick={onClose}>×</button>
         </div>
         <div className="modal-frame">
           {entry.frame && <img className="modal-img" src={entry.frame} alt="" />}
