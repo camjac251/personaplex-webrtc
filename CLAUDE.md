@@ -26,7 +26,7 @@ RunPod single-template deployment of NVIDIA PersonaPlex (a Moshi finetune) over 
 - Inference and warmup run via `loop.run_in_executor`. Inline GPU work starves aiortc keepalives.
 - Vision inject drips one token per outer frame, only when `_vision_pad_streak >= LIVE_PROMPT_BOUNDARY_STREAK`. Outbound PCM zeroed during inject. Cap at `LIVE_PROMPT_MAX_STEPS`.
 - Auto-rewind: `_pad_force_remaining` tripping `COLLAPSE_TRIGGER_THRESHOLD` times in `COLLAPSE_WINDOW_SEC` restores the latest snapshot via `set_streaming_state_inplace`. Always pass `dict(state_dict)` so subsequent rewinds still find the keys.
-- Anti-collapse slider defaults: `padding_bonus=1.5`, `max_turn_text_tokens=150`, `repetition_penalty=1.2`. Verify `buildConfigPayload()` is actually sending nonzero values before debugging "model rambling" symptoms.
+- Anti-collapse slider defaults: `padding_bonus=1.0`, `max_turn_text_tokens=120`, `repetition_penalty=1.15`. Verify `buildConfigPayload()` is actually sending nonzero values before debugging "model rambling" symptoms.
 - `torch.cuda.empty_cache()` in `_run_rtc_session.finally`. Model weights and KV cache buffer stay resident across sessions.
 
 ## Gotchas

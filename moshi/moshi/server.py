@@ -262,7 +262,8 @@ class ServerState:
         self._inject_active: bool = False
         # Auto-rewind cooldown bookkeeping. Updated on a successful
         # rewind; checked before the next would fire.
-        self._last_rewind_at: float = 0.0
+        # time.monotonic() near process start can be smaller than AUTO_REWIND_MIN_INTERVAL_SEC; 0.0 sentinel would suppress the first rewind on fresh containers
+        self._last_rewind_at: Optional[float] = None
         # Gemini consecutive-error counter for the auto-disable path.
         # Reset on every 2xx success and on session start.
         self._gemini_consecutive_errors: int = 0
@@ -488,60 +489,77 @@ class ServerState:
                 cutoff = now - COLLAPSE_WINDOW_SEC
                 while self._collapse_triggers and self._collapse_triggers[0] < cutoff:
                     self._collapse_triggers.popleft()
-                self._collapse_triggers.append(now)
-                if len(self._collapse_triggers) >= COLLAPSE_TRIGGER_THRESHOLD:
-                    # Cooldown: the snapshotted state itself is often the
-                    # wobbling state, so back-to-back rewinds would storm.
-                    cooldown_left = AUTO_REWIND_MIN_INTERVAL_SEC - (now - self._last_rewind_at)
-                    if cooldown_left > 0:
-                        logger.warning(
-                            "auto-rewind suppressed by cooldown (%.0f s remaining)",
-                            cooldown_left,
-                        )
-                        self._collapse_triggers.clear()
-                    else:
-                        sid = self._active_session_id
-                        snapshots = self._session_snapshots.get(sid, []) if sid else []
-                        if snapshots:
-                            _, state_dict = snapshots[-1]
-                            # set_streaming_state_inplace pops entries from
-                            # the dict it's given. Pass a fresh shallow copy
-                            # so subsequent rewinds still find the keys.
-                            self.lm_gen.set_streaming_state_inplace(
-                                dict(state_dict)
-                            )
-                            # Clear the safety-net state too. Otherwise
-                            # _pad_force_remaining (12 frames of forced pad)
-                            # carries over and the rewound state immediately
-                            # re-triggers the streak.
-                            self.lm_gen._pad_force_remaining = 0
-                            self.lm_gen._non_pad_streak = 0
-                            self._last_rewind_at = now
+                # Qualifying gap: long natural turns can pulse _pad_force_remaining
+                # back-to-back without any wobble. Require >= 4 s since the prior
+                # trigger so three consecutive normal turns don't spuriously trip.
+                qualifying_gap_sec = 4.0
+                if (
+                    self._collapse_triggers
+                    and (now - self._collapse_triggers[-1]) < qualifying_gap_sec
+                ):
+                    # treat as continuation of the same turn; don't append, don't fire
+                    pass
+                else:
+                    self._collapse_triggers.append(now)
+                    if len(self._collapse_triggers) >= COLLAPSE_TRIGGER_THRESHOLD:
+                        # Cooldown: the snapshotted state itself is often the
+                        # wobbling state, so back-to-back rewinds would storm.
+                        if self._last_rewind_at is None:
+                            cooldown_left = 0.0
+                        else:
+                            cooldown_left = AUTO_REWIND_MIN_INTERVAL_SEC - (now - self._last_rewind_at)
+                        if cooldown_left > 0:
                             logger.warning(
-                                "auto-rewind: %d pad-force triggers in %.0fs, "
-                                "restored latest snapshot",
-                                len(self._collapse_triggers),
-                                COLLAPSE_WINDOW_SEC,
+                                "auto-rewind suppressed by cooldown (%.0f s remaining)",
+                                cooldown_left,
                             )
                             self._collapse_triggers.clear()
-                            sess = self._active_session
-                            loop = self._main_loop
-                            if sess is not None and loop is not None:
-                                # DataChannel sends touch the asyncio loop's
-                                # SCTP transport; aiortc is not thread-safe.
-                                # Schedule the send back on the loop thread.
-                                try:
-                                    loop.call_soon_threadsafe(
-                                        sess.send_notice,
-                                        "Auto-rewind: model wobbled, "
-                                        "restored recent snapshot",
-                                    )
-                                except Exception as exc:
-                                    logger.warning(
-                                        "auto-rewind notice scheduling failed: %s: %s",
-                                        type(exc).__name__,
-                                        exc,
-                                    )
+                        else:
+                            sid = self._active_session_id
+                            snapshots = self._session_snapshots.get(sid, []) if sid else []
+                            if snapshots:
+                                _, state_dict = snapshots[-1]
+                                # set_streaming_state_inplace pops entries from
+                                # the dict it's given. Pass a fresh shallow copy
+                                # so subsequent rewinds still find the keys.
+                                self.lm_gen.set_streaming_state_inplace(
+                                    dict(state_dict)
+                                )
+                                # Clear the safety-net state too. Otherwise
+                                # _pad_force_remaining (12 frames of forced pad)
+                                # carries over and the rewound state immediately
+                                # re-triggers the streak.
+                                self.lm_gen._pad_force_remaining = 0
+                                self.lm_gen._non_pad_streak = 0
+                                self._last_rewind_at = now
+                                logger.warning(
+                                    "auto-rewind: %d pad-force triggers in %.0fs, "
+                                    "restored latest snapshot",
+                                    len(self._collapse_triggers),
+                                    COLLAPSE_WINDOW_SEC,
+                                )
+                                self._collapse_triggers.clear()
+                                sess = self._active_session
+                                loop = self._main_loop
+                                if sess is not None and loop is not None:
+                                    # DataChannel sends touch the asyncio loop's
+                                    # SCTP transport; aiortc is not thread-safe.
+                                    # Schedule the send back on the loop thread.
+                                    try:
+                                        loop.call_soon_threadsafe(
+                                            sess.send_notice,
+                                            "Auto-rewind: model wobbled, "
+                                            "restored recent snapshot",
+                                        )
+                                    except Exception as exc:
+                                        logger.warning(
+                                            "auto-rewind notice scheduling failed: %s: %s",
+                                            type(exc).__name__,
+                                            exc,
+                                        )
+                            else:
+                                # discarding stale pre-snapshot triggers; otherwise the first usable snapshot can be torched by a single new trigger that pulls in pre-snapshot history
+                                self._collapse_triggers.clear()
             self._prev_pad_force_remaining = pad_force
 
             # --- inject window edge detection ------------------------
@@ -813,12 +831,38 @@ class ServerState:
                                 sess.send_notice(
                                     f"Vision auto-disabled after {VISION_AUTO_DISABLE_THRESHOLD} consecutive errors: {err_text[:120]}"
                                 )
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            logger.warning(
+                                "auto-disable notify failed: %s: %s",
+                                type(exc).__name__,
+                                exc,
+                            )
+        except aiohttp.ClientError as exc:
+            clog.log("warning", f"vision transport error: {type(exc).__name__}: {exc}")
+            self._gemini_consecutive_errors += 1
+            if self._gemini_consecutive_errors >= VISION_AUTO_DISABLE_THRESHOLD:
+                self._vision_force_disabled = True
+                clog.log(
+                    "warning",
+                    f"vision auto-disabled after {self._gemini_consecutive_errors} consecutive errors",
+                )
+                # mirror the existing client-notify pattern from the 4xx branch
+                try:
+                    sess = self._active_session
+                    if sess is not None:
+                        sess.send_vision_status(False)
+                        sess.send_notice("Vision auto-disabled after repeated transport errors")
+                except Exception as notify_exc:
+                    logger.warning(
+                        "auto-disable notify failed: %s: %s",
+                        type(notify_exc).__name__,
+                        notify_exc,
+                    )
         except Exception as exc:
-            clog.log(
-                "warning",
-                f"vision processing failed: {type(exc).__name__}: {exc}",
+            logger.exception(
+                "vision processing failed (code error, not transport): %s: %s",
+                type(exc).__name__,
+                exc,
             )
         finally:
             self._vision_in_flight.discard(session_id)
@@ -1202,6 +1246,8 @@ class ServerState:
         clog: ColorizedLog,
         session_id: Optional[str] = None,
     ) -> None:
+        _snap_t: Optional[asyncio.Task] = None
+        _cad_t: Optional[asyncio.Task] = None
         try:
             try:
                 await asyncio.wait_for(config_event.wait(), timeout=30.0)
@@ -1232,6 +1278,12 @@ class ServerState:
                     "info",
                     f"timing: voice prompt load {(time.monotonic() - t_vp) * 1000:.0f} ms ({voice_prompt_path})",
                 )
+            elif not voice_prompt_path:
+                # lm_gen.voice_prompt persists across sessions; without an explicit reset, a no-prompt session inherits the prior session's loaded voice cache
+                self.lm_gen.voice_prompt = None
+                self.lm_gen.voice_prompt_audio = None
+                self.lm_gen.voice_prompt_cache = None
+                self.lm_gen.voice_prompt_embeddings = None
 
             # Empty list (not None) so _step_text_prompt_core iterates as a
             # no-op when the user clears the textarea. Iterating None raises
@@ -1284,7 +1336,7 @@ class ServerState:
             self._prev_pad_force_remaining = 0
             self._vision_request_pending = False
             self._inject_active = False
-            self._last_rewind_at = 0.0
+            self._last_rewind_at = None
             # Reset auto-disable so a previous session's vision failures
             # don't carry over and silently block this session's calls.
             self._gemini_consecutive_errors = 0
@@ -1332,12 +1384,19 @@ class ServerState:
                             # Pass a shallow copy so the snapshot stays reusable on the
                             # next rewind.
                             self.lm_gen.set_streaming_state_inplace(dict(state_dict))
+                            # snapshot restores transformer state only; the safety-net counters live on LMGen and would re-trip the wobble being escaped
+                            self.lm_gen._pad_force_remaining = 0
+                            self.lm_gen._non_pad_streak = 0
 
                     await loop.run_in_executor(None, _do_rewind)
                     try:
                         session.send_notice(f"Rewound to snapshot from {age_sec:.0f} s ago")
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning(
+                            "auto-rewind notify failed: %s: %s",
+                            type(exc).__name__,
+                            exc,
+                        )
                 elif mtype == "vision_frame":
                     base64_data = msg.get("data", "")
                     if base64_data:
@@ -1508,7 +1567,6 @@ class ServerState:
         finally:
             if session_id is not None:
                 self._candidate_sessions.pop(session_id, None)
-                self._interaction_ids.pop(session_id, None)
                 self._session_snapshots.pop(session_id, None)
                 self._vision_in_flight.discard(session_id)
                 # Drain in-flight Gemini calls before the next session can
@@ -1526,9 +1584,20 @@ class ServerState:
                         )
                     except asyncio.TimeoutError:
                         clog.log("warning", "vision tasks did not drain within 2 s")
+                # pop after drain: a late vision task can still pass the active-session gate during the 2 s cancel window and write a fresh chain id; popping here guarantees the next session starts clean
+                self._interaction_ids.pop(session_id, None)
             self._active_session = None
             self._active_session_id = None
             self._main_loop = None
+            # explicit cancel + drain; otherwise stale ticks can contend for _infer_lock with the next session's warmup
+            for _task in (_cad_t, _snap_t):
+                if _task is not None and not _task.done():
+                    _task.cancel()
+            if _cad_t is not None or _snap_t is not None:
+                await asyncio.gather(
+                    *(t for t in (_cad_t, _snap_t) if t is not None),
+                    return_exceptions=True,
+                )
             try:
                 await session.close()
             finally:
@@ -1540,8 +1609,12 @@ class ServerState:
                 if torch.cuda.is_available():
                     try:
                         torch.cuda.empty_cache()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning(
+                            "cuda empty_cache failed: %s: %s",
+                            type(exc).__name__,
+                            exc,
+                        )
                 self.lock.release()
                 clog.log("info", "session closed, lock released")
 

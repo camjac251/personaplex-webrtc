@@ -204,10 +204,11 @@ class SessionConfig:
     text_temperature: float = 0.7
     text_topk: int = 25
     audio_topk: int = 250
-    repetition_penalty: float = 1.2
+    repetition_penalty: float = 1.15
     repetition_penalty_context: int = 64
-    padding_bonus: float = 0.0
-    max_turn_text_tokens: int = 0
+    # zero defaults mean a partial client payload silently disables collapse protection
+    padding_bonus: float = 1.0
+    max_turn_text_tokens: int = 120
 
 
 class RTCSession:
