@@ -1372,8 +1372,12 @@ class ServerState:
                         clog.log("warning", "rewind requested but no snapshots available")
                         try:
                             session.send_notice("Rewind: no snapshot yet (wait a few seconds)")
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            logger.warning(
+                                "rewind no-snapshot notify failed: %s: %s",
+                                type(exc).__name__,
+                                exc,
+                            )
                         return
                     snap_ts, state_dict = snapshots[-1]
                     age_sec = max(0.0, time.monotonic() - snap_ts)
@@ -1388,13 +1392,16 @@ class ServerState:
                             # snapshot restores transformer state only; the safety-net counters live on LMGen and would re-trip the wobble being escaped
                             self.lm_gen._pad_force_remaining = 0
                             self.lm_gen._non_pad_streak = 0
+                            self._collapse_triggers.clear()
+                            self._prev_pad_force_remaining = 0
+                            self._last_rewind_at = time.monotonic()
 
                     await loop.run_in_executor(None, _do_rewind)
                     try:
                         session.send_notice(f"Rewound to snapshot from {age_sec:.0f} s ago")
                     except Exception as exc:
                         logger.warning(
-                            "auto-rewind notify failed: %s: %s",
+                            "manual-rewind notify failed: %s: %s",
                             type(exc).__name__,
                             exc,
                         )
