@@ -1,0 +1,311 @@
+  /* Pipeline as vertical signal flow */
+  .flow {
+    display: flex; flex-direction: column;
+  }
+  .flow-stage {
+    position: relative;
+    display: grid;
+    grid-template-columns: 10px 1fr;
+    gap: 10px;
+    align-items: start;
+    padding-bottom: 14px;
+  }
+  .flow-stage:last-child { padding-bottom: 0; }
+  .flow-stage::before {
+    content: "";
+    position: absolute;
+    left: 4.5px;
+    top: 14px;
+    bottom: -1px;
+    width: 1px;
+    background: var(--line-2);
+  }
+  .flow-stage:last-child::before { display: none; }
+  .flow-stage.branch {
+    margin-left: 18px;
+    padding-bottom: 12px;
+  }
+  .flow-stage.branch::before {
+    display: none;
+  }
+  .flow-stage.branch::after {
+    content: "";
+    position: absolute;
+    left: -14px; top: 5px;
+    width: 14px; height: 1px;
+    background: var(--line-2);
+  }
+  .flow-dot {
+    width: 10px; height: 10px;
+    border: 1px solid var(--ink-4);
+    background: var(--bg-2);
+    border-radius: 50%;
+    margin-top: 2px;
+    position: relative;
+    z-index: 1;
+    transition: background 0.18s, border-color 0.18s;
+  }
+  .flow-stage.active .flow-dot {
+    background: var(--accent);
+    border-color: var(--accent);
+  }
+  .flow-stage.warn .flow-dot {
+    background: var(--amber);
+    border-color: var(--amber);
+  }
+  .flow-stage.branch .flow-dot {
+    width: 8px; height: 8px;
+    margin-top: 3px;
+  }
+  .flow-l {
+    font-size: 11.5px;
+    color: var(--ink-3);
+    line-height: 1.2;
+    transition: color 0.18s;
+  }
+  .flow-stage.active .flow-l { color: var(--ink); }
+  .flow-v {
+    font-family: 'Geist Mono', monospace;
+    font-size: 10px;
+    color: var(--ink-4);
+    letter-spacing: 0.04em;
+    margin-top: 2px;
+    line-height: 1.4;
+    font-feature-settings: 'tnum';
+  }
+  .flow-stage.active .flow-v { color: var(--ink-2); }
+
+  /* Tail meter (small inline progress bar for telemetry/pipeline) */
+  .meter {
+    display: block;
+    width: 100%;
+    height: 3px;
+    background: var(--surface-3);
+    border-radius: 999px;
+    overflow: hidden;
+    margin-top: 5px;
+  }
+  .meter .fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: inherit;
+    transition: width 0.18s ease-out;
+  }
+  .meter .fill.warn { background: var(--amber); }
+  .meter .fill.err  { background: var(--red); }
+  .meter .fill.violet { background: var(--violet); }
+
+  /* Vision history rows now clickable */
+  .v-entry { cursor: pointer; transition: color 0.12s; }
+  .v-entry:hover { color: var(--ink); }
+  .v-entry:hover .ts { color: var(--ink-3); }
+
+  /* Frame inspector modal */
+  .modal-backdrop {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.55);
+    z-index: 500;
+    display: grid; place-items: center;
+    animation: fade-in 0.14s ease-out;
+  }
+  .modal {
+    width: 440px;
+    max-width: calc(100vw - 32px);
+    background: var(--surface);
+    border: 1px solid var(--line-3);
+    border-radius: var(--r-card);
+    box-shadow: 0 16px 40px rgba(0,0,0,0.7);
+    overflow: hidden;
+    animation: modal-in 0.18s ease-out;
+  }
+  @keyframes modal-in {
+    from { opacity: 0; transform: scale(0.96); }
+    to   { opacity: 1; transform: scale(1); }
+  }
+  .modal-h {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--line);
+    background: var(--bg-2);
+  }
+  .modal-h .l {
+    font-family: 'Geist Mono', monospace;
+    font-size: 10px;
+    color: var(--ink-2);
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+  }
+  .modal-h .meta {
+    font-family: 'Geist Mono', monospace;
+    font-size: 10px;
+    color: var(--ink-4);
+    letter-spacing: 0.06em;
+  }
+  .modal-h .x {
+    cursor: pointer;
+    background: transparent;
+    border: 0;
+    appearance: none;
+    color: var(--ink-4);
+    font: inherit;
+    font-size: 15px;
+    padding: 2px 6px;
+    line-height: 1;
+    margin-left: 8px;
+  }
+  .modal-h .x:hover { color: var(--ink); }
+  .modal-frame {
+    aspect-ratio: 16 / 10;
+    position: relative;
+    background: #0a0a0a;
+    overflow: hidden;
+  }
+  .modal-frame::before {
+    content: "";
+    position: absolute; inset: 0;
+    z-index: 0;
+    background:
+      radial-gradient(ellipse at var(--fx, 30%) var(--fy, 35%), rgba(141, 126, 179, 0.4), transparent 60%),
+      radial-gradient(ellipse at var(--gx, 75%) var(--gy, 70%), rgba(176, 145, 71, 0.28), transparent 55%),
+      repeating-linear-gradient(45deg, rgba(255,255,255,0.025) 0 16px, transparent 16px 32px);
+  }
+  .modal-frame::after {
+    content: "";
+    position: absolute; inset: 0;
+    z-index: 2;
+    background: linear-gradient(180deg, transparent 50%, rgba(0,0,0,0.75));
+  }
+  .modal-img {
+    position: absolute; inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    z-index: 1;
+  }
+  .modal-frame .scan {
+    position: absolute; inset: 8px;
+    z-index: 3;
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 3px;
+    pointer-events: none;
+  }
+  .modal-frame .cap {
+    position: absolute;
+    left: 14px; right: 14px; bottom: 12px;
+    z-index: 4;
+    color: #fff;
+    font-size: 13px;
+    line-height: 1.4;
+    text-shadow: 0 1px 4px rgba(0,0,0,0.9);
+  }
+  .modal-meta {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    padding: 12px 14px;
+    gap: 12px;
+  }
+  .modal-meta .cell {
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .modal-meta .l {
+    font-family: 'Geist Mono', monospace;
+    font-size: 9px;
+    color: var(--ink-5);
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+  }
+  .modal-meta .v {
+    font-family: 'Geist Mono', monospace;
+    font-size: 12px;
+    color: var(--ink);
+    font-feature-settings: 'tnum';
+  }
+  .modal-choice {
+    padding: 14px;
+    display: grid;
+    gap: 8px;
+  }
+  .source-choice {
+    width: 100%;
+    border: 1px solid var(--line);
+    background: var(--surface);
+    color: var(--ink-2);
+    border-radius: var(--r-ctrl);
+    padding: 12px;
+    display: grid;
+    gap: 4px;
+    text-align: left;
+    cursor: pointer;
+    font: inherit;
+  }
+  .source-choice:hover {
+    border-color: var(--line-2);
+    background: var(--surface-2);
+    color: var(--ink);
+  }
+  .source-choice span:last-child {
+    color: var(--ink-4);
+    font-size: 11px;
+  }
+  .source-k {
+    font-family: 'Geist Mono', monospace;
+    color: var(--ink);
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .modal-foot {
+    padding: 10px 14px;
+    border-top: 1px solid var(--line);
+    background: var(--bg);
+    display: flex; gap: 8px; justify-content: flex-end;
+  }
+
+  /* Pre-flight rows */
+  .pfl {
+    display: grid;
+    grid-template-columns: 22px 1fr auto;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 11px;
+    border: 1px solid var(--line);
+    background: var(--sunk);
+    border-radius: var(--r-ctrl);
+    transition: border-color 0.18s, background 0.18s;
+  }
+  .pfl.checking { border-color: rgba(176,145,71,0.4); }
+  .pfl.ok       { border-color: rgba(132,168,90,0.4); background: rgba(132,168,90,0.05); }
+  .pfl.fail     { border-color: rgba(194,90,90,0.4);  background: rgba(194,90,90,0.05); }
+  .pfl-d {
+    width: 22px; height: 22px;
+    display: grid; place-items: center;
+    border-radius: 50%;
+    background: var(--surface-2);
+    color: var(--ink-3);
+    font-size: 11px;
+  }
+  .pfl.ok .pfl-d   { background: var(--accent); color: var(--bg); }
+  .pfl.fail .pfl-d { background: var(--red); color: var(--bg); }
+  .pfl-d svg { width: 11px; height: 11px; display: block; }
+  .pfl-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--ink-5); }
+  .pfl-spin {
+    width: 11px; height: 11px;
+    border: 1.5px solid var(--ink-5);
+    border-top-color: var(--amber);
+    border-radius: 50%;
+    animation: pfl-spin 0.8s linear infinite;
+  }
+  @keyframes pfl-spin { to { transform: rotate(360deg); } }
+  .pfl-body { min-width: 0; }
+  .pfl-l    { font-size: 12px; color: var(--ink); font-weight: 500; }
+  .pfl-h    { font-family: 'Geist Mono', monospace; font-size: 9.5px; color: var(--ink-4); letter-spacing: 0.06em; margin-top: 2px; }
+  .pfl-status {
+    font-family: 'Geist Mono', monospace;
+    font-size: 9.5px;
+    color: var(--ink-4);
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+  }
+  .pfl.ok   .pfl-status { color: var(--accent); }
+  .pfl.fail .pfl-status { color: var(--red); }
+  .pfl.checking .pfl-status { color: var(--amber); }
