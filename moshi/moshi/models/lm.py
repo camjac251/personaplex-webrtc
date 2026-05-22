@@ -714,10 +714,10 @@ class LMGen(StreamingModule[_LMGenState]):
         self._frame_rate = frame_rate
         self._sample_rate = sample_rate
         self._frame_size = int(self._sample_rate / self._frame_rate)
-        self._zero_frame = torch.zeros(1, 1, self._frame_size, device=device)
+        self._zero_frame = torch.zeros(1, 1, self._frame_size, device=self.lm_model.device)
         duration = self._frame_size / self._sample_rate
         sine = create_sinewave(duration, self._sample_rate)
-        self._sine_frame = torch.tensor(sine, device=device).unsqueeze(0).unsqueeze(0)  # (1,1,T)
+        self._sine_frame = torch.tensor(sine, device=self.lm_model.device).unsqueeze(0).unsqueeze(0)  # (1,1,T)
         self.check = check
         self.report_loss = report_loss
         if report_loss:
@@ -733,7 +733,15 @@ class LMGen(StreamingModule[_LMGenState]):
         self.voice_prompt_audio: Optional[torch.Tensor] = None
         self.voice_prompt_cache: Optional[torch.Tensor] = None
         self.voice_prompt_embeddings: Optional[torch.Tensor] = None
-        #self.voice_prompt_mimi_streaming_state: Optional[StreamingStateDict] = None
+        # Missing: Mimi encoder streaming state is not captured alongside the LM
+        # state. When a saved voice prompt is loaded mid-session the LM cache
+        # resumes mid-stream but the Mimi encoder restarts at t=0, so the
+        # encoder transients drift over the first few minutes of cloned output.
+        # Fix would require: bumping the on-disk format to namespace LM and
+        # Mimi state (e.g. "lm." / "mimi." prefixes in the safetensors blob),
+        # threading the mimi instance into load_voice_prompt_embeddings and
+        # set_streaming_state_inplace, and saving mimi.get_streaming_state()
+        # at the end of _step_voice_prompt_core before save_streaming_state.
 
     def _init_streaming_state(self, batch_size: int) -> _LMGenState:
         lm_model = self.lm_model
@@ -952,13 +960,15 @@ class LMGen(StreamingModule[_LMGenState]):
         sampled_text_token = sampled_text_token[:, 0, 0]  # shape is [B]
 
         next_text_token = torch.where(provided_[:, 0, 0], target_[:, 0, 0], sampled_text_token)
+        # forced text tokens are externally-supplied context, not model speech; counting them toward _non_pad_streak self-triggers the safety net
+        text_was_forced = bool(provided_[0, 0, 0].item())
 
         # Hard cap on turn length. If the model emits N consecutive non-pad
         # text tokens, force pad for ~1 s of text frames (12.5 Hz) so the
         # audio decoder produces real silence and the turn actually yields.
         # Safety net under padding_bonus; no effect when max_turn_text_tokens
         # is 0. batch=1 is asserted above, so .item() is fine.
-        if self.max_turn_text_tokens > 0:
+        if self.max_turn_text_tokens > 0 and not text_was_forced:
             pad_id = lm_model.text_padding_token_id
             if self._pad_force_remaining > 0:
                 next_text_token = torch.full_like(next_text_token, pad_id)
