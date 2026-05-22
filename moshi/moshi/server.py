@@ -700,6 +700,7 @@ class ServerState:
                 )
 
         try:
+            loop = asyncio.get_event_loop()
             prev_id = self._interaction_ids.get(session_id)
             url = f"https://generativelanguage.googleapis.com/v1beta/interactions?key={self._gemini_api_key}"
 
@@ -715,7 +716,13 @@ class ServerState:
             # talking about. Keeps the scene description aligned with the
             # conversation. Skipped if empty or on the very first call
             # (the system prompt already covers the cold-start case).
-            recent_snippet = "".join(list(self._transcript_recent)).strip()
+            def _recent_transcript_snippet() -> str:
+                with self._infer_lock:
+                    return "".join(list(self._transcript_recent)).strip()
+
+            recent_snippet = await loop.run_in_executor(
+                None, _recent_transcript_snippet
+            )
             if recent_snippet:
                 input_parts.append({
                     "type": "text",
@@ -857,7 +864,6 @@ class ServerState:
                                 tokens[:VISION_QUEUE_MAX]
                             )
 
-                    loop = asyncio.get_event_loop()
                     await loop.run_in_executor(None, _set_vision_context)
                 else:
                     err_text = await resp.text()
