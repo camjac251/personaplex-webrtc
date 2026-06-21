@@ -1,9 +1,48 @@
-  /* ─── Tuning rail (between transcript and transport) ─── */
+  /* ─── Tuning rack (collapsible wrapper between transcript and transport) ─── */
+  .rack {
+    border-top: 1px solid var(--line);
+    background: var(--bg-2);
+  }
+  .rack-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 6px 14px;
+    border: 0;
+    background: transparent;
+    text-align: left;
+    cursor: pointer;
+    user-select: none;
+    transition: background 0.12s;
+  }
+  .rack-bar:hover { background: var(--surface); }
+  .rack-bar:focus-visible {
+    outline: 2px solid var(--line-3);
+    outline-offset: -2px;
+  }
+  .rack-t {
+    font-family: 'Geist Mono', monospace;
+    font-size: 9px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+  .rack-meta {
+    font-size: 9px;
+    color: var(--ink-4);
+    margin-left: auto;
+    letter-spacing: 0.06em;
+    font-feature-settings: 'tnum';
+  }
+  .rack-x {
+    font-size: 10px;
+    color: var(--ink-4);
+  }
+  /* ─── Tuning rail (four-column slider grid inside the rack) ─── */
   .rail {
     display: grid;
     grid-template-columns: repeat(4, 1fr);
-    border-top: 1px solid var(--line);
-    background: var(--bg-2);
     min-height: 0;
   }
   .rail-col {
@@ -80,6 +119,63 @@
   .seed-row input { padding: 6px 9px; font-size: 11.5px; }
   .seed-row .btn { padding: 0 10px; font-size: 11px; }
 
+  /* Label-and-stepper option row (idle timeout) */
+  .opt-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-top: 10px;
+  }
+  .opt-l {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+  }
+  .opt-n { font-size: 11.5px; color: var(--ink-2); }
+  .opt-d { font-size: 10px; color: var(--ink-4); }
+  .step-num {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+  .step-num button {
+    width: 20px;
+    height: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--line-2);
+    border-radius: 4px;
+    background: var(--surface);
+    color: var(--ink-2);
+    font-size: 13px;
+    cursor: pointer;
+    transition: color 0.12s ease, border-color 0.12s ease;
+  }
+  .step-num button:hover {
+    color: var(--ink);
+    border-color: var(--line-3);
+  }
+  .step-num span {
+    font-size: 11px;
+    min-width: 28px;
+    text-align: center;
+  }
+
+  /* Two-button file-IO group for the session-config row */
+  .config-io {
+    display: flex;
+    gap: 5px;
+    flex-shrink: 0;
+  }
+  .config-io .btn {
+    padding: 5px 9px;
+    font-size: 11px;
+  }
+
   /* Vision panel inline settings */
   .vision-tune {
     border-top: 1px solid var(--line);
@@ -131,7 +227,22 @@
     letter-spacing: 0.18em;
     text-transform: uppercase;
     margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
   }
+  /* Rack-module signature: a short accent bar leading the console header. */
+  .cons-h::before {
+    content: "";
+    width: 9px;
+    height: 2px;
+    border-radius: 1px;
+    background: var(--accent);
+    opacity: 0.6;
+    flex-shrink: 0;
+  }
+  /* The Events header carries a trailing Clear control instead of the tick. */
+  .cons-h.events-h::before { display: none; }
   .row {
     display: flex; justify-content: space-between; align-items: center;
     padding: 5px 0;
@@ -177,3 +288,110 @@
     margin-top: 8px;
   }
   .cons-note b { color: var(--ink-3); font-weight: 500; }
+
+  /* ─── Snapshot bookmarks (console D · Snapshots) ─── */
+  .bm-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 8px;
+  }
+  .bm {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 6px 9px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--r-ctrl);
+    color: var(--ink-2);
+    text-align: left;
+    cursor: pointer;
+    transition: color 0.12s, border-color 0.12s;
+  }
+  .bm:hover:not(:disabled) {
+    border-color: var(--line-3);
+    color: var(--ink);
+  }
+  .bm:focus-visible {
+    outline: 2px solid var(--line-3);
+    outline-offset: -2px;
+  }
+  .bm:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .bm .btn-ico {
+    width: 11px;
+    height: 11px;
+    color: var(--ink-4);
+    flex-shrink: 0;
+  }
+  .bm-l {
+    flex: 1;
+    min-width: 0;
+    font-size: 11.5px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .bm-t {
+    font-size: 10px;
+    color: var(--ink-4);
+    font-feature-settings: 'tnum';
+  }
+
+  .netbar {
+    height: 3px;
+    background: var(--surface-3);
+    border-radius: 999px;
+    overflow: hidden;
+    margin: 6px 0 4px;
+  }
+  .netbar-fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: 999px;
+    transition: width 0.4s ease, background 0.4s ease;
+  }
+  .netbar-fill.warn { background: var(--amber); }
+  .netbar-fill.err { background: var(--red); }
+
+  .seg-mini-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 7px 0 2px;
+  }
+  .seg-mini-label {
+    font-family: 'Geist Mono', monospace;
+    font-size: 9px;
+    color: var(--ink-4);
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+  }
+  .seg-mini {
+    display: flex;
+    background: var(--sunk);
+    border: 1px solid var(--line);
+    border-radius: var(--r-ctrl);
+    padding: 2px;
+    gap: 1px;
+  }
+  .seg-mini button {
+    background: transparent;
+    border: 0;
+    padding: 4px 9px;
+    color: var(--ink-4);
+    font-family: 'Geist Mono', monospace;
+    font-size: 9.5px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    border-radius: 3px;
+    cursor: pointer;
+  }
+  .seg-mini button:hover { color: var(--ink-2); }
+  .seg-mini button.on { background: var(--surface-3); color: var(--ink); }
+  .cons-sect .btn.block { margin-top: 9px; }

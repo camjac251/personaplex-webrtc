@@ -17,8 +17,22 @@
 
   /* Narrow */
   @media (max-width: 1080px) {
-    .body { grid-template-columns: var(--col-side) 1fr; }
-    .cons { display: none; }
+    .body {
+      grid-template-columns: var(--col-side) 1fr;
+      grid-template-rows: minmax(0, 1fr) auto;
+      overflow: auto;
+    }
+    .body.side-collapsed {
+      grid-template-columns: 56px minmax(0, 1fr);
+    }
+    .cons {
+      display: block;
+      grid-column: 1 / -1;
+      border-left: none;
+      border-top: 1px solid var(--line);
+      max-height: 320px;
+      overflow-y: auto;
+    }
   }
   @media (max-width: 760px) {
     .topbar {
@@ -36,6 +50,20 @@
     .shell { height: auto; min-height: 100vh; }
     body { overflow: auto; }
     .telem { grid-template-columns: repeat(2, 1fr); }
+    .turn-insights {
+      grid-template-columns: 1fr;
+    }
+    .turn-insight {
+      border-right: 0;
+      border-bottom: 1px solid var(--line);
+    }
+    .turn-insight:last-child {
+      border-bottom: 0;
+    }
+    .turn-ribbon-head {
+      flex-direction: column;
+      gap: 3px;
+    }
     .lower.with-vision { grid-template-columns: 1fr; }
     .vision { border-left: none; border-top: 1px solid var(--line); }
   }

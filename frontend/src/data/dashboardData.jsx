@@ -61,30 +61,69 @@ export const VOICES = [
   "VARM4",
 ];
 
-export const VOICE_TAGS = {
-  NATF0: ["warm", "measured"],
-  NATF1: ["bright", "fast"],
-  NATF2: ["neutral", "measured"],
-  NATF3: ["warm", "slow"],
-  NATM0: ["dark", "measured"],
-  NATM1: ["neutral", "fast"],
-  NATM2: ["bright", "fast"],
-  NATM3: ["warm", "measured"],
-  VARF0: ["bright", "theatrical"],
-  VARF1: ["bright", "fast"],
-  VARF2: ["warm", "breathy"],
-  VARF3: ["dark", "gravelly"],
-  VARF4: ["bright", "playful"],
-  VARM0: ["dark", "gravelly"],
-  VARM1: ["bright", "fast"],
-  VARM2: ["warm", "measured"],
-  VARM3: ["neutral", "theatrical"],
-  VARM4: ["warm", "low"],
-};
-
-export const TONE_FILTERS = ["all", "warm", "neutral", "bright", "dark"];
-export const VISION_PER_CALL_USD = 0.0012;
+export const VISION_PER_CALL_USD = 0.00012;
 export const VISION_MOTION_THRESHOLD = 0.04;
+
+export const HEARTBEAT_INTERVAL_MS = 1000;
+export const HEARTBEAT_STALE_AFTER_MS = 3500;
+export const HEARTBEAT_MISSED_LIMIT = 3;
+export const HEARTBEAT_MAX_PENDING = 30;
+
+// Grace window after a transient "disconnected" before forcing an ICE
+// restart. Long enough to let aiortc/ICE self-recover, short enough that a
+// frozen conversation does not linger.
+export const RECONNECT_GRACE_MS = 2500;
+// Receiver playoutDelayHint (seconds) when the jitter buffer is biased for
+// smoothness rather than latency.
+export const JITTER_BUFFER_SMOOTH_SEC = 0.2;
+
+export const ADHERENCE_MODES = [
+  {
+    id: "balanced",
+    label: "Balanced",
+    desc: "Stay on role without sounding rigid.",
+    instruction:
+      "Adherence: follow the persona and task above, stay focused on the user's request, and stop when the answer is complete.",
+  },
+  {
+    id: "strict",
+    label: "Strict",
+    desc: "Prefer short, literal task completion.",
+    instruction:
+      "Adherence: treat the persona and task above as firm instructions. Do not drift into unrelated topics, do not keep talking after the task is answered, and ask one brief clarification if needed.",
+  },
+  {
+    id: "adaptive",
+    label: "Adaptive",
+    desc: "Follow the user when the conversation shifts.",
+    instruction:
+      "Adherence: keep the persona active, but adapt to the user's latest intent when they interrupt, correct, or redirect the conversation.",
+  },
+];
+
+export const EXPRESSION_MODES = [
+  {
+    id: "natural",
+    label: "Natural",
+    desc: "Warm, brief, and practical.",
+    instruction:
+      "Expression: speak naturally with short, warm responses and avoid long monologues.",
+  },
+  {
+    id: "concise",
+    label: "Concise",
+    desc: "Minimal words and fast turn-taking.",
+    instruction:
+      "Expression: use the fewest words that solve the user's request. Prefer one or two sentences unless detail is explicitly requested.",
+  },
+  {
+    id: "expressive",
+    label: "Expressive",
+    desc: "More prosody and color when useful.",
+    instruction:
+      "Expression: use vivid phrasing and more vocal energy while still yielding quickly when the user speaks.",
+  },
+];
 
 export const DEFAULTS = {
   textTemp: 0.7,
@@ -101,6 +140,78 @@ export const DEFAULTS = {
   seed: 42,
   visionIntervalMs: 5000,
 };
+
+export const SESSION_PROFILES = [
+  {
+    id: "live_support",
+    label: "Live support",
+    desc: "Short turns with strong yield pressure.",
+    presetId: "assistant",
+    voice: "NATF1",
+    adherenceMode: "strict",
+    expressionMode: "concise",
+    textTemp: 0.55,
+    textTopk: 18,
+    audioTemp: 0.65,
+    audioTopk: 220,
+    repPenalty: 1.2,
+    repContext: 80,
+    padBonus: 1.15,
+    maxTurn: 80,
+    echoCancel: true,
+    noiseSupp: true,
+    autoGain: false,
+    visionInTranscript: false,
+    visionIntervalMs: 7000,
+    seedRandom: true,
+  },
+  {
+    id: "expressive_guide",
+    label: "Expressive guide",
+    desc: "More color while keeping interruption friendly.",
+    presetId: "teacher",
+    voice: "VARF4",
+    adherenceMode: "balanced",
+    expressionMode: "expressive",
+    textTemp: 0.82,
+    textTopk: 40,
+    audioTemp: 0.9,
+    audioTopk: 320,
+    repPenalty: 1.12,
+    repContext: 64,
+    padBonus: 1.0,
+    maxTurn: 120,
+    echoCancel: true,
+    noiseSupp: true,
+    autoGain: false,
+    visionInTranscript: false,
+    visionIntervalMs: 5000,
+    seedRandom: true,
+  },
+  {
+    id: "clinical_intake",
+    label: "Clinical intake",
+    desc: "Structured collection with low drift.",
+    presetId: "medical",
+    voice: "NATF2",
+    adherenceMode: "strict",
+    expressionMode: "concise",
+    textTemp: 0.45,
+    textTopk: 12,
+    audioTemp: 0.55,
+    audioTopk: 180,
+    repPenalty: 1.2,
+    repContext: 96,
+    padBonus: 1.2,
+    maxTurn: 90,
+    echoCancel: true,
+    noiseSupp: true,
+    autoGain: false,
+    visionInTranscript: false,
+    visionIntervalMs: 10000,
+    seedRandom: true,
+  },
+];
 
 export const PARAM_INFO = {
   txtTemp: {
@@ -233,6 +344,16 @@ export const PARAM_INFO = {
       <>
         The selected embedding or uploaded audio conditions the model's voice.
         It is a prefix, not perfect zero-shot cloning.
+      </>
+    ),
+  },
+  voiceBlend: {
+    title: "Blend a second voice",
+    body: (
+      <>
+        Mixes two built-in voices into one speaking timbre by interpolating
+        their speaker embeddings. The slider sets the share of each. Applied
+        on connect, like the rest of the voice prefix.
       </>
     ),
   },

@@ -23,6 +23,8 @@
     --red:          #c25a5a;
     --blue:         #6f93b3;
     --violet:       #8d7eb3;
+    --scope-bg:     #0a0c09;       /* phosphor-dark oscilloscope screen */
+    --scope-grid:   rgba(132, 168, 90, 0.10);
 
     --r-card: 6px;
     --r-ctrl: 5px;

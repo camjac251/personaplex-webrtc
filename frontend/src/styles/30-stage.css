@@ -49,7 +49,7 @@
   /* Telemetry row: slim */
   .telem {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(5, 1fr);
     border-bottom: 1px solid var(--line);
     background: var(--bg-2);
   }
@@ -85,43 +85,94 @@
     min-height: 0;
   }
 
-  /* Visualizer: compact, no glow */
-  .viz {
+  /* Meter-bridge deck: dual VU ladders + phosphor oscilloscope */
+  .deck {
     border-bottom: 1px solid var(--line);
-    background: var(--bg-2);
-    position: relative;
-    height: 168px;
-    overflow: hidden;
-  }
-  .viz-head {
-    position: absolute; inset: 8px 12px auto 12px;
-    display: flex; justify-content: space-between; align-items: center;
-    z-index: 2;
-    pointer-events: none;
-  }
-  .viz-head .ch {
-    font-family: 'Geist Mono', monospace;
-    font-size: 9px;
-    color: var(--ink-4);
-    letter-spacing: 0.18em;
-    text-transform: uppercase;
-  }
-  .viz-head .ch .state {
-    color: var(--ink-3);
-    margin-left: 8px;
-  }
-  .viz-head .ch.active .state { color: var(--accent); }
-  .viz-head .ch.r { text-align: right; }
-  .viz-head .ch.r.active .state { color: var(--amber); }
-  .viz-canvas { position: absolute; inset: 0; }
-  .viz-canvas canvas { width: 100%; height: 100%; display: block; }
-  .viz-fade {
-    position: absolute; inset: 0;
-    pointer-events: none;
-    background: linear-gradient(90deg, var(--bg-2) 0%, transparent 4%, transparent 96%, var(--bg-2) 100%);
+    background: linear-gradient(180deg, var(--bg-2), var(--bg));
+    display: grid;
+    grid-template-columns: 84px minmax(0, 1fr) 84px;
+    gap: 0;
+    height: clamp(150px, 24vh, 240px);
   }
 
-  /* Inject-active banner over viz */
+  /* Channel strip */
+  .chan {
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+    padding: 8px 9px 7px;
+    min-width: 0;
+  }
+  .chan:first-child { border-right: 1px solid var(--line); }
+  .chan:last-child { border-left: 1px solid var(--line); }
+  .chan-h { display: flex; align-items: center; gap: 6px; justify-content: space-between; }
+  .chan-n {
+    font-family: 'Geist Mono', monospace; font-size: 8.5px;
+    letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-3);
+  }
+  .chan.hot .chan-n { color: var(--ink); }
+  .chan-led { width: 6px; height: 6px; border-radius: 50%; background: var(--ink-5); transition: background 0.1s; }
+  .chan.hot .chan-led.green { background: var(--accent); }
+  .chan.hot .chan-led.amber { background: var(--amber); }
+  .chan-body { display: flex; gap: 6px; align-items: stretch; justify-content: center; min-height: 0; padding: 8px 0; }
+  .chan-scale {
+    display: flex; flex-direction: column; justify-content: space-between;
+    font-family: 'Geist Mono', monospace; font-size: 7.5px; color: var(--ink-5);
+    text-align: right; padding: 1px 0; letter-spacing: 0.04em;
+  }
+  .chan-s {
+    text-align: center; font-size: 8.5px; letter-spacing: 0.16em;
+    color: var(--ink-4); padding-top: 5px; border-top: 1px solid var(--line);
+  }
+  .chan.hot .chan-s { color: var(--ink-2); }
+
+  /* VU ladder */
+  .vu {
+    display: flex; flex-direction: column; gap: 2px;
+    width: 16px; height: 100%;
+    justify-content: flex-end;
+  }
+  .vu-seg {
+    flex: 1; border-radius: 1px; min-height: 3px;
+    background: var(--surface-3);
+    opacity: 0.45;
+    transition: opacity 0.06s, background 0.06s;
+  }
+  .vu-seg.on { opacity: 1; }
+  .vu-seg.z-green.on { background: var(--accent); }
+  .vu-seg.z-amber.on { background: var(--amber); }
+  .vu-seg.z-red.on { background: var(--red); }
+  .vu-seg.peak { box-shadow: 0 0 0 1px rgba(255,255,255,0.25) inset; }
+
+  /* Oscilloscope screen */
+  .scope {
+    position: relative;
+    margin: 8px;
+    border: 1px solid var(--line-2);
+    border-radius: 4px;
+    background:
+      radial-gradient(120% 120% at 50% 0%, rgba(132,168,90,0.04), transparent 70%),
+      var(--scope-bg);
+    overflow: hidden;
+    box-shadow: inset 0 0 24px rgba(0,0,0,0.6), inset 0 0 0 1px rgba(255,255,255,0.02);
+  }
+  .scope-screen { position: absolute; inset: 0; }
+  .scope-screen canvas { width: 100%; height: 100%; display: block; }
+  .scope-corner {
+    position: absolute;
+    font-family: 'Geist Mono', monospace; font-size: 8px;
+    letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-4);
+    display: inline-flex; align-items: center; gap: 5px;
+    z-index: 2; pointer-events: none;
+  }
+  .scope-corner.tl { top: 7px; left: 9px; }
+  .scope-corner.tr { top: 7px; right: 9px; }
+  .scope-corner.bl { bottom: 7px; left: 9px; }
+  .scope-corner.br { bottom: 7px; right: 9px; }
+  .scope-corner .dot { width: 5px; height: 5px; border-radius: 50%; }
+  .scope-corner .dot.green { background: var(--accent); }
+  .scope-corner .dot.amber { background: var(--amber); }
+
+  /* Inject-active banner over the scope */
   .viz-inject {
     position: absolute; top: 8px; left: 50%; transform: translateX(-50%);
     z-index: 3;
@@ -158,6 +209,13 @@
   }
   .viz-inject.barge .d { background: var(--amber); }
   .viz-inject.barge .gate { border-left-color: rgba(176, 145, 71, 0.3); }
+  .viz-inject.interrupt {
+    background: rgba(194, 90, 90, 0.18);
+    border-color: rgba(194, 90, 90, 0.4);
+    color: var(--red);
+  }
+  .viz-inject.interrupt .d { background: var(--red); }
+  .viz-inject.interrupt .gate { border-left-color: rgba(194, 90, 90, 0.3); }
 
   /* Idle / connecting overlay over viz */
   .viz-overlay {
@@ -392,6 +450,135 @@
     flex: 1; overflow-y: auto;
     padding: 14px 16px 20px;
   }
+  .turn-insights {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    border-top: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+    background: var(--bg-2);
+  }
+  .turn-insight {
+    min-width: 0;
+    padding: 7px 16px;
+    border-right: 1px solid var(--line);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .turn-insight:last-child { border-right: 0; }
+  .turn-insight .k,
+  .turn-ribbon-head {
+    font-family: 'Geist Mono', monospace;
+    font-size: 9px;
+    color: var(--ink-4);
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+  }
+  .turn-insight .v {
+    font-family: 'Geist Mono', monospace;
+    font-size: 11px;
+    color: var(--ink-2);
+    font-feature-settings: 'tnum';
+  }
+  .turn-ribbon-wrap {
+    padding: 8px 16px 10px;
+    border-bottom: 1px solid var(--line);
+    background: var(--bg-2);
+  }
+  .turn-ribbon-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 7px;
+  }
+  .turn-ribbon-head span:last-child { color: var(--ink-5); }
+  .turn-ribbon {
+    position: relative;
+    display: flex;
+    gap: 7px;
+    overflow-x: auto;
+    margin: 0;
+    list-style: none;
+    padding: 2px 0 4px;
+  }
+  .turn-ribbon::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 18px;
+    height: 1px;
+    background: var(--line);
+  }
+  /* List wrapper around each mark: a layout-neutral flex item that lets the
+     inner button keep governing width and stretch to the ribbon height. */
+  .turn-mark-item {
+    display: flex;
+    min-width: 0;
+  }
+  .turn-mark {
+    position: relative;
+    z-index: 1;
+    min-width: 122px;
+    max-width: 190px;
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: center;
+    gap: 7px;
+    padding: 7px 8px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-ctrl);
+    background: var(--sunk);
+    color: var(--ink-3);
+    text-align: left;
+    cursor: pointer;
+    overflow: hidden;
+  }
+  .turn-mark::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: var(--p, 0%);
+    height: 2px;
+    background: var(--ink-4);
+  }
+  .turn-mark:hover {
+    color: var(--ink);
+    border-color: var(--line-3);
+    background: var(--surface);
+  }
+  .turn-mark.assistant::before,
+  .turn-mark.assistant-end::before,
+  .turn-mark.ok::before { background: var(--accent); }
+  .turn-mark.vision::before,
+  .turn-mark.inject::before,
+  .turn-mark.info::before { background: var(--violet); }
+  .turn-mark.budget::before,
+  .turn-mark.warn::before { background: var(--amber); }
+  .turn-mark.interrupt::before,
+  .turn-mark.rewind::before,
+  .turn-mark.err::before { background: var(--red); }
+  .turn-mark .t {
+    font-family: 'Geist Mono', monospace;
+    font-size: 9px;
+    color: var(--ink-5);
+    font-feature-settings: 'tnum';
+  }
+  .turn-mark .m {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11px;
+    line-height: 1.2;
+  }
+  .timeline-audio {
+    width: 100%;
+    height: 32px;
+    margin-top: 8px;
+    display: block;
+  }
   .line {
     display: grid;
     grid-template-columns: 42px 1fr;
@@ -421,6 +608,14 @@
     line-height: 1.55;
     color: var(--ink);
   }
+  /* User turn that produced no recognized words: a muted, italic marker
+     that the human spoke without fabricating their words. */
+  .line .text.muted {
+    color: var(--ink-4);
+    font-style: italic;
+    font-size: 12.5px;
+  }
+  .line.audio-only .who { opacity: 0.65; }
   .typing::after { content: "▍"; color: var(--accent); animation: blink 1s steps(2) infinite; margin-left: 1px; }
   @keyframes blink { 50% { opacity: 0; } }
 
@@ -517,6 +712,7 @@
   .vision-meta {
     padding: 7px 12px;
     display: flex; justify-content: space-between;
+    gap: 8px;
     font-family: 'Geist Mono', monospace;
     font-size: 9.5px;
     color: var(--ink-3);
@@ -525,6 +721,7 @@
     border-bottom: 1px solid var(--line);
   }
   .vision-meta b { color: var(--ink); font-weight: 500; }
+  .vision-meta .warn { color: var(--amber); }
   .vision-history {
     flex: 1; overflow-y: auto;
     padding: 6px 12px 12px;
@@ -544,6 +741,17 @@
     margin-bottom: 6px;
   }
   .v-entry .ts { color: var(--ink-5); margin-right: 5px; }
+  .vision-budget {
+    width: 100%;
+    min-height: 32px;
+    padding: 6px 8px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-ctrl);
+    background: var(--sunk);
+    color: var(--ink);
+    font: inherit;
+    font-size: 12px;
+  }
 
   /* Transport bar */
   .transport {

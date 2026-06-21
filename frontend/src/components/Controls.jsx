@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
 import { PARAM_INFO } from "../data/dashboardData.jsx";
@@ -43,6 +43,23 @@ export function Info({ k }) {
   }, [open]);
 
   if (!meta) return null;
+  const tipPanel = (
+    <div
+      className={cls("info-tip-portal", pos.flip && "below")}
+      role="tooltip"
+      style={{
+        position: "fixed",
+        left: pos.left,
+        top: pos.top,
+        transform: pos.flip ? "translateY(0)" : "translateY(-100%)",
+      }}
+      onMouseEnter={keepOpen}
+      onMouseLeave={closeSoon}
+    >
+      <div className="info-tip-title">{meta.title}</div>
+      <div className="info-tip-body">{meta.body}</div>
+    </div>
+  );
   return (
     <>
       <button
@@ -58,54 +75,77 @@ export function Info({ k }) {
           setOpen((current) => !current);
         }}
       />
-      {open &&
-        createPortal(
-          <div
-            className={cls("info-tip-portal", pos.flip && "below")}
-            style={{
-              position: "fixed",
-              left: pos.left,
-              top: pos.top,
-              transform: pos.flip ? "translateY(0)" : "translateY(-100%)",
-            }}
-            onMouseEnter={keepOpen}
-            onMouseLeave={closeSoon}
-          >
-            <div className="info-tip-title">{meta.title}</div>
-            <div className="info-tip-body">{meta.body}</div>
-          </div>,
-          document.body,
-        )}
+      {open && createPortal(tipPanel, document.body)}
     </>
   );
 }
 
 export function Listbox({ value, options, onChange, placeholder = "Select", label = placeholder }) {
   const ref = useRef(null);
+  const menuId = useId();
   const [open, setOpen] = useState(false);
+  const [focusIdx, setFocusIdx] = useState(0);
   const current = options.find((option) => option.value === value);
+  const activeIndex = options.findIndex((option) => option.value === value);
 
   useEffect(() => {
     if (!open) return;
+    setFocusIdx(Math.max(0, activeIndex));
     const onDoc = (event) => {
       if (!ref.current?.contains(event.target)) setOpen(false);
     };
     document.addEventListener("mousedown", onDoc);
     return () => document.removeEventListener("mousedown", onDoc);
-  }, [open]);
+  }, [activeIndex, open]);
+
+  const choose = (option) => {
+    if (!option) return;
+    onChange(option.value);
+    setOpen(false);
+  };
+
+  const onKeyDown = (event) => {
+    if (!["ArrowDown", "ArrowUp", "Home", "End", "Enter", " ", "Escape"].includes(event.key)) return;
+    if (!open && ["ArrowDown", "ArrowUp", "Enter", " "].includes(event.key)) {
+      event.preventDefault();
+      setOpen(true);
+      setFocusIdx(Math.max(0, activeIndex));
+      return;
+    }
+    if (!open) return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      setOpen(false);
+      return;
+    }
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      choose(options[focusIdx]);
+      return;
+    }
+    event.preventDefault();
+    if (event.key === "Home") setFocusIdx(0);
+    if (event.key === "End") setFocusIdx(Math.max(0, options.length - 1));
+    if (event.key === "ArrowDown") setFocusIdx((index) => Math.min(options.length - 1, index + 1));
+    if (event.key === "ArrowUp") setFocusIdx((index) => Math.max(0, index - 1));
+  };
 
   return (
     <div className="lb" ref={ref}>
       <button
         type="button"
+        role="combobox"
         className={cls("lb-trigger", open && "open")}
         aria-haspopup="listbox"
         aria-expanded={open}
+        aria-controls={menuId}
+        aria-activedescendant={open ? `${menuId}-opt-${focusIdx}` : undefined}
         aria-label={label}
+        onKeyDown={onKeyDown}
         onClick={() => setOpen((currentOpen) => !currentOpen)}
       >
         <span className="lb-trigger-label">{current?.label || placeholder}</span>
-        <svg className="lb-chev" viewBox="0 0 10 10">
+        <svg className="lb-chev" viewBox="0 0 10 10" aria-hidden="true" focusable="false">
           <path
             d="M2 4l3 3 3-3"
             stroke="currentColor"
@@ -116,18 +156,17 @@ export function Listbox({ value, options, onChange, placeholder = "Select", labe
         </svg>
       </button>
       {open && (
-        <div className="lb-menu" role="listbox" aria-label={label}>
-          {options.map((option) => (
+        <div id={menuId} className="lb-menu" role="listbox" aria-label={label}>
+          {options.map((option, index) => (
             <button
               key={option.value}
+              id={`${menuId}-opt-${index}`}
               type="button"
-              className={cls("lb-opt", option.value === value && "active")}
+              className={cls("lb-opt", option.value === value && "active", index === focusIdx && "focused")}
               role="option"
               aria-selected={option.value === value}
-              onClick={() => {
-                onChange(option.value);
-                setOpen(false);
-              }}
+              onMouseEnter={() => setFocusIdx(index)}
+              onClick={() => choose(option)}
             >
               <span className="lb-opt-marker" />
               <span className="lb-opt-body">

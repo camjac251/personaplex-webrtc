@@ -9,6 +9,7 @@ export function PreflightModal({ preflight, done, onRun, onClose }) {
     { key: "turn", label: "TURN reachable", hint: "GET /api/rtc/ice-servers" },
   ];
   return (
+    // biome-ignore lint/a11y: backdrop click-to-dismiss is a supplementary affordance; ESC via trapDialogKeydown and the Close button provide the keyboard path
     <div className="modal-backdrop" onClick={onClose}>
       <div
         ref={dialogRef}
@@ -32,8 +33,8 @@ export function PreflightModal({ preflight, done, onRun, onClose }) {
             return (
               <div key={row.key} className={cls("pfl", state)}>
                 <div className="pfl-d">
-                  {state === "ok" && <svg viewBox="0 0 10 10"><polyline points="2,5 4.5,7.5 8,3" stroke="currentColor" strokeWidth="1.5" fill="none" /></svg>}
-                  {state === "fail" && <svg viewBox="0 0 10 10"><line x1="2.5" y1="2.5" x2="7.5" y2="7.5" stroke="currentColor" strokeWidth="1.5" /><line x1="7.5" y1="2.5" x2="2.5" y2="7.5" stroke="currentColor" strokeWidth="1.5" /></svg>}
+                  {state === "ok" && <svg viewBox="0 0 10 10" aria-hidden="true" focusable="false"><polyline points="2,5 4.5,7.5 8,3" stroke="currentColor" strokeWidth="1.5" fill="none" /></svg>}
+                  {state === "fail" && <svg viewBox="0 0 10 10" aria-hidden="true" focusable="false"><line x1="2.5" y1="2.5" x2="7.5" y2="7.5" stroke="currentColor" strokeWidth="1.5" /><line x1="7.5" y1="2.5" x2="2.5" y2="7.5" stroke="currentColor" strokeWidth="1.5" /></svg>}
                   {state === "checking" && <span className="pfl-spin" />}
                   {state === "idle" && <span className="pfl-dot" />}
                 </div>
@@ -58,6 +59,7 @@ export function PreflightModal({ preflight, done, onRun, onClose }) {
 export function VisionSourceModal({ onClose, onCamera, onScreen }) {
   const dialogRef = useDialogFocus();
   return (
+    // biome-ignore lint/a11y: backdrop click-to-dismiss is a supplementary affordance; ESC via trapDialogKeydown and the Close button provide the keyboard path
     <div className="modal-backdrop" onClick={onClose}>
       <div
         ref={dialogRef}
@@ -92,7 +94,19 @@ export function VisionSourceModal({ onClose, onCamera, onScreen }) {
 
 export function FrameModal({ entry, onClose, onDetail }) {
   const dialogRef = useDialogFocus();
+  const meta = entry.meta || {};
+  const source = meta.source || (entry.frame ? "captured" : "caption");
+  const size = meta.width && meta.height ? `${meta.width}x${meta.height}` : "unknown";
+  const payload = Number.isFinite(meta.bytes) && meta.bytes > 0 ? `${(meta.bytes / 1024).toFixed(1)} KB` : "unknown";
+  const detail = meta.detail ? "yes" : "no";
+  const pending = !!entry.detailPending;
+  const detailLabel = pending
+    ? "Re-requesting…"
+    : entry.frame
+      ? "Re-request detail"
+      : "Capture detail";
   return (
+    // biome-ignore lint/a11y: backdrop click-to-dismiss is a supplementary affordance; ESC via trapDialogKeydown and the Close button provide the keyboard path
     <div className="modal-backdrop" onClick={onClose}>
       <div
         ref={dialogRef}
@@ -106,7 +120,7 @@ export function FrameModal({ entry, onClose, onDetail }) {
       >
         <div className="modal-h">
           <span id="frame-title" className="l">Frame · {entry.ts}</span>
-          <span className="meta">jpeg</span>
+          <span className="meta">{meta.detail ? "detail jpeg" : "jpeg"}</span>
           <button type="button" className="x" aria-label="Close frame inspector" onClick={onClose}>×</button>
         </div>
         <div className="modal-frame">
@@ -115,12 +129,21 @@ export function FrameModal({ entry, onClose, onDetail }) {
           <div className="cap">{entry.text}</div>
         </div>
         <div className="modal-meta">
-          <div className="cell"><span className="l">Source</span><span className="v">{entry.frame ? "captured" : "caption"}</span></div>
-          <div className="cell"><span className="l">Detail</span><span className="v">available</span></div>
-          <div className="cell"><span className="l">Action</span><span className="v">re-send</span></div>
+          <div className="cell"><span className="l">Source</span><span className="v">{source}</span></div>
+          <div className="cell"><span className="l">Size</span><span className="v">{size}</span></div>
+          <div className="cell"><span className="l">Detail</span><span className="v">{detail}</span></div>
+          <div className="cell"><span className="l">Payload</span><span className="v">{payload}</span></div>
         </div>
         <div className="modal-foot">
-          <button className="btn ghost" type="button" onClick={onDetail}>Re-request detail</button>
+          <button
+            className="btn ghost"
+            type="button"
+            onClick={onDetail}
+            disabled={pending}
+            aria-busy={pending}
+          >
+            {detailLabel}
+          </button>
           <button className="btn" type="button" onClick={onClose}>Close</button>
         </div>
       </div>
