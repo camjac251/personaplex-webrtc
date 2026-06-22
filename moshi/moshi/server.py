@@ -184,7 +184,10 @@ def _strip_system_tags(text: str) -> str:
 
 
 def _sanitize_vision_text(text: str) -> str:
-    cleaned = " ".join(text.replace("\x00", " ").split())
+    # Strip any <system> wrap first: the wrap is a t=0-only convention, so a
+    # caption carrying it would inject an off-distribution marker mid-stream.
+    # The reinforce path strips too; the vision path must match.
+    cleaned = " ".join(_strip_system_tags(text).replace("\x00", " ").split())
     if len(cleaned) <= VISION_TEXT_MAX_CHARS:
         return cleaned
     trimmed = cleaned[:VISION_TEXT_MAX_CHARS].rsplit(" ", 1)[0]
@@ -1427,6 +1430,15 @@ class ServerState:
                                 # re-triggers the streak.
                                 self.lm_gen._pad_force_remaining = 0
                                 self.lm_gen._non_pad_streak = 0
+                                # Inject queues live on ServerState, not in the
+                                # snapshot, and forced frames freeze the pad
+                                # streak; clear them so a pre-rewind caption is
+                                # not dripped into the freshly-restored state.
+                                self._vision_pending.clear()
+                                self._vision_inject_steps = 0
+                                self._reinforce_pending.clear()
+                                self._reinforce_inject_steps = 0
+                                self._vision_pad_streak = 0
                                 self._last_rewind_at = now
                                 # Drop buffered user audio so the turn that
                                 # straddled the wobble is not re-finalized
@@ -1663,10 +1675,13 @@ class ServerState:
         if session_id != self._active_session_id:
             return
 
-        # In-flight guard to prevent overlapping calls from corrupting the chain
-        if session_id in self._vision_in_flight:
+        # In-flight guard to prevent overlapping calls from corrupting the
+        # chain. Detail re-requests use a separate key so a user's detail
+        # click and the live cadence never evict each other's slot.
+        inflight_key = f"{session_id}:detail" if detail else session_id
+        if inflight_key in self._vision_in_flight:
             return
-        self._vision_in_flight.add(session_id)
+        self._vision_in_flight.add(inflight_key)
 
         if self._http_session is None or self._http_session.closed:
             self._http_session = aiohttp.ClientSession()
@@ -1677,7 +1692,7 @@ class ServerState:
             self._vision_force_disabled = True
             clog.log(
                 "warning",
-                f"vision auto-disabled after {self._gemini_consecutive_errors} consecutive errors",
+                f"{notice} ({self._gemini_consecutive_errors} consecutive errors)",
             )
             try:
                 sess = self._active_session
@@ -1745,7 +1760,10 @@ class ServerState:
                         )
                     return
 
-            prev_id = self._interaction_ids.get(session_id)
+            # A detail re-request describes a held historical frame, so it must
+            # not read from (or later write to) the live conversational chain,
+            # or the next live frame would chain off a stale scene.
+            prev_id = None if detail else self._interaction_ids.get(session_id)
             url = f"https://generativelanguage.googleapis.com/v1beta/interactions?key={self._gemini_api_key}"
 
             input_parts = []
@@ -1848,7 +1866,8 @@ class ServerState:
                             "warning",
                             f"Gemini returned no text (steps={len(steps)})",
                         )
-                        self._interaction_ids.pop(session_id, None)
+                        if not detail:
+                            self._interaction_ids.pop(session_id, None)
                         self._gemini_consecutive_errors += 1
                         if self._gemini_consecutive_errors >= VISION_AUTO_DISABLE_THRESHOLD:
                             _disable_vision(
@@ -1857,17 +1876,21 @@ class ServerState:
                         return
 
                     self._gemini_consecutive_errors = 0
-                    if new_id:
-                        self._interaction_ids[session_id] = new_id
-                    else:
-                        # Missing id means the Interactions chain is
-                        # effectively reset; drop the prior id so the
-                        # next call starts fresh with the system prompt.
-                        clog.log(
-                            "warning",
-                            "Gemini response missing 'id'; dropping chain",
-                        )
-                        self._interaction_ids.pop(session_id, None)
+                    # Only the live path owns the conversational chain id; a
+                    # detail re-request must neither write its response id back
+                    # nor drop the chain.
+                    if not detail:
+                        if new_id:
+                            self._interaction_ids[session_id] = new_id
+                        else:
+                            # Missing id means the Interactions chain is
+                            # effectively reset; drop the prior id so the
+                            # next call starts fresh with the system prompt.
+                            clog.log(
+                                "warning",
+                                "Gemini response missing 'id'; dropping chain",
+                            )
+                            self._interaction_ids.pop(session_id, None)
 
                     clog.log("info", f"vision: {text}")
                     # Surface the description to the client UI.
@@ -1931,7 +1954,8 @@ class ServerState:
                 else:
                     err_text = await resp.text()
                     clog.log("warning", f"Gemini Interactions error ({resp.status}): {err_text}")
-                    self._interaction_ids.pop(session_id, None)
+                    if not detail:
+                        self._interaction_ids.pop(session_id, None)
                     self._gemini_consecutive_errors += 1
                     if self._gemini_consecutive_errors >= VISION_AUTO_DISABLE_THRESHOLD:
                         _disable_vision(
@@ -1955,7 +1979,7 @@ class ServerState:
                 exc,
             )
         finally:
-            self._vision_in_flight.discard(session_id)
+            self._vision_in_flight.discard(inflight_key)
 
     def _resolve_voice_prompt_path(self, voice_prompt_filename: str) -> tuple[Optional[str], Optional[str]]:
         """Resolve the on-disk path for a voice prompt name.
@@ -2727,6 +2751,14 @@ class ServerState:
                                 # the safety-net counters like the latest path.
                                 self.lm_gen._pad_force_remaining = 0
                                 self.lm_gen._non_pad_streak = 0
+                                # Clear the inject queues (not part of the
+                                # snapshot) so a pre-rewind caption is not
+                                # dripped into the restored bookmark state.
+                                self._vision_pending.clear()
+                                self._vision_inject_steps = 0
+                                self._reinforce_pending.clear()
+                                self._reinforce_inject_steps = 0
+                                self._vision_pad_streak = 0
                                 self._collapse_triggers.clear()
                                 self._prev_pad_force_remaining = 0
                                 # Share the auto-rewind cooldown clock so a jump
@@ -2787,6 +2819,14 @@ class ServerState:
                             # snapshot restores transformer state only; the safety-net counters live on LMGen and would re-trip the wobble being escaped
                             self.lm_gen._pad_force_remaining = 0
                             self.lm_gen._non_pad_streak = 0
+                            # Clear the inject queues (not part of the snapshot)
+                            # so a pre-rewind caption is not dripped into the
+                            # restored state.
+                            self._vision_pending.clear()
+                            self._vision_inject_steps = 0
+                            self._reinforce_pending.clear()
+                            self._reinforce_inject_steps = 0
+                            self._vision_pad_streak = 0
                             self._collapse_triggers.clear()
                             self._prev_pad_force_remaining = 0
                             self._last_rewind_at = time.monotonic()

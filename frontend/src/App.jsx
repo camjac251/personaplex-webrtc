@@ -1346,15 +1346,15 @@ function App() {
       } else if (message.type === "vision_status") {
         setVisionEnabledFromServer(!!message.enabled);
         if (!message.enabled) {
-          // A server-driven disable while local capture is running means a
-          // server-side backstop tripped. Stop local capture and latch the
-          // budget marker so the UI lands in the "stops at limit" state to
-          // match the client-side cutoff, regardless of which side fired.
+          // A server-driven disable can be an error auto-disable, the spend
+          // ceiling, or a missing key. Stop local capture, but do not infer a
+          // budget trip here: that flag is owned by the client-side cost
+          // effect (and the server's own spend notice surfaces the budget
+          // case), so error-disables are no longer mislabeled "budget hit".
           if (visionStreamRef.current) {
-            setVisionBudgetTripped(true);
             stopVision();
           }
-          addNotice("warn", "Vision unavailable or auto-disabled");
+          addNotice("warn", "Vision disabled by server for this session");
         }
       } else if (message.type === "stat") {
         setGpuStat((stat) => ({
@@ -1810,10 +1810,17 @@ function App() {
           visionLastFrameDataRef.current.length === frame.data.length
         ) {
           let diff = 0;
-          for (let i = 0; i < frame.data.length; i += 16) {
-            diff += Math.abs(frame.data[i] - visionLastFrameDataRef.current[i]);
+          // Sample luma across R, G, and B per stride. Stepping by 16 (a
+          // multiple of 4) used to land only on the red channel, so motion
+          // that moved green/blue while holding red could fall under the
+          // threshold and be gated out.
+          for (let i = 0; i + 2 < frame.data.length; i += 16) {
+            diff +=
+              Math.abs(frame.data[i] - visionLastFrameDataRef.current[i]) +
+              Math.abs(frame.data[i + 1] - visionLastFrameDataRef.current[i + 1]) +
+              Math.abs(frame.data[i + 2] - visionLastFrameDataRef.current[i + 2]);
           }
-          const meanDelta = diff / (frame.data.length / 16) / 255;
+          const meanDelta = diff / (frame.data.length / 16) / 3 / 255;
           if (meanDelta < VISION_MOTION_THRESHOLD) {
             setVisionFramesGated((count) => count + 1);
             return false;
@@ -1840,7 +1847,7 @@ function App() {
   const startVisionSource = useCallback(async (source) => {
     if (!isLive) return;
     if (!visionEnabledFromServer) {
-      addNotice("warn", "Vision unavailable, server has no Gemini key");
+      addNotice("warn", "Vision is unavailable for this session");
       toast("Vision unavailable");
       return;
     }
@@ -1874,7 +1881,7 @@ function App() {
   const startVision = useCallback(() => {
     if (!isLive) return;
     if (!visionEnabledFromServer) {
-      addNotice("warn", "Vision unavailable, server has no Gemini key");
+      addNotice("warn", "Vision is unavailable for this session");
       toast("Vision unavailable");
       return;
     }
@@ -1904,9 +1911,16 @@ function App() {
   useEffect(() => {
     if (!visionOn || !visionStreamRef.current) return undefined;
     if (visionIntervalRef.current) clearInterval(visionIntervalRef.current);
+    // Clamp at point of use: a stale or corrupt stored value (0, negative,
+    // NaN) would otherwise coerce setInterval to the browser minimum and fire
+    // captures (real Gemini calls) many times a second.
+    const periodMs = Math.min(
+      30000,
+      Math.max(1000, Number(visionIntervalMs) || DEFAULTS.visionIntervalMs),
+    );
     const intervalId = setInterval(() => {
       if (!stateRef.current.visionPaused) captureFrame(false, false);
-    }, visionIntervalMs);
+    }, periodMs);
     visionIntervalRef.current = intervalId;
     return () => {
       clearInterval(intervalId);

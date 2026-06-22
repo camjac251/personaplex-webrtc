@@ -995,7 +995,15 @@ class LMGen(StreamingModule[_LMGenState]):
         # Skip pad (0) and silence (3) so they do not crowd the context. Also,
         # filtering 0 here is what makes the duplicate-index scatter in
         # apply_repetition_penalty unambiguous (the sentinel for empty slots).
-        if self.repetition_penalty > 1.0 and self.repetition_penalty_context > 0:
+        # Exclude forced (externally-injected) tokens, mirroring the
+        # max-turn streak guard above. Without this, injected caption/persona
+        # words enter the ring buffer and the model is later penalized for
+        # naturally referencing the very scene it was just fed.
+        if (
+            self.repetition_penalty > 1.0
+            and self.repetition_penalty_context > 0
+            and not text_was_forced
+        ):
             ctx = self.repetition_penalty_context
             keep_mask = (next_text_token != 0) & (next_text_token != 3)
             slot = state.recent_text_offset % ctx
