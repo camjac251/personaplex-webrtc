@@ -92,6 +92,17 @@
   }
 
   /* ─── Listbox (custom select) ─────────────────────── */
+  .lb-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .lb-caption {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    font-family: 'Geist Mono', monospace;
+    font-size: 9px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--ink-4);
+  }
   .lb { position: relative; }
   .lb-trigger {
     width: 100%;

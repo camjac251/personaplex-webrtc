@@ -100,6 +100,12 @@ function App() {
   const [speaking, setSpeaking] = useState(null);
   const [interrupting, setInterrupting] = useState(false);
   const [transcriptText, setTranscriptText] = useState("");
+  // AI transcript split into per-turn segments for chronological rendering.
+  // Each entry is { id, at, text }; a new segment opens on the same
+  // turn-boundary signal that drives the session timeline (a >1600 ms gap
+  // between text chunks). transcriptText stays as the flat accumulator that
+  // token and rate accounting read from.
+  const [aiTurns, setAiTurns] = useState([]);
   // User-side transcript turns. Each entry is { id, audioOnly, text }. A
   // turn is created from the local speaking-state transition (mic spoke,
   // assistant resumed) with audioOnly true and no text; the optional
@@ -258,6 +264,8 @@ function App() {
   // a user_text message can upgrade the right audio-only row. Null when no
   // user turn is open.
   const userTurnOpenRef = useRef(null);
+  // Id of the assistant transcript segment currently receiving text chunks.
+  const aiTurnOpenRef = useRef(null);
   const recordingPlaybackRef = useRef(null);
   const stateRef = useRef({});
   const bargeActiveRef = useRef(false);
@@ -1209,6 +1217,9 @@ function App() {
             { id: `${Date.now()}-ai`, ts, offsetMs, level: "ok", kind: "assistant", label: "Assistant turn started" },
             ...items,
           ].slice(0, 80));
+          const aiTurnId = `${Date.now()}-ai-${Math.random().toString(36).slice(2, 7)}`;
+          aiTurnOpenRef.current = aiTurnId;
+          setAiTurns((turns) => [...turns, { id: aiTurnId, at: now, text: "" }].slice(-60));
         } else {
           assistantTurnRef.current.lastChunkAt = now;
         }
@@ -1224,6 +1235,11 @@ function App() {
           setAssistantRate({ words, seconds, wpm: Math.round((words / seconds) * 60) });
           return next;
         });
+        setAiTurns((turns) =>
+          turns.map((turn) =>
+            turn.id === aiTurnOpenRef.current ? { ...turn, text: turn.text + chunk } : turn,
+          ),
+        );
         assistantIdleTimerRef.current = window.setTimeout(() => {
           const turn = assistantTurnRef.current;
           if (!turn.startedAt) return;
@@ -1250,6 +1266,7 @@ function App() {
             lastLength: transcriptLengthRef.current,
             words: 0,
           };
+          aiTurnOpenRef.current = null;
           assistantIdleTimerRef.current = null;
         }, 1600);
       } else if (message.type === "user_text") {
@@ -1287,7 +1304,7 @@ function App() {
           // transition): record a fresh turn so the words are not dropped.
           return [
             ...turns,
-            { id: freshId, audioOnly: userText.length === 0, text: userText },
+            { id: freshId, audioOnly: userText.length === 0, text: userText, at: performance.now() },
           ].slice(-40);
         });
       } else if (message.type === "vision_caption") {
@@ -1477,6 +1494,8 @@ function App() {
     setStageMessage("Requesting microphone");
     setTranscriptText("");
     transcriptLengthRef.current = 0;
+    setAiTurns([]);
+    aiTurnOpenRef.current = null;
     setUserTurns([]);
     userTurnOpenRef.current = null;
     userSpokeRef.current = false;
@@ -1718,6 +1737,8 @@ function App() {
     cleanup();
     setTranscriptText("");
     transcriptLengthRef.current = 0;
+    setAiTurns([]);
+    aiTurnOpenRef.current = null;
     setUserTurns([]);
     userTurnOpenRef.current = null;
     userSpokeRef.current = false;
@@ -2270,7 +2291,7 @@ function App() {
       userSpokeRef.current = false;
       const id = `${Date.now()}-you-${Math.random().toString(36).slice(2, 7)}`;
       userTurnOpenRef.current = id;
-      setUserTurns((turns) => [...turns, { id, audioOnly: true, text: "" }].slice(-40));
+      setUserTurns((turns) => [...turns, { id, audioOnly: true, text: "", at: performance.now() }].slice(-40));
     }
   }, [speaking, phase]);
 
@@ -2432,6 +2453,20 @@ function App() {
   const phaseIdx = { idle: 0, connecting: 1, warmup: 2, live: 3, ended: 4 }[phase] ?? 0;
   const phaseProgress = { idle: 0, connecting: 25, warmup: 55, live: 82, ended: 100 }[phase] ?? 0;
   const turnTokens = Math.max(0, transcriptText.trim().split(/\s+/).filter(Boolean).length);
+  // Interleave assistant segments and user turns into one chronological list
+  // so the transcript reads as a back-and-forth instead of one AI blob.
+  const transcriptTurns = [
+    ...aiTurns
+      .filter((turn) => turn.text.trim())
+      .map((turn) => ({ id: turn.id, role: "ai", at: turn.at || 0, text: turn.text })),
+    ...userTurns.map((turn) => ({
+      id: turn.id,
+      role: "you",
+      at: turn.at || 0,
+      audioOnly: turn.audioOnly,
+      text: turn.text,
+    })),
+  ].sort((a, b) => a.at - b.at);
   const blendActive = voiceBlend && !uploadedVoiceFilename && voiceB && voiceB !== voice && blendMix > 0;
   const voiceDisplay = uploadedVoiceFilename
     ? uploadedVoiceLabel || "uploaded"
@@ -2536,13 +2571,18 @@ function App() {
               <div className="sect-h">
                 <div>
                   <div className="sect-num">01 · PERSONA</div>
-                  <div className="sect-title">System prompt</div>
+                  <div className="sect-title" style={{ display: "inline-flex", alignItems: "center" }}>
+                    System prompt
+                    <Info k="systemPrompt" />
+                  </div>
                 </div>
                 <span className="sect-sub">{presetId === "custom" ? "custom" : "preset"}</span>
               </div>
               <div className="session-profile">
                 <Listbox
                   label="Session profile"
+                  caption="Session profile"
+                  info="profile"
                   value={sessionProfileId}
                   options={[
                     ...allSessionProfiles.map((profile) => ({
@@ -2620,6 +2660,8 @@ function App() {
               <div style={{ height: 8 }} />
               <Listbox
                 label="Persona preset"
+                caption="Persona preset"
+                info="persona"
                 value={presetId}
                 options={[
                   ...PERSONA_PRESETS.map((preset) => ({
@@ -2654,6 +2696,8 @@ function App() {
               <div className="prompt-modes">
                 <Listbox
                   label="Adherence"
+                  caption="Adherence"
+                  info="adherence"
                   value={adherenceMode}
                   options={ADHERENCE_MODES.map((mode) => ({
                     value: mode.id,
@@ -2667,6 +2711,8 @@ function App() {
                 />
                 <Listbox
                   label="Expression"
+                  caption="Expression"
+                  info="expression"
                   value={expressionMode}
                   options={EXPRESSION_MODES.map((mode) => ({
                     value: mode.id,
@@ -2681,7 +2727,10 @@ function App() {
               </div>
               <div className="opt-row">
                 <div className="opt-l">
-                  <span className="opt-n">Reinforce in silences</span>
+                  <span className="opt-n" style={{ display: "inline-flex", alignItems: "center" }}>
+                    Reinforce in silences
+                    <Info k="reinforce" />
+                  </span>
                   <span className="opt-d">Re-assert the persona during pauses to fight long-session drift</span>
                 </div>
                 <button
@@ -2841,7 +2890,10 @@ function App() {
               <div className="sect-h">
                 <div>
                   <div className="sect-num">03 · CLONE</div>
-                  <div className="sect-title">Reference clip</div>
+                  <div className="sect-title" style={{ display: "inline-flex", alignItems: "center" }}>
+                    Reference clip
+                    <Info k="clone" />
+                  </div>
                 </div>
                 <span className="sect-sub">{uploadedVoiceFilename ? "active" : "optional"}</span>
               </div>
@@ -2892,7 +2944,10 @@ function App() {
               {uploadedVoiceFilename && (
                 <div className="clone-strength">
                   <div className="clone-strength-row">
-                    <span className="l">Clone strength</span>
+                    <span className="l" style={{ display: "inline-flex", alignItems: "center" }}>
+                      Clone strength
+                      <Info k="cloneStrength" />
+                    </span>
                     <span className="v mono">{cloneStrength}%</span>
                   </div>
                   <input
@@ -2917,7 +2972,10 @@ function App() {
               <div className="sect-h">
                 <div>
                   <div className="sect-num">04 · VISION</div>
-                  <div className="sect-title">Scene prompt</div>
+                  <div className="sect-title" style={{ display: "inline-flex", alignItems: "center" }}>
+                    Scene prompt
+                    <Info k="visionPrompt" />
+                  </div>
                 </div>
                 <span className="sect-sub">Gemini</span>
               </div>
@@ -2949,7 +3007,10 @@ function App() {
               <ToggleRow info="agc" name="Auto gain" desc="May swing the model input" value={autoGain} onChange={(value) => { setAutoGain(value); setSessionProfileId("custom"); }} />
               <div className="device-route">
                 <div className="device-route-copy">
-                  <div className="n">Speaker output</div>
+                  <div className="n" style={{ display: "inline-flex", alignItems: "center" }}>
+                    Speaker output
+                    <Info k="output" />
+                  </div>
                   <div className="d">{canRouteOutput ? "Assistant playback route" : "Browser controlled"}</div>
                 </div>
                 {canRouteOutput ? (
@@ -3007,7 +3068,10 @@ function App() {
               </div>
               <div className="opt-row">
                 <div className="opt-l">
-                  <span className="opt-n">Idle timeout</span>
+                  <span className="opt-n" style={{ display: "inline-flex", alignItems: "center" }}>
+                    Idle timeout
+                    <Info k="idle" />
+                  </span>
                   <span className="opt-d">Auto-end the session to release the live slot</span>
                 </div>
                 <div className="step-num">
@@ -3260,7 +3324,7 @@ function App() {
                   <span className="r">{assistantRate.words ? `${assistantRate.wpm} wpm` : isLive ? "streaming" : phase}</span>
                 </div>
                 <div className="transcript-stream">
-                  {!transcriptText && userTurns.length === 0 ? (
+                  {transcriptTurns.length === 0 ? (
                     <div className="transcript-empty">
                       <div>
                         <div className="label">{isLive ? "Listening" : "No active transcript"}</div>
@@ -3268,14 +3332,13 @@ function App() {
                       </div>
                     </div>
                   ) : (
-                    <>
-                      {transcriptText && (
-                        <div className="line ai">
+                    transcriptTurns.map((turn) =>
+                      turn.role === "ai" ? (
+                        <div key={turn.id} className="line ai">
                           <span className="who">AI</span>
-                          <span className="text">{transcriptText}</span>
+                          <span className="text">{turn.text}</span>
                         </div>
-                      )}
-                      {userTurns.map((turn) => (
+                      ) : (
                         <div key={turn.id} className={cls("line you", turn.audioOnly && "audio-only")}>
                           <span className="who">You</span>
                           {turn.audioOnly ? (
@@ -3284,8 +3347,8 @@ function App() {
                             <span className="text">{turn.text}</span>
                           )}
                         </div>
-                      ))}
-                    </>
+                      ),
+                    )
                   )}
                 </div>
                 {/* biome-ignore lint/a11y/useAriaPropsSupportedByRole: aria-label names this readout region for assistive tech; visible per-row labels are also present */}
@@ -3402,7 +3465,10 @@ function App() {
                     </div>
                     <div>
                       <div className="mini-row">
-                        <span className="l">Cost ceiling</span>
+                        <span className="l" style={{ display: "inline-flex", alignItems: "center" }}>
+                          Cost ceiling
+                          <Info k="visionBudget" />
+                        </span>
                         <span className="v">{visionCostLimitActive ? `$${Number(visionCostLimitUsd).toFixed(2)}` : "off"}</span>
                       </div>
                       <input
@@ -3568,7 +3634,7 @@ function App() {
             <Row label="Packet loss" value={isLive ? `${netStats.lossPct}%` : "—"} dot={isLive && netStats.lossPct > 1 ? "warn" : ""} />
             <Row label="Candidate" value={isLive && netStats.candidate ? netStats.candidate : "—"} dot={isLive ? "ok" : ""} />
             <div className="seg-mini-row">
-              <span className="seg-mini-label" id="jitter-buffer-label">Jitter buffer</span>
+              <span className="seg-mini-label" id="jitter-buffer-label" style={{ display: "inline-flex", alignItems: "center" }}>Jitter buffer<Info k="jitter" /></span>
               {/* biome-ignore lint/a11y/useSemanticElements: segmented toggle; role=group with aria-labelledby is correct here and <fieldset> would impose form-control styling */}
               <div className="seg-mini" role="group" aria-labelledby="jitter-buffer-label">
                 {[

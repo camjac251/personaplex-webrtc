@@ -357,4 +357,142 @@ export const PARAM_INFO = {
       </>
     ),
   },
+  systemPrompt: {
+    title: "System prompt",
+    body: (
+      <>
+        The persona and instructions, wrapped in a <code>&lt;system&gt;</code>{" "}
+        tag and sent once when the session connects. Sets who the model is and
+        how it should behave. Edits apply on the next connect, not mid-session.
+      </>
+    ),
+  },
+  profile: {
+    title: "Session profile",
+    body: (
+      <>
+        A saved bundle of every connect-time setting: persona, voice, sampling,
+        and mic. Pick one to load it whole, or save your current setup as a new
+        card.
+      </>
+    ),
+  },
+  persona: {
+    title: "Persona preset",
+    body: (
+      <>
+        A starting system prompt for a common role. Selecting one fills the
+        prompt below; edit it freely and it becomes <b>Custom</b>.
+      </>
+    ),
+  },
+  adherence: {
+    title: "Adherence",
+    body: (
+      <>
+        How tightly the model holds to the persona and task. <b>Balanced</b>{" "}
+        stays in role without sounding rigid, <b>Strict</b> prefers short
+        literal task completion, <b>Adaptive</b> follows you when you redirect.
+        Added to the prompt on connect.
+      </>
+    ),
+  },
+  expression: {
+    title: "Expression",
+    body: (
+      <>
+        The speaking style added to the prompt. <b>Natural</b> is warm and
+        brief, <b>Concise</b> uses the fewest words with fast turn-taking,{" "}
+        <b>Expressive</b> adds more prosody and color.
+      </>
+    ),
+  },
+  reinforce: {
+    title: "Reinforce in silences",
+    body: (
+      <>
+        Quietly re-feeds the persona into the text channel during natural pauses
+        to fight drift on long sessions. Off by default because mid-stream
+        injection is off-distribution; enable only if the model wanders from its
+        role.
+      </>
+    ),
+  },
+  gender: {
+    title: "Voice filter",
+    body: (
+      <>
+        Narrows the built-in voice list by the voice's labeled gender. It only
+        filters the choices below; it does not change the model.
+      </>
+    ),
+  },
+  clone: {
+    title: "Reference clip",
+    body: (
+      <>
+        Upload a short, clean recording of one speaker to condition the voice
+        from your own audio instead of a built-in prefix. <b>10 to 60 s</b>{" "}
+        works best. It is a prefix, not exact cloning.
+      </>
+    ),
+  },
+  cloneStrength: {
+    title: "Clone strength",
+    body: (
+      <>
+        How much of the uploaded clip is used as the voice prefix. Higher leans
+        harder on your sample's timbre; lower keeps the model more neutral.
+        Applied on connect.
+      </>
+    ),
+  },
+  visionPrompt: {
+    title: "Scene prompt",
+    body: (
+      <>
+        The instruction sent to Gemini with each captured frame. It shapes the
+        one-sentence scene description that gets fed to the model during
+        silences.
+      </>
+    ),
+  },
+  visionBudget: {
+    title: "Cost ceiling",
+    body: (
+      <>
+        A hard spend cap for Gemini vision this session, in dollars. At the
+        limit the server stops sending frames. Set <b>0</b> to disable the cap.
+        Each call is about <b>$0.00012</b>.
+      </>
+    ),
+  },
+  idle: {
+    title: "Idle timeout",
+    body: (
+      <>
+        Auto-ends the session after this many minutes of inactivity so the
+        single live slot is released. <b>Off</b> keeps it open until you end it.
+      </>
+    ),
+  },
+  jitter: {
+    title: "Jitter buffer",
+    body: (
+      <>
+        Trades latency against smoothness on playback. <b>Latency</b> keeps
+        playout tight for fast back-and-forth; <b>Smooth</b> adds a small delay
+        to ride out network jitter at the cost of responsiveness.
+      </>
+    ),
+  },
+  output: {
+    title: "Speaker output",
+    body: (
+      <>
+        Which device plays the assistant's voice. Routing needs a browser that
+        supports output selection; otherwise the system default is used.
+      </>
+    ),
+  },
 };

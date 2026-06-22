@@ -80,7 +80,7 @@ export function Info({ k }) {
   );
 }
 
-export function Listbox({ value, options, onChange, placeholder = "Select", label = placeholder }) {
+export function Listbox({ value, options, onChange, placeholder = "Select", label = placeholder, caption, info }) {
   const ref = useRef(null);
   const menuId = useId();
   const [open, setOpen] = useState(false);
@@ -130,7 +130,7 @@ export function Listbox({ value, options, onChange, placeholder = "Select", labe
     if (event.key === "ArrowUp") setFocusIdx((index) => Math.max(0, index - 1));
   };
 
-  return (
+  const field = (
     <div className="lb" ref={ref}>
       <button
         type="button"
@@ -178,6 +178,16 @@ export function Listbox({ value, options, onChange, placeholder = "Select", labe
           ))}
         </div>
       )}
+    </div>
+  );
+  if (!caption && !info) return field;
+  return (
+    <div className="lb-field">
+      <div className="lb-caption">
+        <span>{caption || label}</span>
+        {info && <Info k={info} />}
+      </div>
+      {field}
     </div>
   );
 }
