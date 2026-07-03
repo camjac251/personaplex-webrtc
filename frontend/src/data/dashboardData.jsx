@@ -475,11 +475,12 @@ export const PARAM_INFO = {
     ),
   },
   idle: {
-    title: "Idle timeout",
+    title: "Session limit",
     body: (
       <>
-        Auto-ends the session after this many minutes of inactivity so the
-        single live slot is released. <b>Off</b> keeps it open until you end it.
+        Hard cap on total session length. The session ends after this many
+        minutes of wall-clock time, even mid-conversation, so the single live
+        slot is released. <b>Off</b> keeps it open until you end it.
       </>
     ),
   },

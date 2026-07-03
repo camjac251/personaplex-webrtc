@@ -3108,7 +3108,7 @@ function App() {
               <div className="opt-row">
                 <div className="opt-l">
                   <span className="opt-n" style={{ display: "inline-flex", alignItems: "center" }}>
-                    Idle timeout
+                    Session limit
                     <Info k="idle" />
                   </span>
                   <span className="opt-d">Auto-end the session to release the live slot</span>
@@ -3116,7 +3116,7 @@ function App() {
                 <div className="step-num">
                   <button
                     type="button"
-                    aria-label="Decrease idle timeout"
+                    aria-label="Decrease session limit"
                     onClick={() => {
                       setIdleTimeout((value) => Math.max(0, value - 5));
                       setSessionProfileId("custom");
@@ -3127,7 +3127,7 @@ function App() {
                   <span className="mono">{idleTimeout ? `${idleTimeout}m` : "off"}</span>
                   <button
                     type="button"
-                    aria-label="Increase idle timeout"
+                    aria-label="Increase session limit"
                     onClick={() => {
                       setIdleTimeout((value) => Math.min(60, value + 5));
                       setSessionProfileId("custom");

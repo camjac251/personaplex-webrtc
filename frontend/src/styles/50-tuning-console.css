@@ -119,7 +119,7 @@
   .seed-row input { padding: 6px 9px; font-size: 11.5px; }
   .seed-row .btn { padding: 0 10px; font-size: 11px; }
 
-  /* Label-and-stepper option row (idle timeout) */
+  /* Label-and-stepper option row (session limit) */
   .opt-row {
     display: flex;
     align-items: center;
