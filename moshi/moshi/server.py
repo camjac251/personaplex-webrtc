@@ -2314,7 +2314,19 @@ class ServerState:
         (cancellation propagates to the caller while the locked flag stays
         set). We work around it by shielding the acquire task and, on
         timeout, releasing the lock if the task in fact succeeded.
+
+        A ``timeout`` of 0 or less is a pure non-blocking probe and must
+        not go through the shielded path: ``wait_for(timeout=0)`` times
+        out before a freshly created acquire task gets its first loop
+        tick, so it fails even when the lock is free.
         """
+        if timeout <= 0:
+            if self.lock.locked():
+                return False
+            # locked-check-then-acquire cannot race on the event loop:
+            # an uncontended Lock.acquire() completes without yielding.
+            await self.lock.acquire()
+            return True
         waiter = asyncio.create_task(self.lock.acquire())
         try:
             await asyncio.wait_for(asyncio.shield(waiter), timeout=timeout)
