@@ -678,6 +678,16 @@ class RTCSession:
         if self._control and self._control.readyState == "open":
             self._control.send(json.dumps({"type": "error", "reason": reason}))
 
+    def send_end(self, reason: str) -> None:
+        """Announce a server-initiated session end before the pc closes.
+
+        Gives the client a chance to take its graceful shutdown path
+        (keeping the local recording) rather than reading the imminent
+        peer-connection close as a transport failure.
+        """
+        if self._control and self._control.readyState == "open":
+            self._control.send(json.dumps({"type": "end", "reason": reason}))
+
     def send_pong(self, t: object, seq: Optional[int] = None) -> None:
         """Echo a heartbeat ping so the client can measure app-level RTT.
 

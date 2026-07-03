@@ -3472,12 +3472,18 @@ class ServerState:
                                         "Session ended automatically after "
                                         "reaching the time limit"
                                     )
+                                    session.send_end("session_timeout")
                                 except Exception as exc:
                                     clog.log(
                                         "warning",
                                         f"session-timeout notify failed: "
                                         f"{type(exc).__name__}: {exc}",
                                     )
+                                # DataChannel sends are queued on the SCTP
+                                # transport; give the end message a moment
+                                # to reach the client so it sees a graceful
+                                # end rather than a dead transport.
+                                await asyncio.sleep(0.25)
                                 # Ending the session wakes wait_for_close();
                                 # the runner's finally releases the lock.
                                 await session.close()

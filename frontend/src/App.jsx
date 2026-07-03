@@ -1419,6 +1419,7 @@ function App() {
       } else if (message.type === "end") {
         addNotice("info", "Server ended session");
         cleanup({ showDownload: true });
+        setStageMessage("Session complete");
       }
     },
     [addNotice, attachAudioGraph, cleanup, pulseInterrupt, recordRttSample, startRecording, stopVision, toast],
