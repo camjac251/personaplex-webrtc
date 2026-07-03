@@ -52,7 +52,12 @@ from aiortc import RTCSessionDescription
 
 from .models import loaders, MimiModel, LMGen
 from .models.lm import MAX_REPETITION_CONTEXT
-from .rtc_session import DEFAULT_STUN_FALLBACK, RTCSession, SessionConfig
+from .rtc_session import (
+    DEFAULT_STUN_FALLBACK,
+    RTCSession,
+    SessionConfig,
+    clamp_temperature,
+)
 from .utils.connection import create_ssl_context, get_lan_ip
 from .utils.logging import setup_logger, ColorizedLog
 
@@ -2619,8 +2624,14 @@ class ServerState:
 
             self.lm_gen.temp = cfg.audio_temperature
             self.lm_gen.temp_text = cfg.text_temperature
-            self.lm_gen.top_k_text = max(1, cfg.text_topk)
-            self.lm_gen.top_k = max(1, cfg.audio_topk)
+            # torch.topk raises for k larger than the sampled vocabulary,
+            # so cap top-k at the model's real cardinalities.
+            self.lm_gen.top_k_text = min(
+                max(1, cfg.text_topk), self.lm_gen.lm_model.text_card
+            )
+            self.lm_gen.top_k = min(
+                max(1, cfg.audio_topk), self.lm_gen.lm_model.card
+            )
             self.lm_gen.repetition_penalty = max(1.0, cfg.repetition_penalty)
             self.lm_gen.repetition_penalty_context = max(
                 0, min(cfg.repetition_penalty_context, MAX_REPETITION_CONTEXT)
@@ -3049,18 +3060,28 @@ class ServerState:
                     )
                     # Parse and clamp on the event loop, before touching
                     # lm_gen or the lock, using the same bounds as the
-                    # connect-time apply so live and connect edits land on
-                    # identical validated values.
+                    # connect-time parse and apply so live and connect
+                    # edits land on identical validated values.
                     updates: dict = {}
                     try:
                         if "text_temperature" in msg:
-                            updates["temp_text"] = float(msg["text_temperature"])
+                            updates["temp_text"] = clamp_temperature(
+                                msg["text_temperature"]
+                            )
                         if "audio_temperature" in msg:
-                            updates["temp"] = float(msg["audio_temperature"])
+                            updates["temp"] = clamp_temperature(
+                                msg["audio_temperature"]
+                            )
                         if "text_topk" in msg:
-                            updates["top_k_text"] = max(1, int(msg["text_topk"]))
+                            updates["top_k_text"] = min(
+                                max(1, int(msg["text_topk"])),
+                                self.lm_gen.lm_model.text_card,
+                            )
                         if "audio_topk" in msg:
-                            updates["top_k"] = max(1, int(msg["audio_topk"]))
+                            updates["top_k"] = min(
+                                max(1, int(msg["audio_topk"])),
+                                self.lm_gen.lm_model.card,
+                            )
                         if "repetition_penalty" in msg:
                             updates["repetition_penalty"] = max(
                                 1.0, float(msg["repetition_penalty"])

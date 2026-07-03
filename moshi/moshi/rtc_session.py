@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import fractions
 import json
+import math
 from dataclasses import dataclass
 from typing import AsyncIterator, Awaitable, Callable, Optional
 
@@ -194,6 +195,28 @@ class MimiOutputTrack(MediaStreamTrack):
         frame.time_base = fractions.Fraction(1, WEBRTC_SAMPLE_RATE)
         self._timestamp += OUTBOUND_FRAME_SAMPLES
         return frame
+
+
+# Sampling-temperature bounds shared by the connect-time config parse and
+# the server's live update_config path, matching the dashboard slider
+# range. Out-of-range finite values are clamped; non-finite values are
+# rejected because they silently break sampling (inf flattens the
+# distribution, nan flips sample_token to greedy decoding).
+TEMPERATURE_MIN = 0.1
+TEMPERATURE_MAX = 1.5
+
+
+def clamp_temperature(value) -> float:
+    """Coerce ``value`` to a finite temperature within slider bounds.
+
+    Raises ``ValueError`` for non-finite input: ``float()`` accepts the
+    strings "nan"/"inf", and ``json.loads`` accepts bare NaN/Infinity
+    literals, so JSON parsing alone does not keep these out.
+    """
+    out = float(value)
+    if not math.isfinite(out):
+        raise ValueError(f"temperature must be finite, got {value!r}")
+    return min(TEMPERATURE_MAX, max(TEMPERATURE_MIN, out))
 
 
 @dataclass
@@ -759,10 +782,10 @@ class RTCSession:
                         )
                     ),
                     seed=seed,
-                    audio_temperature=float(
+                    audio_temperature=clamp_temperature(
                         payload.get("audio_temperature", defaults.audio_temperature)
                     ),
-                    text_temperature=float(
+                    text_temperature=clamp_temperature(
                         payload.get("text_temperature", defaults.text_temperature)
                     ),
                     text_topk=int(payload.get("text_topk", defaults.text_topk)),
