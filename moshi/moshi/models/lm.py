@@ -624,7 +624,8 @@ def create_loss_report(
 
     # Text Channel
     text_logits = text_logits.squeeze(dim=1).squeeze(dim=1)
-    target = target[:, 0].squeeze(1).clone()
+    target_all = target
+    target = target_all[:, 0].squeeze(1).clone()
 
     text_probs = torch.softmax(text_logits, dim=-1)
     text_ranks = torch.argsort(text_probs, dim=-1, descending=True)
@@ -646,7 +647,7 @@ def create_loss_report(
 
     # Audio Channels
     for k in range(lm_model.dep_q):
-        target = target[:, k+1].squeeze(1).clone()
+        target = target_all[:, k+1].squeeze(1).clone()
         channel_logits = audio_logits[:, k, :]
 
         audio_probs = torch.softmax(channel_logits, dim=-1)
@@ -1316,7 +1317,8 @@ class LMGen(StreamingModule[_LMGenState]):
                 break
 
     def _step_text_prompt_core(self) -> Iterator[None]:
-        for text_prompt_token in self.text_prompt_tokens:
+        # text_prompt_tokens defaults to None; treat that as no prompt.
+        for text_prompt_token in self.text_prompt_tokens or []:
             yield
             self.step(
                 moshi_tokens=self._encode_zero_frame(),
