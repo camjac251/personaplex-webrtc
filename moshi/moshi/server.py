@@ -263,6 +263,23 @@ REINFORCE_MIN_INTERVAL_SEC = 90.0
 # every fallback-timer interval. ~62 frames is ~5 s at 12.5 Hz.
 PAD_STREAK_REREQUEST_EVERY = 62
 
+# Ceiling for one inbound vision frame, in base64 characters. Real frames
+# at /2 downscale + JPEG 0.55 are well under 100 KB; native + 0.8 detail
+# mode stays under ~400 KB. 600 KB headroom catches both without exposing
+# the server to a runaway client. Applies to single vision_frame messages
+# and to the combined size of a chunked frame.
+VISION_FRAME_MAX_CHARS = 600_000
+
+# Chunked vision-frame reassembly bounds. The control channel's SCTP
+# messages are capped at 64 KB, so the client splits larger frames into
+# ordered vision_frame_chunk parts keyed by frame_id. At most this many
+# half-built frames are held at once (the newest capture evicts the
+# oldest), each frame carries at most this many parts, and a partial
+# older than the stale window is dropped (its sender has moved on).
+VISION_CHUNK_MAX_PARTIALS = 4
+VISION_CHUNK_MAX_PARTS = 16
+VISION_CHUNK_STALE_SEC = 10.0
+
 # Auto-rewind: if the LM safety net (max_turn_text_tokens) triggers this
 # many times within COLLAPSE_WINDOW_SEC, treat that as a sign the model
 # is wobbling and restore the latest snapshot in-place. The thresholds
@@ -2734,6 +2751,12 @@ class ServerState:
 
             self._vision_tasks[session_id] = set()
 
+            # Half-built chunked vision frames, keyed by frame_id. Local to
+            # the session, so teardown drops any incomplete frame with the
+            # closure. Insertion-ordered: the oldest entry is evicted first
+            # when the concurrent-partial bound is hit.
+            vision_partials: dict[str, dict] = {}
+
             async def on_message(msg: dict):
                 mtype = msg.get("type")
                 if mtype == "rewind":
@@ -3184,12 +3207,9 @@ class ServerState:
                 elif mtype == "vision_frame":
                     base64_data = msg.get("data", "")
                     if base64_data:
-                        # Cap inbound frame size. Real frames at /2
-                        # downscale + JPEG 0.55 are well under 100 KB;
-                        # native + 0.8 detail mode stays under ~400 KB.
-                        # 600 KB headroom catches both without exposing
-                        # the server to a runaway client.
-                        if len(base64_data) > 600_000:
+                        # Cap inbound frame size so a runaway client cannot
+                        # push unbounded data at the description service.
+                        if len(base64_data) > VISION_FRAME_MAX_CHARS:
                             clog.log(
                                 "warning",
                                 f"vision_frame too large: {len(base64_data)} chars; dropping",
@@ -3215,6 +3235,90 @@ class ServerState:
                         )
                         tasks.add(task)
                         task.add_done_callback(tasks.discard)
+                elif mtype == "vision_frame_chunk":
+                    # Reassemble a frame the client split to stay under the
+                    # 64 KB SCTP message cap. A malformed sequence drops the
+                    # partial; a completed frame flows through the same
+                    # vision_frame path as a single-message frame.
+                    frame_id = str(msg.get("frame_id") or "")[:128]
+                    data = msg.get("data", "")
+                    try:
+                        seq = int(msg.get("seq"))
+                        total = int(msg.get("total"))
+                    except (TypeError, ValueError):
+                        clog.log(
+                            "warning", "vision_frame_chunk: bad seq/total; dropping"
+                        )
+                        vision_partials.pop(frame_id, None)
+                        return
+                    if (
+                        not frame_id
+                        or not isinstance(data, str)
+                        or not data
+                        or not 2 <= total <= VISION_CHUNK_MAX_PARTS
+                        or not 0 <= seq < total
+                    ):
+                        clog.log(
+                            "warning",
+                            f"vision_frame_chunk: bad part {seq}/{total}; dropping",
+                        )
+                        vision_partials.pop(frame_id, None)
+                        return
+                    now_mono = time.monotonic()
+                    for stale_id in [
+                        fid
+                        for fid, part in vision_partials.items()
+                        if fid != frame_id
+                        and now_mono - part["started"] > VISION_CHUNK_STALE_SEC
+                    ]:
+                        vision_partials.pop(stale_id, None)
+                        clog.log(
+                            "warning", "vision_frame_chunk: dropped stale partial"
+                        )
+                    partial = vision_partials.get(frame_id)
+                    if partial is None:
+                        while len(vision_partials) >= VISION_CHUNK_MAX_PARTIALS:
+                            vision_partials.pop(next(iter(vision_partials)), None)
+                            clog.log(
+                                "warning",
+                                "vision_frame_chunk: partial evicted by newer frame",
+                            )
+                        partial = {
+                            "parts": [None] * total,
+                            "detail": bool(msg.get("detail", False)),
+                            "chars": 0,
+                            "started": now_mono,
+                        }
+                        vision_partials[frame_id] = partial
+                    if len(partial["parts"]) != total or partial["parts"][seq] is not None:
+                        clog.log(
+                            "warning",
+                            "vision_frame_chunk: inconsistent sequence; dropping frame",
+                        )
+                        vision_partials.pop(frame_id, None)
+                        return
+                    partial["chars"] += len(data)
+                    # Same combined ceiling as a single vision_frame message.
+                    if partial["chars"] > VISION_FRAME_MAX_CHARS:
+                        clog.log(
+                            "warning",
+                            f"vision_frame_chunk: combined frame too large: "
+                            f"{partial['chars']} chars; dropping",
+                        )
+                        vision_partials.pop(frame_id, None)
+                        return
+                    partial["parts"][seq] = data
+                    if any(part is None for part in partial["parts"]):
+                        return
+                    vision_partials.pop(frame_id, None)
+                    await on_message(
+                        {
+                            "type": "vision_frame",
+                            "frame_id": frame_id,
+                            "data": "".join(partial["parts"]),
+                            "detail": partial["detail"],
+                        }
+                    )
 
             # Warmup runs in an executor without holding _infer_lock;
             # snapshot_task and the bookmark/interrupt/update_config

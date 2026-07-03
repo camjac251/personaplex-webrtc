@@ -20,8 +20,11 @@ import {
   RENEGOTIATE_MAX_ATTEMPTS,
   RENEGOTIATE_RETRY_DELAY_MS,
   SESSION_PROFILES,
+  VISION_FRAME_CHUNK_CHARS,
+  VISION_FRAME_MAX_CHARS,
   VISION_MOTION_THRESHOLD,
   VISION_PER_CALL_USD,
+  VISION_SEND_BUFFERED_LIMIT,
   VOICES,
 } from "./data/dashboardData.jsx";
 import { useStoredState } from "./hooks/useStoredState.js";
@@ -1854,9 +1857,18 @@ function App() {
   };
 
   const sendVisionFrame = useCallback((dataUrl, meta, detail = false) => {
-    if (!dataUrl || !controlRef.current || controlRef.current.readyState !== "open") return null;
+    const control = controlRef.current;
+    if (!dataUrl || !control || control.readyState !== "open") return null;
     const base64 = dataUrl.split(",")[1] || "";
     if (!base64) return null;
+    if (base64.length > VISION_FRAME_MAX_CHARS) {
+      addNotice("warn", "Vision frame too large to send, try a smaller source", "vision");
+      return null;
+    }
+    if (control.bufferedAmount > VISION_SEND_BUFFERED_LIMIT) {
+      addNotice("warn", "Vision frame skipped, control channel congested", "vision");
+      return null;
+    }
     const frameId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${visionFrameSeqRef.current++}`;
     const nextMeta = {
       ...meta,
@@ -1871,16 +1883,43 @@ function App() {
       const oldest = pendingVisionFramesRef.current.keys().next().value;
       pendingVisionFramesRef.current.delete(oldest);
     }
-    controlRef.current.send(
-      JSON.stringify({ type: "vision_frame", frame_id: frameId, data: base64, detail: !!detail }),
-    );
+    try {
+      if (base64.length <= VISION_FRAME_CHUNK_CHARS) {
+        control.send(
+          JSON.stringify({ type: "vision_frame", frame_id: frameId, data: base64, detail: !!detail }),
+        );
+      } else {
+        // One SCTP message must stay under the server's 64 KB
+        // max-message-size, so large frames (full-res detail captures,
+        // big screen shares) go out as ordered chunks the server
+        // reassembles by frame_id.
+        const total = Math.ceil(base64.length / VISION_FRAME_CHUNK_CHARS);
+        for (let seq = 0; seq < total; seq += 1) {
+          control.send(
+            JSON.stringify({
+              type: "vision_frame_chunk",
+              frame_id: frameId,
+              seq,
+              total,
+              data: base64.slice(seq * VISION_FRAME_CHUNK_CHARS, (seq + 1) * VISION_FRAME_CHUNK_CHARS),
+              detail: !!detail,
+            }),
+          );
+        }
+      }
+    } catch (error) {
+      pendingVisionFramesRef.current.delete(frameId);
+      addNotice("err", `Vision frame send failed: ${error.message || error}`, "vision");
+      toast("Vision frame send failed");
+      return null;
+    }
     setVisionFramesSent((count) => count + 1);
     const now = performance.now();
     visionLastSentAtRef.current = now;
     setVisionLastSentAt(now);
     setVisionClockMs(now);
     return frameId;
-  }, []);
+  }, [addNotice, toast]);
 
   const captureFrame = useCallback(
     async (detail = false, force = false) => {

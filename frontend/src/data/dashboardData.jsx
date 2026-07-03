@@ -63,6 +63,19 @@ export const VOICES = [
 
 export const VISION_PER_CALL_USD = 0.00012;
 export const VISION_MOTION_THRESHOLD = 0.04;
+// One control-channel SCTP message must stay under the server's negotiated
+// 64 KB max-message-size; a larger send throws (and can error-close the
+// channel in some browsers). Frames whose base64 payload exceeds this are
+// split into vision_frame_chunk messages of this many characters each,
+// leaving headroom for the JSON envelope.
+export const VISION_FRAME_CHUNK_CHARS = 48000;
+// Mirrors the server's inbound cap on one reassembled frame; anything
+// larger would be dropped server-side, so refuse to send it at all.
+export const VISION_FRAME_MAX_CHARS = 600000;
+// Skip a vision capture when this many bytes are already queued unsent on
+// the control channel; piling frames onto a backed-up channel only delays
+// the messages already in flight.
+export const VISION_SEND_BUFFERED_LIMIT = 1000000;
 
 export const HEARTBEAT_INTERVAL_MS = 1000;
 export const HEARTBEAT_STALE_AFTER_MS = 3500;
