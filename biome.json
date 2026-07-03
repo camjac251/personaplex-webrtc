@@ -3,6 +3,12 @@
   "files": {
     "includes": ["frontend/**"]
   },
+  "formatter": {
+    "enabled": false
+  },
+  "assist": {
+    "enabled": false
+  },
   "linter": {
     "enabled": true,
     "rules": {
