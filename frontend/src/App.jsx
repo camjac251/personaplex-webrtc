@@ -243,6 +243,9 @@ function App() {
   const lastInterruptClickRef = useRef(0);
   const liveConfigPendingRef = useRef({});
   const liveConfigTimerRef = useRef(null);
+  // The connect-time config payload as it was sent on channel open, so the
+  // ready handler can diff it against current state.
+  const sentConfigRef = useRef(null);
   const interruptTimerRef = useRef(null);
   const reconnectGraceTimerRef = useRef(null);
   // Holds the latest reconnect callback so the one-time PC state handlers
@@ -277,6 +280,22 @@ function App() {
   const userSpokeRef = useRef(false);
 
   stateRef.current = { visionOn, visionPaused, visionInjecting, phase, interrupting, jitterBuffer };
+
+  // Latest live-tunable sampling values, refreshed every render. The rail
+  // sliders stay interactive during connecting/warmup while sendLiveConfig
+  // drops updates, so the ready handler diffs these against the
+  // connect-time payload and resends whatever moved in that window.
+  const liveTuningRef = useRef({});
+  liveTuningRef.current = {
+    text_temperature: Number(textTemp),
+    audio_temperature: Number(audioTemp),
+    text_topk: Number.parseInt(textTopk, 10),
+    audio_topk: Number.parseInt(audioTopk, 10),
+    repetition_penalty: Number(repPenalty),
+    repetition_penalty_context: Number.parseInt(repContext, 10),
+    padding_bonus: Number(padBonus),
+    max_turn_text_tokens: Number.parseInt(maxTurn, 10),
+  };
 
   const isLive = phase === "live";
   const cfgLocked = phase === "connecting" || phase === "warmup" || phase === "live";
@@ -1201,6 +1220,17 @@ function App() {
         }
         attachAudioGraph();
         startRecording();
+        // Resend any live-tunable value the user moved while the phase was
+        // connecting/warmup: those slider changes updated React state but
+        // sendLiveConfig drops updates until the session is live.
+        const sentConfig = sentConfigRef.current || {};
+        const drifted = {};
+        for (const [key, val] of Object.entries(liveTuningRef.current)) {
+          if (sentConfig[key] !== val) drifted[key] = val;
+        }
+        if (Object.keys(drifted).length && controlRef.current?.readyState === "open") {
+          controlRef.current.send(JSON.stringify({ type: "update_config", ...drifted }));
+        }
       } else if (message.type === "text") {
         const chunk = message.v || "";
         if (!chunk) return;
@@ -1636,6 +1666,7 @@ function App() {
       control.onopen = () => {
         const payload = buildConfigPayload();
         control.send(JSON.stringify({ type: "config", ...payload }));
+        sentConfigRef.current = payload;
         setPhase("warmup");
         setStageMessage("Loading model and warming audio");
         addNotice("info", "Config sent, waiting for server warmup");
@@ -3519,9 +3550,14 @@ function App() {
                         value={visionCostLimitUsd}
                         aria-label="Gemini vision cost ceiling"
                         onChange={(event) => {
-                          setVisionCostLimitUsd(Math.max(0, Number(event.target.value) || 0));
+                          const nextLimit = Math.max(0, Number(event.target.value) || 0);
+                          setVisionCostLimitUsd(nextLimit);
                           setVisionBudgetTripped(false);
                           setSessionProfileId("custom");
+                          // The server enforces its own copy of the ceiling;
+                          // push the change so a mid-session raise takes
+                          // effect there too.
+                          sendLiveConfig({ vision_cost_limit_usd: nextLimit });
                         }}
                       />
                     </div>
@@ -3537,8 +3573,12 @@ function App() {
                         aria-checked={visionInTranscript}
                         aria-label="Echo vision captions in transcript"
                         onClick={() => {
-                          setVisionInTranscript(!visionInTranscript);
+                          const nextEcho = !visionInTranscript;
+                          setVisionInTranscript(nextEcho);
                           setSessionProfileId("custom");
+                          // The echo is produced server-side at caption
+                          // time; push the toggle so it applies mid-session.
+                          sendLiveConfig({ vision_in_transcript: nextEcho });
                         }}
                       />
                     </div>

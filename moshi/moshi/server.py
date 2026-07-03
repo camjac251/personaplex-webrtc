@@ -3045,8 +3045,10 @@ class ServerState:
                         return
                     # Sampling and anti-collapse scalars that step() re-reads
                     # every frame, so reassigning them takes effect on the
-                    # next step with no re-priming. voice_prompt / text_prompt
-                    # / seed are deliberately absent: they change conditioning
+                    # next step with no re-priming, plus the two vision
+                    # settings (plain ServerState scalars read at dispatch /
+                    # caption-echo time). voice_prompt / text_prompt / seed
+                    # are deliberately absent: they change conditioning
                     # or the RNG and cannot move mid-stream.
                     live_keys = (
                         "text_temperature",
@@ -3057,12 +3059,15 @@ class ServerState:
                         "repetition_penalty_context",
                         "padding_bonus",
                         "max_turn_text_tokens",
+                        "vision_cost_limit_usd",
+                        "vision_in_transcript",
                     )
                     # Parse and clamp on the event loop, before touching
                     # lm_gen or the lock, using the same bounds as the
                     # connect-time parse and apply so live and connect
                     # edits land on identical validated values.
                     updates: dict = {}
+                    vision_cost_limit: Optional[float] = None
                     try:
                         if "text_temperature" in msg:
                             updates["temp_text"] = clamp_temperature(
@@ -3102,24 +3107,66 @@ class ServerState:
                             updates["max_turn_text_tokens"] = max(
                                 0, int(msg["max_turn_text_tokens"])
                             )
+                        if "vision_cost_limit_usd" in msg:
+                            vision_cost_limit = max(
+                                0.0, float(msg["vision_cost_limit_usd"])
+                            )
                     except (TypeError, ValueError) as exc:
                         clog.log("warning", f"update_config: bad value: {exc}")
                         return
-                    if not updates:
+                    if session_id == self._active_session_id:
+                        if "vision_in_transcript" in msg:
+                            # Read only at caption-echo time, so a plain
+                            # event-loop assignment is safe.
+                            self._vision_in_transcript = bool(
+                                msg["vision_in_transcript"]
+                            )
+                        if vision_cost_limit is not None:
+                            self._vision_cost_limit_usd = vision_cost_limit
+                            spend = (
+                                self._vision_frames_dispatched
+                                * self._vision_cost_per_call_usd
+                            )
+                            if self._vision_spend_tripped and (
+                                vision_cost_limit <= 0.0
+                                or spend < vision_cost_limit
+                            ):
+                                # The spend guard is the only path that
+                                # latches _vision_spend_tripped and it sets
+                                # _vision_force_disabled alongside it, so
+                                # both clear together here; an error-caused
+                                # force-disable (tripped stays False) is
+                                # untouched.
+                                self._vision_spend_tripped = False
+                                self._vision_force_disabled = False
+                                try:
+                                    session.send_vision_status(True)
+                                    session.send_notice(
+                                        "Vision re-enabled: spend ceiling raised"
+                                    )
+                                except Exception as exc:
+                                    logger.warning(
+                                        "vision re-enable notify failed: %s: %s",
+                                        type(exc).__name__,
+                                        exc,
+                                    )
+                    applied = [k for k in live_keys if k in msg]
+                    if not applied:
                         return
 
-                    def _apply_live_config():
-                        # Mutate scalars under the inference lock so the
-                        # assignment cannot tear a concurrent step() read in
-                        # the executor.
-                        with self._infer_lock:
-                            if session_id != self._active_session_id:
-                                return
-                            for attr, val in updates.items():
-                                setattr(self.lm_gen, attr, val)
+                    if updates:
 
-                    await loop.run_in_executor(None, _apply_live_config)
-                    applied = [k for k in live_keys if k in msg]
+                        def _apply_live_config():
+                            # Mutate scalars under the inference lock so the
+                            # assignment cannot tear a concurrent step() read
+                            # in the executor.
+                            with self._infer_lock:
+                                if session_id != self._active_session_id:
+                                    return
+                                for attr, val in updates.items():
+                                    setattr(self.lm_gen, attr, val)
+
+                        await loop.run_in_executor(None, _apply_live_config)
                     clog.log("info", f"update_config applied: {applied}")
                     try:
                         session.send_event(
