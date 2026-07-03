@@ -73,6 +73,13 @@ export const HEARTBEAT_MAX_PENDING = 30;
 // restart. Long enough to let aiortc/ICE self-recover, short enough that a
 // frozen conversation does not linger.
 export const RECONNECT_GRACE_MS = 2500;
+// Renegotiate POST retries during an ICE restart. The POST rides the same
+// network that just dropped, so early attempts can fail while the outage is
+// still in progress. Attempts times delay must stay well under the server's
+// ~30 s ICE consent expiry so a successful retry still lands on a live
+// session.
+export const RENEGOTIATE_MAX_ATTEMPTS = 3;
+export const RENEGOTIATE_RETRY_DELAY_MS = 4000;
 // Receiver playoutDelayHint (seconds) when the jitter buffer is biased for
 // smoothness rather than latency.
 export const JITTER_BUFFER_SMOOTH_SEC = 0.2;

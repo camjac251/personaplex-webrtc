@@ -17,6 +17,8 @@ import {
   JITTER_BUFFER_SMOOTH_SEC,
   PERSONA_PRESETS,
   RECONNECT_GRACE_MS,
+  RENEGOTIATE_MAX_ATTEMPTS,
+  RENEGOTIATE_RETRY_DELAY_MS,
   SESSION_PROFILES,
   VISION_MOTION_THRESHOLD,
   VISION_PER_CALL_USD,
@@ -1466,7 +1468,25 @@ function App() {
       pc.restartIce();
       const offer = await pc.createOffer({ iceRestart: true });
       await pc.setLocalDescription(offer);
-      const answer = await postRenegotiate(sessionId, pc.localDescription);
+      // The renegotiate POST rides the same network that just dropped, so
+      // early attempts can fail while the outage is still in progress.
+      // Retry a few times before declaring the session lost.
+      let answer = null;
+      for (let attempt = 1; attempt <= RENEGOTIATE_MAX_ATTEMPTS; attempt += 1) {
+        try {
+          answer = await postRenegotiate(sessionId, pc.localDescription);
+          break;
+        } catch (error) {
+          if (attempt === RENEGOTIATE_MAX_ATTEMPTS) throw error;
+          addNotice("warn", `Renegotiate failed, retrying (${attempt}/${RENEGOTIATE_MAX_ATTEMPTS})`);
+          await new Promise((resolve) => {
+            setTimeout(resolve, RENEGOTIATE_RETRY_DELAY_MS);
+          });
+          // The session may have been torn down while we waited (e.g. the
+          // server's end message ran cleanup); stop retrying quietly.
+          if (pcRef.current !== pc) return;
+        }
+      }
       await pc.setRemoteDescription({ sdp: answer.sdp, type: answer.type });
       // The session_id is unchanged, so the existing candidate stream keeps
       // serving fresh server candidates. Only re-open it if the blip closed
@@ -1475,10 +1495,14 @@ function App() {
       addNotice("ok", "Reconnected, session and model state preserved");
       toast("Reconnected");
     } catch (error) {
+      // Terminal: the session is gone, but the local capture is not. Land
+      // on the ended screen with the recording downloadable and say what
+      // actually happened.
       addNotice("err", error.message || "ICE restart failed");
-      cleanup({ keepPhase: true });
-      setPhase("idle");
-      setStageMessage("Connection failed");
+      addNotice("warn", "Connection lost, session ended; recording kept");
+      toast("Connection lost");
+      cleanup({ showDownload: true });
+      setStageMessage("Connection lost");
     } finally {
       setReconnecting(false);
     }
