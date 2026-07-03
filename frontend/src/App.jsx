@@ -1937,10 +1937,21 @@ function App() {
   }, [clearConnectHold, startConversation]);
 
   const stopConversation = useCallback(() => {
+    const control = controlRef.current;
+    if (control?.readyState === "open") {
+      try {
+        control.send(JSON.stringify({ type: "goodbye" }));
+      } catch {
+        // Best-effort: without it the server reads the close as a
+        // transport drop and holds a short resume window.
+      }
+    }
     addNotice("info", "Session ended, recording available");
-    cleanup({ showDownload: true });
     setPhase("ended");
     setStageMessage("Session complete");
+    // Give the goodbye a moment on the wire before the pc closes; an
+    // aborted SCTP queue would turn this back into a transport drop.
+    window.setTimeout(() => cleanup({ showDownload: true }), 150);
   }, [addNotice, cleanup]);
 
   const newConversation = () => {

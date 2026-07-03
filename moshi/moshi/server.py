@@ -1231,6 +1231,16 @@ class ServerState:
         if not os.path.exists(cache_path):
             if not await self._try_acquire_session_lock(timeout=0):
                 return web.json_response({"error": "session_busy"}, status=409)
+            # The lock is free during a resume window, but the resident
+            # model state belongs to the client about to reclaim it: a
+            # preview here would hold the lock through the reconnect
+            # retries and its finally resets mimi's streaming state under
+            # the conversation. Checked after the acquire so a grant
+            # recorded by a tearing-down runner (which holds the lock
+            # while recording it) can't slip past.
+            if self._resume_grant is not None:
+                self.lock.release()
+                return web.json_response({"error": "session_busy"}, status=409)
             try:
                 loop = asyncio.get_event_loop()
                 cache_path = await loop.run_in_executor(
@@ -2604,10 +2614,11 @@ class ServerState:
         cfg: Optional[SessionConfig] = None
         # Teardown bookkeeping for the resume grant: whether this session
         # reached the live phase with primed model state, whether the
-        # server itself decided to end it, and the wall-clock the watchdog
-        # budget math needs.
+        # server or the client deliberately ended it, and the wall-clock
+        # the watchdog budget math needs.
         went_live = False
         server_ended = False
+        client_ended = False
         effective_timeout_sec = 0
         session_started_at: Optional[float] = None
         try:
@@ -3446,6 +3457,15 @@ class ServerState:
                             "detail": partial["detail"],
                         }
                     )
+                elif mtype == "goodbye":
+                    # Deliberate client end. Without this signal the
+                    # upcoming pc close is indistinguishable from a
+                    # transport death, so teardown would record a resume
+                    # grant and pin the snapshot clones for the full
+                    # window on every normal End-session click.
+                    nonlocal client_ended
+                    client_ended = True
+                    clog.log("info", "client ended session")
 
             # Warmup runs in an executor without holding _infer_lock;
             # snapshot_task and the bookmark/interrupt/update_config
@@ -3825,6 +3845,7 @@ class ServerState:
                 if (
                     went_live
                     and not server_ended
+                    and not client_ended
                     and session.close_reason is None
                     and cfg is not None
                 ):
