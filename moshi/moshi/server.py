@@ -3592,6 +3592,7 @@ def _get_static_path(static: Optional[str]) -> Optional[str]:
     return static
 
 
+@torch.no_grad()
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="localhost", type=str)
@@ -3963,8 +3964,8 @@ def main():
             state.asr.shutdown()
     app.on_cleanup.append(_close_http_session)
 
-    web.run_app(app, port=args.port, ssl_context=ssl_context)
+    web.run_app(app, host=args.host, port=args.port, ssl_context=ssl_context)
 
 
-with torch.no_grad():
+if __name__ == "__main__":
     main()
