@@ -82,17 +82,18 @@ export const HEARTBEAT_STALE_AFTER_MS = 3500;
 export const HEARTBEAT_MISSED_LIMIT = 3;
 export const HEARTBEAT_MAX_PENDING = 30;
 
-// Grace window after a transient "disconnected" before forcing an ICE
-// restart. Long enough to let aiortc/ICE self-recover, short enough that a
+// Grace window after a transient "disconnected" before rebuilding the
+// transport. Long enough to let ICE self-recover, short enough that a
 // frozen conversation does not linger.
 export const RECONNECT_GRACE_MS = 2500;
-// Renegotiate POST retries during an ICE restart. The POST rides the same
-// network that just dropped, so early attempts can fail while the outage is
-// still in progress. Attempts times delay must stay well under the server's
-// ~30 s ICE consent expiry so a successful retry still lands on a live
-// session.
-export const RENEGOTIATE_MAX_ATTEMPTS = 3;
-export const RENEGOTIATE_RETRY_DELAY_MS = 4000;
+// Reconnect attempts after a transport failure. Each attempt builds a
+// fresh peer connection and posts an offer with resume_session_id; the
+// POST rides the same network that just dropped, so early attempts can
+// fail while the outage is still in progress. Attempts times delay must
+// stay well inside the server's ~25 s resume window so a successful retry
+// can still reclaim the resident model state.
+export const RECONNECT_MAX_ATTEMPTS = 3;
+export const RECONNECT_RETRY_DELAY_MS = 4000;
 // Receiver playoutDelayHint (seconds) when the jitter buffer is biased for
 // smoothness rather than latency.
 export const JITTER_BUFFER_SMOOTH_SEC = 0.2;

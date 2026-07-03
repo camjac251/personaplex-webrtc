@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { fetchIceServers, fetchVoiceList, postRenegotiate } from "./api/rtc.js";
+import { fetchIceServers, fetchVoiceList } from "./api/rtc.js";
 import { Info, Listbox, ToggleRow, MiniSlider } from "./components/Controls.jsx";
 import { PreflightModal, VisionSourceModal, FrameModal } from "./components/Modals.jsx";
 import { Badge, Flow, Level, RailColumn, Row, RTTGraph, Scope, TelemetryCell, VuMeter } from "./components/Telemetry.jsx";
@@ -17,8 +17,8 @@ import {
   JITTER_BUFFER_SMOOTH_SEC,
   PERSONA_PRESETS,
   RECONNECT_GRACE_MS,
-  RENEGOTIATE_MAX_ATTEMPTS,
-  RENEGOTIATE_RETRY_DELAY_MS,
+  RECONNECT_MAX_ATTEMPTS,
+  RECONNECT_RETRY_DELAY_MS,
   SESSION_PROFILES,
   VISION_FRAME_CHUNK_CHARS,
   VISION_FRAME_MAX_CHARS,
@@ -258,6 +258,13 @@ function App() {
   // Holds the latest reconnect callback so the one-time PC state handlers
   // installed at connect can trigger a restart with current phase/refs.
   const reconnectRef = useRef(null);
+  // True while a fresh-pc reconnect is trying to resume the server-side
+  // session; read by the control-channel open and ready handlers so they
+  // keep the UI session alive instead of treating the connect as new.
+  const resumingRef = useRef(false);
+  // Whether the last offer answer said the server resumed the previous
+  // session's model state (resumed: true) or started fresh.
+  const offerResumedRef = useRef(false);
   const connectHoldTimerRef = useRef(null);
   const connectHoldTickRef = useRef(null);
   const assistantIdleTimerRef = useRef(null);
@@ -1121,61 +1128,87 @@ function App() {
     setVisionLastSentAt(0);
   }, []);
 
+  // Transport-only teardown: unwinds the peer connection, control channel,
+  // candidate stream, and the audio-graph taps bound to the dead streams,
+  // and stops the mic tracks. Leaves the audio context, the recording
+  // destination, the running MediaRecorder, and all UI session state alive
+  // so a fresh-pc reconnect can rebind without losing the session.
+  const teardownTransport = useCallback(() => {
+    if (candidateStreamRef.current) {
+      try {
+        candidateStreamRef.current.close();
+      } catch {
+        // Ignore stream close failures.
+      }
+      candidateStreamRef.current = null;
+    }
+    pendingCandidatesRef.current = [];
+    if (controlRef.current) {
+      try {
+        controlRef.current.close();
+      } catch {
+        // Ignore channel close failures.
+      }
+      controlRef.current = null;
+    }
+    if (pcRef.current) {
+      try {
+        pcRef.current.ontrack = null;
+        pcRef.current.onconnectionstatechange = null;
+        pcRef.current.oniceconnectionstatechange = null;
+        pcRef.current.onicecandidate = null;
+        pcRef.current.close();
+      } catch {
+        // Ignore peer close failures.
+      }
+      pcRef.current = null;
+    }
+    if (aiAudioRef.current) {
+      try {
+        aiAudioRef.current.srcObject = null;
+      } catch {
+        // Ignore audio cleanup failures.
+      }
+    }
+    for (const nodeRef of [aiSourceRef, micSourceRef, aiAnalyserRef, micAnalyserRef]) {
+      try {
+        nodeRef.current?.disconnect?.();
+      } catch {
+        // Ignore graph disconnect failures.
+      }
+      nodeRef.current = null;
+    }
+    micStreamRef.current?.getTracks?.().forEach((track) => {
+      track.stop();
+    });
+    micStreamRef.current = null;
+    aiStreamRef.current = null;
+    // Null the session id so candidates gathered by the next peer
+    // connection buffer until its answer arrives instead of being posted
+    // against the dead session.
+    sessionIdRef.current = null;
+  }, []);
+
   const cleanup = useCallback(
     (options = {}) => {
       const { showDownload = false, keepPhase = false } = options;
       stopRecording(showDownload);
-      if (candidateStreamRef.current) {
-        try {
-          candidateStreamRef.current.close();
-        } catch {
-          // Ignore stream close failures.
-        }
-        candidateStreamRef.current = null;
-      }
-      sessionIdRef.current = null;
-      pendingCandidatesRef.current = [];
-      if (controlRef.current) {
-        try {
-          controlRef.current.close();
-        } catch {
-          // Ignore channel close failures.
-        }
-        controlRef.current = null;
-      }
-      if (pcRef.current) {
-        try {
-          pcRef.current.ontrack = null;
-          pcRef.current.onconnectionstatechange = null;
-          pcRef.current.oniceconnectionstatechange = null;
-          pcRef.current.onicecandidate = null;
-          pcRef.current.close();
-        } catch {
-          // Ignore peer close failures.
-        }
-        pcRef.current = null;
-      }
+      teardownTransport();
+      resumingRef.current = false;
+      offerResumedRef.current = false;
       if (aiAudioRef.current) {
         try {
           aiAudioRef.current.pause();
-          aiAudioRef.current.srcObject = null;
         } catch {
           // Ignore audio cleanup failures.
         }
       }
-      for (const nodeRef of [aiSourceRef, micSourceRef, aiAnalyserRef, micAnalyserRef, recordingDestinationRef]) {
-        try {
-          nodeRef.current?.disconnect?.();
-        } catch {
-          // Ignore graph disconnect failures.
-        }
-        nodeRef.current = null;
+      try {
+        recordingDestinationRef.current?.disconnect?.();
+      } catch {
+        // Ignore graph disconnect failures.
       }
-      micStreamRef.current?.getTracks?.().forEach((track) => {
-        track.stop();
-      });
-      micStreamRef.current = null;
-      aiStreamRef.current = null;
+      recordingDestinationRef.current = null;
       if (interruptTimerRef.current) clearTimeout(interruptTimerRef.current);
       interruptTimerRef.current = null;
       if (reconnectGraceTimerRef.current) clearTimeout(reconnectGraceTimerRef.current);
@@ -1215,23 +1248,41 @@ function App() {
       }
       if (!keepPhase) setPhase(showDownload ? "ended" : "idle");
     },
-    [stopRecording, stopVision],
+    [stopRecording, stopVision, teardownTransport],
   );
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: captureFrame is declared after this hook (temporal dead zone); it is referentially stable, so omitting it is safe
   const handleControlMessage = useCallback(
     (message) => {
       if (message.type === "ready") {
+        // Ready is the reconnect confirmation: it can only arrive once the
+        // new transport carries the control channel, so success is claimed
+        // here, never on the SDP answer alone.
+        const wasResuming = resumingRef.current;
+        resumingRef.current = false;
+        const resumed = wasResuming && message.resumed === true;
         setPhase("live");
-        setStageMessage("Connected");
+        setStageMessage(resumed ? "Live" : "Connected");
         setConnectionIssue(null);
         setServerInfo((info) => ({
           gpuName: typeof message.gpu_name === "string" ? message.gpu_name : info.gpuName,
           vramTotal: Number.isFinite(message.vram_total) ? message.vram_total : info.vramTotal,
           serverBuild: typeof message.server_build === "string" ? message.server_build : info.serverBuild,
         }));
-        addNotice("ok", "Warmup complete, session live");
-        toast("Connected");
+        if (resumed) {
+          addNotice("ok", "Reconnected, session and model state preserved");
+          toast("Reconnected");
+        } else if (wasResuming) {
+          // The resume window lapsed server-side: the transcript on screen
+          // is history the model no longer remembers, and the server-side
+          // snapshots and bookmarks are gone.
+          addNotice("warn", "Resume window expired, server started a fresh session");
+          toast("New session started");
+          setBookmarks([]);
+        } else {
+          addNotice("ok", "Warmup complete, session live");
+          toast("Connected");
+        }
         if (navigator.mediaSession) {
           try {
             if (window.MediaMetadata) {
@@ -1246,7 +1297,12 @@ function App() {
           }
         }
         attachAudioGraph();
-        startRecording();
+        // Across a reconnect the recorder keeps rolling against the
+        // persistent recording destination; only start one when none is
+        // active so the local capture spans the transport swap.
+        if (!mediaRecorderRef.current || mediaRecorderRef.current.state === "inactive") {
+          startRecording();
+        }
         // Resend any live-tunable value the user moved while the phase was
         // connecting/warmup: those slider changes updated React state but
         // sendLiveConfig drops updates until the session is live.
@@ -1521,51 +1577,258 @@ function App() {
     [flushPendingCandidates],
   );
 
+  // Builds a fresh RTCPeerConnection against the current mic stream, wires
+  // every transport handler (tracks, control channel, state changes, ICE
+  // trickle), posts the offer, and applies the answer. Shared by the
+  // initial connect and the fresh-pc reconnect; resumeSessionId asks the
+  // server to continue the previous session's resident model state.
+  const openPeerSession = useCallback(
+    async ({ resumeSessionId = null } = {}) => {
+      setStageMessage("Fetching TURN credentials");
+      const iceServers = await fetchIceServers();
+      addNotice("info", "Creating peer connection");
+      // Candidates gathered by this peer connection buffer until the answer
+      // delivers its session id; a leftover id from a previous attempt would
+      // post them against the wrong session.
+      sessionIdRef.current = null;
+      const pc = new RTCPeerConnection({ iceServers, iceCandidatePoolSize: 1 });
+      pcRef.current = pc;
+      try {
+        pc.ontrack = (event) => {
+          aiStreamRef.current = event.streams?.[0] || new MediaStream([event.track]);
+          if (aiAudioRef.current) {
+            aiAudioRef.current.srcObject = aiStreamRef.current;
+            aiAudioRef.current.play().catch((error) => {
+              console.warn("AI audio autoplay blocked:", error);
+            });
+          }
+          // Bias the freshly available receiver's jitter buffer to the current
+          // preference. Best-effort: not every browser exposes a writable hint.
+          const receiver = event.receiver;
+          if (receiver && "playoutDelayHint" in receiver) {
+            try {
+              receiver.playoutDelayHint =
+                stateRef.current.jitterBuffer === "smooth" ? JITTER_BUFFER_SMOOTH_SEC : 0;
+            } catch {
+              // Ignore browsers that reject the assignment.
+            }
+          }
+          attachAudioGraph();
+        };
+
+        pc.onconnectionstatechange = () => {
+          if (pcRef.current !== pc) return;
+          const state = pc.connectionState;
+          const live = stateRef.current.phase === "live";
+          if (state === "connected") {
+            if (reconnectGraceTimerRef.current) {
+              clearTimeout(reconnectGraceTimerRef.current);
+              reconnectGraceTimerRef.current = null;
+            }
+            if (live) setStageMessage("Live");
+          } else if (state === "failed") {
+            if (live) {
+              // Rebuild the transport in place; reconnect's catch path runs
+              // the terminal teardown if the rebuild itself fails.
+              reconnectRef.current?.();
+            } else {
+              addNotice("err", "Connection failed");
+              cleanup({ keepPhase: true });
+              setPhase("idle");
+              setStageMessage("Connection failed");
+            }
+          } else if (state === "disconnected") {
+            setStageMessage("Reconnecting");
+            if (live && !reconnectGraceTimerRef.current) {
+              // Give ICE a grace window to self-recover before forcing a
+              // rebuild, so a normal blip is not preempted needlessly.
+              reconnectGraceTimerRef.current = window.setTimeout(() => {
+                reconnectGraceTimerRef.current = null;
+                if (pcRef.current && pcRef.current.connectionState !== "connected") {
+                  reconnectRef.current?.();
+                }
+              }, RECONNECT_GRACE_MS);
+            }
+          }
+        };
+
+        pc.oniceconnectionstatechange = () => {
+          if (pcRef.current !== pc) return;
+          const state = pc.iceConnectionState;
+          const live = stateRef.current.phase === "live";
+          if (!live) {
+            if (state === "checking") setStageMessage("Connecting peers");
+            if (state === "connected" || state === "completed") setStageMessage("Opening control channel");
+            if (state === "failed") {
+              addNotice("err", "ICE failed, TURN may be unreachable");
+              cleanup({ keepPhase: true });
+              setPhase("idle");
+            }
+            return;
+          }
+          if (state === "failed") {
+            // Rebuild the transport; the conversation and model state are
+            // preserved on success, terminal teardown on failure.
+            reconnectRef.current?.();
+          }
+        };
+
+        const control = pc.createDataChannel("control");
+        controlRef.current = control;
+        control.onopen = () => {
+          const payload = buildConfigPayload();
+          control.send(JSON.stringify({ type: "config", ...payload }));
+          if (resumingRef.current && offerResumedRef.current) {
+            // The server resumes under the original session's applied
+            // config and ignores the payload above (sent only as the
+            // channel-open signal), so the connect-time record must keep
+            // describing what the server actually runs.
+            setStageMessage("Restoring session");
+            addNotice("info", "Control channel open, resuming session");
+            return;
+          }
+          sentConfigRef.current = payload;
+          setPhase("warmup");
+          setStageMessage("Loading model and warming audio");
+          addNotice("info", "Config sent, waiting for server warmup");
+        };
+        control.onmessage = (event) => {
+          if (typeof event.data !== "string") return;
+          try {
+            handleControlMessage(JSON.parse(event.data));
+          } catch (error) {
+            console.warn("bad control JSON:", error);
+          }
+        };
+        control.onclose = () => {
+          // Teardown paths null the ref before this event can fire, so only
+          // an unexpected close (transport drop, SCTP-level error) gets past
+          // this guard. Route it into the same recovery path a failed peer
+          // connection takes; its catch runs the terminal teardown.
+          if (controlRef.current !== control) return;
+          if (stateRef.current.phase !== "live") return;
+          addNotice("err", "Control channel closed");
+          reconnectRef.current?.();
+        };
+
+        pc.onicecandidate = (event) => {
+          if (sessionIdRef.current) postCandidate(event.candidate);
+          else pendingCandidatesRef.current.push(event.candidate);
+        };
+
+        micStreamRef.current.getAudioTracks().forEach((track) => {
+          pc.addTrack(track, micStreamRef.current);
+        });
+
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        setStageMessage("Negotiating session");
+        const res = await fetch("/api/rtc/offer", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sdp: pc.localDescription.sdp,
+            type: pc.localDescription.type,
+            ...(resumeSessionId ? { resume_session_id: resumeSessionId } : {}),
+          }),
+        });
+
+        if (res.status === 409) {
+          const error = new Error("Pod busy. Another client is already connected.");
+          error.code = "session_busy";
+          throw error;
+        }
+        if (!res.ok) {
+          let detail = "";
+          try {
+            detail = (await res.json()).error || "";
+          } catch {
+            // Keep empty detail.
+          }
+          throw new Error(`Server returned ${res.status}${detail ? `: ${detail}` : ""}`);
+        }
+
+        const answer = await res.json();
+        offerResumedRef.current = answer.resumed === true;
+        sessionIdRef.current = answer.session_id || null;
+        await pc.setRemoteDescription({ sdp: answer.sdp, type: answer.type });
+        if (sessionIdRef.current) startCandidateStream(sessionIdRef.current);
+        return offerResumedRef.current;
+      } catch (error) {
+        // Unwind only the transport objects this attempt created; shared
+        // state (mic, audio graph, recorder) stays up so the caller can
+        // retry or run its own teardown.
+        if (pcRef.current === pc) {
+          try {
+            pc.close();
+          } catch {
+            // Ignore peer close failures.
+          }
+          pcRef.current = null;
+          controlRef.current = null;
+          pendingCandidatesRef.current = [];
+        }
+        throw error;
+      }
+    },
+    [addNotice, attachAudioGraph, buildConfigPayload, cleanup, handleControlMessage, postCandidate, startCandidateStream],
+  );
+
+  // Fresh-pc reconnect. aiortc cannot ICE-restart a live transport (the
+  // restarted credentials are never applied server-side), so a broken
+  // connection is replaced wholesale: tear down the dead peer connection,
+  // re-acquire the microphone, and post a new offer with resume_session_id
+  // so the server continues from the resident model state. Success is only
+  // claimed when ready arrives on the new control channel; the SDP answer
+  // alone proves nothing about media.
   const reconnect = useCallback(async () => {
-    const pc = pcRef.current;
     const sessionId = sessionIdRef.current;
-    if (phase !== "live" || !pc || !sessionId || reconnecting) return;
+    if (phase !== "live" || !sessionId || reconnecting) return;
     if (reconnectGraceTimerRef.current) {
       clearTimeout(reconnectGraceTimerRef.current);
       reconnectGraceTimerRef.current = null;
     }
     setReconnecting(true);
-    addNotice("warn", "ICE restart, renegotiating transport");
+    resumingRef.current = true;
+    addNotice("warn", "Transport lost, rebuilding the connection");
     try {
-      pc.restartIce();
-      const offer = await pc.createOffer({ iceRestart: true });
-      await pc.setLocalDescription(offer);
-      // The renegotiate POST rides the same network that just dropped, so
-      // early attempts can fail while the outage is still in progress.
-      // Retry a few times before declaring the session lost.
-      let answer = null;
-      for (let attempt = 1; attempt <= RENEGOTIATE_MAX_ATTEMPTS; attempt += 1) {
+      // Transport-only teardown: transcript, bookmarks, elapsed clock, and
+      // the recorder (bound to the persistent recording destination, so it
+      // keeps capturing) all stay alive.
+      teardownTransport();
+      setStageMessage("Reconnecting");
+      micStreamRef.current = await navigator.mediaDevices.getUserMedia({
+        audio: getMicConstraints(),
+      });
+      // The offer rides the same network that just dropped, so early
+      // attempts can fail while the outage is still in progress. Retry a
+      // few times before declaring the session lost.
+      let targetId = sessionId;
+      for (let attempt = 1; attempt <= RECONNECT_MAX_ATTEMPTS; attempt += 1) {
         try {
-          answer = await postRenegotiate(sessionId, pc.localDescription);
-          break;
+          await openPeerSession({ resumeSessionId: targetId });
+          return;
         } catch (error) {
-          if (attempt === RENEGOTIATE_MAX_ATTEMPTS) throw error;
-          addNotice("warn", `Renegotiate failed, retrying (${attempt}/${RENEGOTIATE_MAX_ATTEMPTS})`);
+          // A failed attempt that got as far as an answer moved the server
+          // to a new session id (and the grant with it), so later retries
+          // resume against the latest id the server issued.
+          targetId = sessionIdRef.current || targetId;
+          if (attempt === RECONNECT_MAX_ATTEMPTS) throw error;
+          addNotice("warn", `Reconnect failed, retrying (${attempt}/${RECONNECT_MAX_ATTEMPTS})`);
           await new Promise((resolve) => {
-            setTimeout(resolve, RENEGOTIATE_RETRY_DELAY_MS);
+            setTimeout(resolve, RECONNECT_RETRY_DELAY_MS);
           });
-          // The session may have been torn down while we waited (e.g. the
-          // server's end message ran cleanup); stop retrying quietly.
-          if (pcRef.current !== pc) return;
+          // The session may have ended while we waited (user stop, server
+          // error message); stop retrying quietly.
+          if (stateRef.current.phase !== "live") return;
         }
       }
-      await pc.setRemoteDescription({ sdp: answer.sdp, type: answer.type });
-      // The session_id is unchanged, so the existing candidate stream keeps
-      // serving fresh server candidates. Only re-open it if the blip closed
-      // the EventSource (onerror/done null it out).
-      if (!candidateStreamRef.current) startCandidateStream(sessionId);
-      addNotice("ok", "Reconnected, session and model state preserved");
-      toast("Reconnected");
     } catch (error) {
       // Terminal: the session is gone, but the local capture is not. Land
       // on the ended screen with the recording downloadable and say what
       // actually happened.
-      addNotice("err", error.message || "ICE restart failed");
+      resumingRef.current = false;
+      addNotice("err", error.message || "Reconnect failed");
       addNotice("warn", "Connection lost, session ended; recording kept");
       toast("Connection lost");
       cleanup({ showDownload: true });
@@ -1573,7 +1836,7 @@ function App() {
     } finally {
       setReconnecting(false);
     }
-  }, [phase, reconnecting, addNotice, cleanup, startCandidateStream, toast]);
+  }, [phase, reconnecting, addNotice, cleanup, getMicConstraints, openPeerSession, teardownTransport, toast]);
 
   reconnectRef.current = reconnect;
 
@@ -1614,160 +1877,7 @@ function App() {
       });
       await refreshAudioOutputs();
       await initAudioContext();
-      setStageMessage("Fetching TURN credentials");
-      const iceServers = await fetchIceServers();
-      addNotice("info", "Creating peer connection");
-      const pc = new RTCPeerConnection({ iceServers, iceCandidatePoolSize: 1 });
-      pcRef.current = pc;
-
-      pc.ontrack = (event) => {
-        aiStreamRef.current = event.streams?.[0] || new MediaStream([event.track]);
-        if (aiAudioRef.current) {
-          aiAudioRef.current.srcObject = aiStreamRef.current;
-          aiAudioRef.current.play().catch((error) => {
-            console.warn("AI audio autoplay blocked:", error);
-          });
-        }
-        // Bias the freshly available receiver's jitter buffer to the current
-        // preference. Best-effort: not every browser exposes a writable hint.
-        const receiver = event.receiver;
-        if (receiver && "playoutDelayHint" in receiver) {
-          try {
-            receiver.playoutDelayHint =
-              stateRef.current.jitterBuffer === "smooth" ? JITTER_BUFFER_SMOOTH_SEC : 0;
-          } catch {
-            // Ignore browsers that reject the assignment.
-          }
-        }
-        attachAudioGraph();
-      };
-
-      pc.onconnectionstatechange = () => {
-        if (!pcRef.current) return;
-        const state = pcRef.current.connectionState;
-        const live = stateRef.current.phase === "live";
-        if (state === "connected") {
-          if (reconnectGraceTimerRef.current) {
-            clearTimeout(reconnectGraceTimerRef.current);
-            reconnectGraceTimerRef.current = null;
-          }
-          if (live) setStageMessage("Live");
-        } else if (state === "failed") {
-          if (live) {
-            // Try an in-place restart first; reconnect's catch path runs the
-            // terminal teardown if the restart itself fails.
-            reconnectRef.current?.();
-          } else {
-            addNotice("err", "Connection failed");
-            cleanup({ keepPhase: true });
-            setPhase("idle");
-            setStageMessage("Connection failed");
-          }
-        } else if (state === "disconnected") {
-          setStageMessage("Reconnecting");
-          if (live && !reconnectGraceTimerRef.current) {
-            // Give ICE a grace window to self-recover before forcing a
-            // restart, so a normal blip is not preempted needlessly.
-            reconnectGraceTimerRef.current = window.setTimeout(() => {
-              reconnectGraceTimerRef.current = null;
-              if (pcRef.current && pcRef.current.connectionState !== "connected") {
-                reconnectRef.current?.();
-              }
-            }, RECONNECT_GRACE_MS);
-          }
-        }
-      };
-
-      pc.oniceconnectionstatechange = () => {
-        if (!pcRef.current) return;
-        const state = pcRef.current.iceConnectionState;
-        const live = stateRef.current.phase === "live";
-        if (!live) {
-          if (state === "checking") setStageMessage("Connecting peers");
-          if (state === "connected" || state === "completed") setStageMessage("Opening control channel");
-          if (state === "failed") {
-            addNotice("err", "ICE failed, TURN may be unreachable");
-            cleanup({ keepPhase: true });
-            setPhase("idle");
-          }
-          return;
-        }
-        if (state === "failed") {
-          // Attempt an ICE restart in place; the conversation and model
-          // state are preserved on success, terminal teardown on failure.
-          reconnectRef.current?.();
-        }
-      };
-
-      const control = pc.createDataChannel("control");
-      controlRef.current = control;
-      control.onopen = () => {
-        const payload = buildConfigPayload();
-        control.send(JSON.stringify({ type: "config", ...payload }));
-        sentConfigRef.current = payload;
-        setPhase("warmup");
-        setStageMessage("Loading model and warming audio");
-        addNotice("info", "Config sent, waiting for server warmup");
-      };
-      control.onmessage = (event) => {
-        if (typeof event.data !== "string") return;
-        try {
-          handleControlMessage(JSON.parse(event.data));
-        } catch (error) {
-          console.warn("bad control JSON:", error);
-        }
-      };
-      control.onclose = () => {
-        // cleanup() nulls the ref before this event can fire, so only an
-        // unexpected close (transport drop, SCTP-level error) gets past
-        // this guard. Route it into the same recovery path a failed peer
-        // connection takes; its catch runs the terminal teardown.
-        if (controlRef.current !== control) return;
-        if (stateRef.current.phase !== "live") return;
-        addNotice("err", "Control channel closed");
-        reconnectRef.current?.();
-      };
-
-      pc.onicecandidate = (event) => {
-        if (sessionIdRef.current) postCandidate(event.candidate);
-        else pendingCandidatesRef.current.push(event.candidate);
-      };
-
-      micStreamRef.current.getAudioTracks().forEach((track) => {
-        pc.addTrack(track, micStreamRef.current);
-      });
-
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      setStageMessage("Negotiating session");
-      const res = await fetch("/api/rtc/offer", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sdp: pc.localDescription.sdp,
-          type: pc.localDescription.type,
-        }),
-      });
-
-      if (res.status === 409) {
-        const error = new Error("Pod busy. Another client is already connected.");
-        error.code = "session_busy";
-        throw error;
-      }
-      if (!res.ok) {
-        let detail = "";
-        try {
-          detail = (await res.json()).error || "";
-        } catch {
-          // Keep empty detail.
-        }
-        throw new Error(`Server returned ${res.status}${detail ? `: ${detail}` : ""}`);
-      }
-
-      const answer = await res.json();
-      sessionIdRef.current = answer.session_id || null;
-      await pc.setRemoteDescription({ sdp: answer.sdp, type: answer.type });
-      if (sessionIdRef.current) startCandidateStream(sessionIdRef.current);
+      await openPeerSession();
     } catch (error) {
       console.error("startConversation failed:", error);
       if (error.code === "session_busy") {
@@ -1788,16 +1898,12 @@ function App() {
     }
   }, [
     addNotice,
-    attachAudioGraph,
-    buildConfigPayload,
     cleanup,
     getMicConstraints,
-    handleControlMessage,
     initAudioContext,
+    openPeerSession,
     phase,
-    postCandidate,
     refreshAudioOutputs,
-    startCandidateStream,
     toast,
   ]);
 
@@ -3457,7 +3563,7 @@ function App() {
                           : isTurnFailed
                             ? "TURN provisioning failed"
                             : reconnecting
-                              ? "ICE restart, re-establishing transport"
+                              ? "Rebuilding connection, resuming session"
                               : phase === "idle"
                                 ? "Standby. Connect to begin."
                                 : stageMessage}
@@ -3840,10 +3946,10 @@ function App() {
               </div>
             </div>
             <button className="btn ghost block" type="button" disabled={!isLive || reconnecting} onClick={reconnect}>
-              {reconnecting ? "Reconnecting…" : "ICE restart · reconnect"}
+              {reconnecting ? "Reconnecting…" : "Reconnect · resume session"}
             </button>
             <div className="cons-note">
-              Survives a transient drop without losing the session or model state.
+              Rebuilds the transport and resumes the server-side model state when the drop is within the resume window.
             </div>
           </div>
 
