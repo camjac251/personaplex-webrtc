@@ -54,8 +54,12 @@ from .models import loaders, MimiModel, LMGen
 from .models.lm import MAX_REPETITION_CONTEXT
 from .rtc_session import (
     DEFAULT_STUN_FALLBACK,
+    INJECT_SILENCE_RMS_DEFAULT,
+    INJECT_SILENCE_STREAK_DEFAULT,
     RTCSession,
     SessionConfig,
+    clamp_inject_silence_rms,
+    clamp_inject_silence_streak,
     clamp_temperature,
 )
 from .utils.connection import create_ssl_context, get_lan_ip
@@ -247,21 +251,11 @@ VISION_QUEUE_MAX = 64
 # has stopped talking: the inner-monologue text channel emits PAD between
 # and within words while the audio for the current word is still decoding,
 # so a short streak is reached mid-utterance. The audio-silence gate below
-# is what actually confirms the thought has finished; both must hold.
+# is what actually confirms the thought has finished; both must hold. The
+# audio-silence half of the gate (self._inject_silence_rms /
+# self._inject_silence_streak) is per-session and live-tunable; its
+# defaults, bounds, and clamps live in rtc_session with SessionConfig.
 LIVE_PROMPT_BOUNDARY_STREAK = 2
-
-# End-of-thought audio gate. A caption is only injected once the model's
-# own decoded output has been below INJECT_SILENCE_RMS for
-# INJECT_SILENCE_STREAK consecutive frames, i.e. the current thought has
-# finished speaking (including the text->audio decoder lag draining out),
-# so the context lands in the following silence and conditions the next
-# thought instead of cutting the current one. Tune these on-device: raise
-# the streak or lower the RMS if injects still clip speech; lower the
-# streak or raise the RMS if captions never inject on a talkative model.
-# The RMS floor is 2x the proven ASR speech/silence threshold
-# (ASR_SILENCE_RMS = 0.005) on the same float PCM scale.
-INJECT_SILENCE_RMS = 0.01
-INJECT_SILENCE_STREAK = 6
 
 # Hard cap on how many tokens we'll inject in one window before forcing
 # a return to normal generation. ~4 s at 12.5 Hz.
@@ -826,6 +820,12 @@ class ServerState:
         # finished speaking, not merely paused between words on the text
         # channel. Reset on each new session and on rewind.
         self._audio_silence_streak: int = 0
+        # Active end-of-thought gate thresholds for this session. Defaults
+        # until the config message applies cfg values; live-tunable via
+        # update_config. Read in _process_audio_frame under _infer_lock;
+        # the writes are atomic scalar rebinds.
+        self._inject_silence_rms: float = INJECT_SILENCE_RMS_DEFAULT
+        self._inject_silence_streak: int = INJECT_SILENCE_STREAK_DEFAULT
         self._vision_inject_steps: int = 0
         # Persona-reinforce state, sharing the vision drip machinery.
         # _reinforce_enabled is the connect-time flag.
@@ -1346,7 +1346,7 @@ class ServerState:
             # cutting the current one.
             model_silent = (
                 self._vision_pad_streak >= LIVE_PROMPT_BOUNDARY_STREAK
-                and self._audio_silence_streak >= INJECT_SILENCE_STREAK
+                and self._audio_silence_streak >= self._inject_silence_streak
             )
             # Decide once per outer call whether to inject this frame.
             inject_token: Optional[int] = None
@@ -1442,7 +1442,7 @@ class ServerState:
                         if pcm_np.size
                         else 0.0
                     )
-                    if frame_rms < INJECT_SILENCE_RMS:
+                    if frame_rms < self._inject_silence_rms:
                         self._audio_silence_streak += 1
                     else:
                         self._audio_silence_streak = 0
@@ -2912,6 +2912,17 @@ class ServerState:
                     0.0, float(getattr(cfg, "vision_cost_per_call_usd", 0.0))
                 )
                 self._vision_spend_tripped = False
+                # Adopt this session's end-of-thought inject-gate thresholds.
+                # cfg is already clamped; re-clamp keeps it safe if a caller
+                # ever builds a config without these fields.
+                self._inject_silence_rms = clamp_inject_silence_rms(
+                    getattr(cfg, "inject_silence_rms", INJECT_SILENCE_RMS_DEFAULT)
+                )
+                self._inject_silence_streak = clamp_inject_silence_streak(
+                    getattr(
+                        cfg, "inject_silence_streak", INJECT_SILENCE_STREAK_DEFAULT
+                    )
+                )
 
             # Expose the session and id so vision-side coroutines can push
             # captions back to the client, and so the executor-side
@@ -3277,6 +3288,8 @@ class ServerState:
                         "max_turn_text_tokens",
                         "vision_cost_limit_usd",
                         "vision_in_transcript",
+                        "inject_silence_rms",
+                        "inject_silence_streak",
                     )
                     # Parse and clamp on the event loop, before touching
                     # lm_gen or the lock, using the same bounds as the
@@ -3284,6 +3297,8 @@ class ServerState:
                     # edits land on identical validated values.
                     updates: dict = {}
                     vision_cost_limit: Optional[float] = None
+                    inject_silence_rms: Optional[float] = None
+                    inject_silence_streak: Optional[int] = None
                     try:
                         if "text_temperature" in msg:
                             updates["temp_text"] = clamp_temperature(
@@ -3327,6 +3342,14 @@ class ServerState:
                             vision_cost_limit = max(
                                 0.0, float(msg["vision_cost_limit_usd"])
                             )
+                        if "inject_silence_rms" in msg:
+                            inject_silence_rms = clamp_inject_silence_rms(
+                                msg["inject_silence_rms"]
+                            )
+                        if "inject_silence_streak" in msg:
+                            inject_silence_streak = clamp_inject_silence_streak(
+                                msg["inject_silence_streak"]
+                            )
                     except (TypeError, ValueError) as exc:
                         clog.log("warning", f"update_config: bad value: {exc}")
                         return
@@ -3366,6 +3389,15 @@ class ServerState:
                                         type(exc).__name__,
                                         exc,
                                     )
+                        if inject_silence_rms is not None:
+                            # Scalar read once per frame in
+                            # _process_audio_frame on the executor thread; the
+                            # rebind is atomic in CPython, so no lock is needed
+                            # (worst case the gate sees the prior value for one
+                            # frame).
+                            self._inject_silence_rms = inject_silence_rms
+                        if inject_silence_streak is not None:
+                            self._inject_silence_streak = inject_silence_streak
                     applied = [k for k in live_keys if k in msg]
                     if not applied:
                         return

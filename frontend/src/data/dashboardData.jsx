@@ -155,6 +155,8 @@ export const DEFAULTS = {
   repContext: 64,
   padBonus: 1.0,
   maxTurn: 120,
+  injectSilenceRms: 0.01,
+  injectSilenceStreak: 6,
   echoCancel: true,
   noiseSupp: true,
   autoGain: false,
@@ -235,6 +237,29 @@ export const SESSION_PROFILES = [
 ];
 
 export const PARAM_INFO = {
+  injRms: {
+    title: "Inject silence floor",
+    body: (
+      <>
+        Audio level below which the model counts as silent. Gates when a
+        vision caption or persona reminder is dripped into the model, so it
+        lands in a real pause instead of cutting speech. Default <b>0.010</b>.
+        Lower it if injects still clip the voice; raise it if captions never
+        inject because the output is never quiet enough.
+      </>
+    ),
+  },
+  injStreak: {
+    title: "Inject silence hold",
+    body: (
+      <>
+        How many consecutive silent frames (about <b>80 ms</b> each) confirm
+        the current thought has finished before context is injected. Default
+        <b>6</b> (about half a second). Higher waits for a longer pause;
+        lower injects sooner but risks clipping the tail of a word.
+      </>
+    ),
+  },
   txtTemp: {
     title: "Text temperature",
     body: (

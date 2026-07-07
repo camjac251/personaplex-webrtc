@@ -168,6 +168,12 @@ function App() {
   const [repContext, setRepContext] = useStoredState("pp_repContextSlider", DEFAULTS.repContext, Number);
   const [padBonus, setPadBonus] = useStoredState("pp_padBonusSlider", DEFAULTS.padBonus, Number);
   const [maxTurn, setMaxTurn] = useStoredState("pp_maxTurnSlider", DEFAULTS.maxTurn, Number);
+  // End-of-thought gate for vision/persona context injection: the model's
+  // audio must be below injectSilenceRms for injectSilenceStreak frames
+  // before a caption is dripped in, so it lands in silence instead of
+  // cutting speech. Live-tunable.
+  const [injectSilenceRms, setInjectSilenceRms] = useStoredState("pp_injectSilenceRms", DEFAULTS.injectSilenceRms, Number);
+  const [injectSilenceStreak, setInjectSilenceStreak] = useStoredState("pp_injectSilenceStreak", DEFAULTS.injectSilenceStreak, Number);
   const [echoCancel, setEchoCancel] = useStoredState("pp_echoCancel", DEFAULTS.echoCancel, (v) => v === "1", (v) => (v ? "1" : "0"));
   const [noiseSupp, setNoiseSupp] = useStoredState("pp_noiseSupp", DEFAULTS.noiseSupp, (v) => v === "1", (v) => (v ? "1" : "0"));
   const [autoGain, setAutoGain] = useStoredState("pp_autoGain", DEFAULTS.autoGain, (v) => v === "1", (v) => (v ? "1" : "0"));
@@ -300,7 +306,7 @@ function App() {
 
   stateRef.current = { visionOn, visionPaused, visionInjecting, phase, interrupting, jitterBuffer };
 
-  // Latest live-tunable sampling values, refreshed every render. The rail
+  // Latest live-tunable rail values, refreshed every render. The rail
   // sliders stay interactive during connecting/warmup while sendLiveConfig
   // drops updates, so the ready handler diffs these against the
   // connect-time payload and resends whatever moved in that window.
@@ -314,6 +320,8 @@ function App() {
     repetition_penalty_context: Number.parseInt(repContext, 10),
     padding_bonus: Number(padBonus),
     max_turn_text_tokens: Number.parseInt(maxTurn, 10),
+    inject_silence_rms: Number(injectSilenceRms),
+    inject_silence_streak: Number.parseInt(injectSilenceStreak, 10),
   };
 
   const isLive = phase === "live";
@@ -665,6 +673,8 @@ function App() {
       session_timeout_sec: Number(idleTimeout) > 0 ? Number(idleTimeout) * 60 : 0,
       vision_cost_limit_usd: Number(visionCostLimitUsd) || 0,
       vision_cost_per_call_usd: VISION_PER_CALL_USD,
+      inject_silence_rms: Number(injectSilenceRms),
+      inject_silence_streak: Number.parseInt(injectSilenceStreak, 10),
     };
   }, [
     uploadedVoiceFilename,
@@ -689,6 +699,8 @@ function App() {
     seed,
     idleTimeout,
     visionCostLimitUsd,
+    injectSilenceRms,
+    injectSilenceStreak,
   ]);
 
   const buildConfigProfile = useCallback(() => ({
@@ -763,6 +775,8 @@ function App() {
     setRepContext(readNumber(config.repetition_penalty_context, DEFAULTS.repContext));
     setPadBonus(readNumber(config.padding_bonus, DEFAULTS.padBonus));
     setMaxTurn(readNumber(config.max_turn_text_tokens, DEFAULTS.maxTurn));
+    setInjectSilenceRms(readNumber(config.inject_silence_rms, DEFAULTS.injectSilenceRms));
+    setInjectSilenceStreak(readNumber(config.inject_silence_streak, DEFAULTS.injectSilenceStreak));
     // Stored as seconds; the stepper edits minutes in 5-step increments.
     // Snap so a hand-edited off-grid value still lands on a reachable step.
     const timeoutMin = readNumber(config.session_timeout_sec, 0) / 60;
@@ -822,7 +836,7 @@ function App() {
     const interval = readNumber(profile?.vision?.interval_ms, visionIntervalMs);
     if (interval >= 1000 && interval <= 30000) setVisionIntervalMs(interval);
     setVisionCostLimitUsd(Math.max(0, readNumber(profile?.vision?.cost_limit_usd, visionCostLimitUsd)));
-  }, [addNotice, allSessionProfiles, clearUploadedVoice, cloneStrength, textPrompt, visionCostLimitUsd, visionIntervalMs, voiceList, setAdherenceMode, setExpressionMode, setAudioTemp, setTextTemp, setTextTopk, setAudioTopk, setRepPenalty, setRepContext, setPadBonus, setMaxTurn, setSeedRandom, setSeed, setIdleTimeout, setTextPrompt, setVisionPrompt, setVisionInTranscript, setReinforceInSilences, setVoice, setVoiceBlend, setVoiceB, setBlendMix, setCloneStrength, setEchoCancel, setNoiseSupp, setAutoGain, setOutputDeviceId, setVisionIntervalMs, setVisionCostLimitUsd]);
+  }, [addNotice, allSessionProfiles, clearUploadedVoice, cloneStrength, textPrompt, visionCostLimitUsd, visionIntervalMs, voiceList, setAdherenceMode, setExpressionMode, setAudioTemp, setTextTemp, setTextTopk, setAudioTopk, setRepPenalty, setRepContext, setPadBonus, setMaxTurn, setInjectSilenceRms, setInjectSilenceStreak, setSeedRandom, setSeed, setIdleTimeout, setTextPrompt, setVisionPrompt, setVisionInTranscript, setReinforceInSilences, setVoice, setVoiceBlend, setVoiceB, setBlendMix, setCloneStrength, setEchoCancel, setNoiseSupp, setAutoGain, setOutputDeviceId, setVisionIntervalMs, setVisionCostLimitUsd]);
 
   const exportConfig = useCallback(() => {
     const profile = JSON.stringify(buildConfigProfile(), null, 2);
@@ -3845,6 +3859,10 @@ function App() {
                 <RailColumn title="TURN" aggregate={`${maxTurn} tok · pad ${fmt(padBonus, 1)}`}>
                   <MiniSlider label="Padding bonus" info="padBonus" value={padBonus} onChange={(value) => { setPadBonus(value); setSessionProfileId("custom"); sendLiveConfig({ padding_bonus: Number(value) }); }} min={0} max={6} step={0.1} format={(v) => fmt(v, 1)} />
                   <MiniSlider label="Max length" info="maxTurn" value={maxTurn} onChange={(value) => { setMaxTurn(value); setSessionProfileId("custom"); sendLiveConfig({ max_turn_text_tokens: Number.parseInt(value, 10) }); }} min={0} max={2000} step={10} format={(v) => (v ? `${v}` : "off")} />
+                </RailColumn>
+                <RailColumn title="INJECT" aggregate={`${fmt(injectSilenceRms, 3)} · ${injectSilenceStreak}f`}>
+                  <MiniSlider label="Silence floor" info="injRms" value={injectSilenceRms} onChange={(value) => { setInjectSilenceRms(value); setSessionProfileId("custom"); sendLiveConfig({ inject_silence_rms: Number(value) }); }} min={0.001} max={0.05} step={0.001} format={(v) => fmt(v, 3)} />
+                  <MiniSlider label="Silence hold" info="injStreak" value={injectSilenceStreak} onChange={(value) => { setInjectSilenceStreak(value); setSessionProfileId("custom"); sendLiveConfig({ inject_silence_streak: Number.parseInt(value, 10) }); }} min={2} max={20} step={1} format={(v) => fmt(v, 0)} />
                 </RailColumn>
               </div>
             )}

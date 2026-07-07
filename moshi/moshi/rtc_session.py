@@ -219,6 +219,48 @@ def clamp_temperature(value) -> float:
     return min(TEMPERATURE_MAX, max(TEMPERATURE_MIN, out))
 
 
+# End-of-thought inject-gate bounds, shared by the connect-time parse and
+# the live update_config path. A queued vision caption (or persona
+# reinforcement) is only injected once the model's decoded audio has stayed
+# below inject_silence_rms for inject_silence_streak consecutive frames,
+# i.e. the current utterance has finished, so the context lands in the
+# trailing silence instead of cutting speech. The RMS floor is measured on
+# the model's decoded output (float PCM ~[-1, 1]); its useful range sits
+# near the input-side ASR silence threshold (0.005). The streak is in
+# ~80 ms frames (12.5 Hz).
+INJECT_SILENCE_RMS_MIN = 0.001
+INJECT_SILENCE_RMS_MAX = 0.05
+INJECT_SILENCE_RMS_DEFAULT = 0.01
+INJECT_SILENCE_STREAK_MIN = 2
+INJECT_SILENCE_STREAK_MAX = 20
+INJECT_SILENCE_STREAK_DEFAULT = 6
+
+
+def clamp_inject_silence_rms(value) -> float:
+    """Coerce ``value`` to a finite RMS floor within bounds.
+
+    Rejects non-finite input like ``clamp_temperature``: a NaN floor would
+    make every frame compare as non-silent (``x < nan`` is always False),
+    silently disabling the whole inject path.
+    """
+    out = float(value)
+    if not math.isfinite(out):
+        raise ValueError(f"inject_silence_rms must be finite, got {value!r}")
+    return min(INJECT_SILENCE_RMS_MAX, max(INJECT_SILENCE_RMS_MIN, out))
+
+
+def clamp_inject_silence_streak(value) -> int:
+    """Coerce ``value`` to an int silence streak within bounds.
+
+    Parses through ``float`` first so a non-finite input raises ValueError
+    rather than ``int()`` raising OverflowError on infinity.
+    """
+    out = float(value)
+    if not math.isfinite(out):
+        raise ValueError(f"inject_silence_streak must be finite, got {value!r}")
+    return min(INJECT_SILENCE_STREAK_MAX, max(INJECT_SILENCE_STREAK_MIN, int(out)))
+
+
 @dataclass
 class SessionConfig:
     """Per-session settings the browser sends over the control channel.
@@ -273,6 +315,11 @@ class SessionConfig:
     # estimated dollar spend. Kept in sync with the client's estimate so the
     # two ceilings agree. 0 disables the dollar conversion.
     vision_cost_per_call_usd: float = 0.0
+    # End-of-thought inject gate (see the clamp helpers above). Live-tunable;
+    # the model's decoded audio must stay below inject_silence_rms for
+    # inject_silence_streak frames before a queued caption is dripped in.
+    inject_silence_rms: float = INJECT_SILENCE_RMS_DEFAULT
+    inject_silence_streak: int = INJECT_SILENCE_STREAK_DEFAULT
 
 
 class RTCSession:
@@ -830,6 +877,16 @@ class RTCSession:
                                 defaults.vision_cost_per_call_usd,
                             )
                         ),
+                    ),
+                    inject_silence_rms=clamp_inject_silence_rms(
+                        payload.get(
+                            "inject_silence_rms", defaults.inject_silence_rms
+                        )
+                    ),
+                    inject_silence_streak=clamp_inject_silence_streak(
+                        payload.get(
+                            "inject_silence_streak", defaults.inject_silence_streak
+                        )
                     ),
                 )
             except (TypeError, ValueError) as exc:
