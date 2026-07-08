@@ -186,11 +186,6 @@ frontend/.env.local
 timings.json
 mlx-trace.json
 
-# Docker files (not used in this project)
-.dockerignore
-Dockerfile
-docker-compose.yaml
-
 # Include everything in assets
 !assets/
 !assets/**

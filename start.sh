@@ -22,6 +22,7 @@ REPO_DIR="/workspace/Personaplex-oneclicker"
 # HuggingFace + torch caches
 export HF_TOKEN="${HF_TOKEN:-}"
 export HF_HOME="/workspace/huggingface_cache"
+export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
 export TORCH_HOME="/workspace/.cache/torch"
 export TRITON_CACHE_DIR="/workspace/.cache/triton"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
@@ -92,11 +93,24 @@ print(f"voices ready at {target}")
 PY
 fi
 
-# Pre-fetch the PersonaPlex model weights so the first connection is instant.
-# The repo is license-gated, so the HF_TOKEN must be passed in explicitly;
-# without it the download 401s and the server stalls on the first request.
-log "pre-fetching personaplex model weights (~7GB)..."
-HF_HUB_DISABLE_PROGRESS_BARS=1 uv run --frozen python -c "import os; from huggingface_hub import snapshot_download; snapshot_download('nvidia/personaplex-7b-v1', token=os.environ.get('HF_TOKEN'))"
+if [ "${PERSONAPLEX_PREFETCH_MODEL:-1}" != "0" ]; then
+    # Pre-fetch the PersonaPlex model weights so the first connection is instant.
+    # voices.tgz is handled above, so keep it out of the model snapshot cache.
+    log "pre-fetching personaplex model weights (~7GB)..."
+    HF_HUB_DISABLE_PROGRESS_BARS=1 uv run --frozen python - <<'PY'
+import os
+
+from huggingface_hub import snapshot_download
+
+snapshot_download(
+    "nvidia/personaplex-7b-v1",
+    token=os.environ.get("HF_TOKEN"),
+    ignore_patterns=["voices.tgz"],
+)
+PY
+else
+    log "skipping model prefetch because PERSONAPLEX_PREFETCH_MODEL=0"
+fi
 
 if [ -z "${GEMINI_API_KEY:-}" ]; then
     log "WARN: GEMINI_API_KEY is not set. Vision features will be disabled."
