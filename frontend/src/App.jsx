@@ -208,7 +208,7 @@ function App() {
   const [autoGain, setAutoGain] = useStoredState("pp_autoGain", DEFAULTS.autoGain, (v) => v === "1", (v) => (v ? "1" : "0"));
   const [visionInTranscript, setVisionInTranscript] = useStoredState("pp_visionInTranscript", false, (v) => v === "1", (v) => (v ? "1" : "0"));
   const [visionFeedModel, setVisionFeedModel] = useStoredState("pp_visionFeedModel", false, (v) => v === "1", (v) => (v ? "1" : "0"));
-  const [visionGroundTurns, setVisionGroundTurns] = useState(false);
+  const [visionGroundTurns, setVisionGroundTurns] = useStoredState("pp_visionGroundTurns", true, (v) => v === "1", (v) => (v ? "1" : "0"));
   const [reinforceInSilences, setReinforceInSilences] = useStoredState("pp_reinforceInSilences", false, (v) => v === "1", (v) => (v ? "1" : "0"));
   const [seedRandom, setSeedRandom] = useStoredState("pp_seedRandom", true, (v) => v === "1", (v) => (v ? "1" : "0"));
   const [seed, setSeed] = useStoredState("pp_seedValue", DEFAULTS.seed, Number);
@@ -705,6 +705,7 @@ function App() {
     setTextTopk,
     setVisionInTranscript,
     setVisionFeedModel,
+    setVisionGroundTurns,
     setReinforceInSilences,
     setVisionIntervalMs,
     setVisionPrompt,
@@ -976,7 +977,7 @@ function App() {
     const interval = readNumber(profile?.vision?.interval_ms, visionIntervalMs);
     if (interval >= 1000 && interval <= 30000) setVisionIntervalMs(interval);
     setVisionCostLimitUsd(Math.max(0, readNumber(profile?.vision?.cost_limit_usd, visionCostLimitUsd)));
-  }, [addNotice, allSessionProfiles, clearUploadedVoice, cloneStrength, textPrompt, visionCostLimitUsd, visionIntervalMs, voiceList, setAdherenceMode, setExpressionMode, setAudioTemp, setTextTemp, setTextTopk, setAudioTopk, setRepPenalty, setRepContext, setPadBonus, setMaxTurn, setInjectSilenceRms, setInjectSilenceStreak, setSeedRandom, setSeed, setIdleTimeout, setTextPrompt, setVisionPrompt, setVisionInTranscript, setVisionFeedModel, setReinforceInSilences, setVoice, setVoiceBlend, setVoiceB, setBlendMix, setCloneStrength, setEchoCancel, setNoiseSupp, setAutoGain, setOutputDeviceId, setVisionIntervalMs, setVisionCostLimitUsd]);
+  }, [addNotice, allSessionProfiles, clearUploadedVoice, cloneStrength, textPrompt, visionCostLimitUsd, visionIntervalMs, voiceList, setAdherenceMode, setExpressionMode, setAudioTemp, setTextTemp, setTextTopk, setAudioTopk, setRepPenalty, setRepContext, setPadBonus, setMaxTurn, setInjectSilenceRms, setInjectSilenceStreak, setSeedRandom, setSeed, setIdleTimeout, setTextPrompt, setVisionPrompt, setVisionInTranscript, setVisionFeedModel, setVisionGroundTurns, setReinforceInSilences, setVoice, setVoiceBlend, setVoiceB, setBlendMix, setCloneStrength, setEchoCancel, setNoiseSupp, setAutoGain, setOutputDeviceId, setVisionIntervalMs, setVisionCostLimitUsd]);
 
   const exportConfig = useCallback(() => {
     const profile = JSON.stringify(buildConfigProfile(), null, 2);
@@ -1264,8 +1265,7 @@ function App() {
     mediaRecorderRef.current = null;
   }, []);
 
-  const setVisionSpeechGrounding = useCallback((enabled) => {
-    setVisionGroundTurns(enabled);
+  const sendVisionSpeechGrounding = useCallback((enabled) => {
     if (controlRef.current?.readyState === "open") {
       controlRef.current.send(JSON.stringify({
         type: "update_config",
@@ -1273,6 +1273,11 @@ function App() {
       }));
     }
   }, []);
+
+  const setVisionSpeechGrounding = useCallback((enabled) => {
+    setVisionGroundTurns(enabled);
+    sendVisionSpeechGrounding(!!visionOn && enabled);
+  }, [sendVisionSpeechGrounding, setVisionGroundTurns, visionOn]);
 
   const stopVision = useCallback(() => {
     if (visionIntervalRef.current) clearInterval(visionIntervalRef.current);
@@ -1288,13 +1293,13 @@ function App() {
     if (visionVideoRef.current) visionVideoRef.current.srcObject = null;
     setVisionOn(false);
     setVisionPaused(false);
-    setVisionSpeechGrounding(false);
+    sendVisionSpeechGrounding(false);
     setVisionInjecting(false);
     setCurrentCaption("");
     setContextStatus({ ...EMPTY_CONTEXT_STATUS });
     visionLastSentAtRef.current = 0;
     setVisionLastSentAt(0);
-  }, [setVisionSpeechGrounding]);
+  }, [sendVisionSpeechGrounding]);
 
   // Transport-only teardown: unwinds the peer connection, control channel,
   // candidate stream, and the audio-graph taps bound to the dead streams,
@@ -2338,16 +2343,19 @@ function App() {
       });
       setVisionOn(true);
       setVisionPaused(false);
-      setVisionSpeechGrounding(true);
+      sendVisionSpeechGrounding(!!visionGroundTurns);
       setVisionFramesSent(0);
       setVisionFramesGated(0);
       setVisionBudgetTripped(false);
       setCaptionEntries([]);
+      const startMessage = visionGroundTurns
+        ? "scene will ground replies after speech"
+        : "scene grounding is manual";
       addNotice(
         "info",
         useCamera
-          ? "Vision camera started, scene will ground replies after speech"
-          : "Vision screen share started, scene will ground replies after speech",
+          ? `Vision camera started, ${startMessage}`
+          : `Vision screen share started, ${startMessage}`,
         "vision",
       );
       visionStatusTickRef.current = setInterval(() => {
@@ -2359,10 +2367,11 @@ function App() {
   }, [
     addNotice,
     isLive,
-    setVisionSpeechGrounding,
+    sendVisionSpeechGrounding,
     stopVision,
     toast,
     visionEnabledFromServer,
+    visionGroundTurns,
   ]);
 
   const startVision = useCallback(() => {
