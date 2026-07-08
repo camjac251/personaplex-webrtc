@@ -195,7 +195,7 @@ function App() {
   const [autoGain, setAutoGain] = useStoredState("pp_autoGain", DEFAULTS.autoGain, (v) => v === "1", (v) => (v ? "1" : "0"));
   const [visionInTranscript, setVisionInTranscript] = useStoredState("pp_visionInTranscript", false, (v) => v === "1", (v) => (v ? "1" : "0"));
   const [visionFeedModel, setVisionFeedModel] = useStoredState("pp_visionFeedModel", false, (v) => v === "1", (v) => (v ? "1" : "0"));
-  const [visionGroundTurns, setVisionGroundTurns] = useStoredState("pp_visionGroundTurns", false, (v) => v === "1", (v) => (v ? "1" : "0"));
+  const [visionGroundTurns, setVisionGroundTurns] = useState(false);
   const [reinforceInSilences, setReinforceInSilences] = useStoredState("pp_reinforceInSilences", false, (v) => v === "1", (v) => (v ? "1" : "0"));
   const [seedRandom, setSeedRandom] = useStoredState("pp_seedRandom", true, (v) => v === "1", (v) => (v ? "1" : "0"));
   const [seed, setSeed] = useStoredState("pp_seedValue", DEFAULTS.seed, Number);
@@ -344,7 +344,7 @@ function App() {
     padding_bonus: Number(padBonus),
     max_turn_text_tokens: Number.parseInt(maxTurn, 10),
     vision_feed_model: !!visionFeedModel,
-    vision_ground_user_turns: !!visionGroundTurns,
+    vision_ground_user_turns: !!visionOn && !!visionGroundTurns,
     inject_silence_rms: Number(injectSilenceRms),
     inject_silence_streak: Number.parseInt(injectSilenceStreak, 10),
   };
@@ -504,7 +504,7 @@ function App() {
   const visionCostLimitActive = Number(visionCostLimitUsd) > 0;
   const visionCostRemaining = Math.max(0, Number(visionCostLimitUsd || 0) - visionCostUsd);
   const visionFeedStatus = formatVisionFeed(currentVisionFeed, visionFeedModel, visionInjecting);
-  const visionTurnStatus = visionGroundTurns ? "turn ground on" : "turn ground off";
+  const visionTurnStatus = visionGroundTurns ? "after speech" : "manual only";
   const timelinePreview = useMemo(() => sessionTimeline.slice(0, 14).reverse(), [sessionTimeline]);
   const timelineDurationMs = useMemo(
     () => Math.max(1000, elapsedSec * 1000, ...sessionTimeline.map((item) => item.offsetMs || 0)),
@@ -663,7 +663,6 @@ function App() {
     setTextTopk,
     setVisionInTranscript,
     setVisionFeedModel,
-    setVisionGroundTurns,
     setReinforceInSilences,
     setVisionIntervalMs,
     setVisionPrompt,
@@ -702,7 +701,7 @@ function App() {
       vision_prompt: visionPrompt || "",
       vision_in_transcript: !!visionInTranscript,
       vision_feed_model: !!visionFeedModel,
-      vision_ground_user_turns: !!visionGroundTurns,
+      vision_ground_user_turns: !!visionOn && !!visionGroundTurns,
       reinforce_in_silences: !!reinforceInSilences,
       audio_temperature: Number(audioTemp),
       text_temperature: Number(textTemp),
@@ -731,6 +730,7 @@ function App() {
     visionInTranscript,
     visionFeedModel,
     visionGroundTurns,
+    visionOn,
     reinforceInSilences,
     audioTemp,
     textTemp,
@@ -895,7 +895,7 @@ function App() {
     const interval = readNumber(profile?.vision?.interval_ms, visionIntervalMs);
     if (interval >= 1000 && interval <= 30000) setVisionIntervalMs(interval);
     setVisionCostLimitUsd(Math.max(0, readNumber(profile?.vision?.cost_limit_usd, visionCostLimitUsd)));
-  }, [addNotice, allSessionProfiles, clearUploadedVoice, cloneStrength, textPrompt, visionCostLimitUsd, visionIntervalMs, voiceList, setAdherenceMode, setExpressionMode, setAudioTemp, setTextTemp, setTextTopk, setAudioTopk, setRepPenalty, setRepContext, setPadBonus, setMaxTurn, setInjectSilenceRms, setInjectSilenceStreak, setSeedRandom, setSeed, setIdleTimeout, setTextPrompt, setVisionPrompt, setVisionInTranscript, setVisionFeedModel, setVisionGroundTurns, setReinforceInSilences, setVoice, setVoiceBlend, setVoiceB, setBlendMix, setCloneStrength, setEchoCancel, setNoiseSupp, setAutoGain, setOutputDeviceId, setVisionIntervalMs, setVisionCostLimitUsd]);
+  }, [addNotice, allSessionProfiles, clearUploadedVoice, cloneStrength, textPrompt, visionCostLimitUsd, visionIntervalMs, voiceList, setAdherenceMode, setExpressionMode, setAudioTemp, setTextTemp, setTextTopk, setAudioTopk, setRepPenalty, setRepContext, setPadBonus, setMaxTurn, setInjectSilenceRms, setInjectSilenceStreak, setSeedRandom, setSeed, setIdleTimeout, setTextPrompt, setVisionPrompt, setVisionInTranscript, setVisionFeedModel, setReinforceInSilences, setVoice, setVoiceBlend, setVoiceB, setBlendMix, setCloneStrength, setEchoCancel, setNoiseSupp, setAutoGain, setOutputDeviceId, setVisionIntervalMs, setVisionCostLimitUsd]);
 
   const exportConfig = useCallback(() => {
     const profile = JSON.stringify(buildConfigProfile(), null, 2);
@@ -1183,6 +1183,16 @@ function App() {
     mediaRecorderRef.current = null;
   }, []);
 
+  const setVisionSpeechGrounding = useCallback((enabled) => {
+    setVisionGroundTurns(enabled);
+    if (controlRef.current?.readyState === "open") {
+      controlRef.current.send(JSON.stringify({
+        type: "update_config",
+        vision_ground_user_turns: enabled,
+      }));
+    }
+  }, []);
+
   const stopVision = useCallback(() => {
     if (visionIntervalRef.current) clearInterval(visionIntervalRef.current);
     if (visionStatusTickRef.current) clearInterval(visionStatusTickRef.current);
@@ -1197,11 +1207,12 @@ function App() {
     if (visionVideoRef.current) visionVideoRef.current.srcObject = null;
     setVisionOn(false);
     setVisionPaused(false);
+    setVisionSpeechGrounding(false);
     setVisionInjecting(false);
     setCurrentCaption("");
     visionLastSentAtRef.current = 0;
     setVisionLastSentAt(0);
-  }, []);
+  }, [setVisionSpeechGrounding]);
 
   // Transport-only teardown: unwinds the peer connection, control channel,
   // candidate stream, and the audio-graph taps bound to the dead streams,
@@ -2216,11 +2227,18 @@ function App() {
       });
       setVisionOn(true);
       setVisionPaused(false);
+      setVisionSpeechGrounding(true);
       setVisionFramesSent(0);
       setVisionFramesGated(0);
       setVisionBudgetTripped(false);
       setCaptionEntries([]);
-      addNotice("info", useCamera ? "Vision camera started" : "Vision screen share started", "vision");
+      addNotice(
+        "info",
+        useCamera
+          ? "Vision camera started, scene will ground replies after speech"
+          : "Vision screen share started, scene will ground replies after speech",
+        "vision",
+      );
       visionStatusTickRef.current = setInterval(() => {
         setVisionClockMs(performance.now());
       }, 1000);
@@ -2230,6 +2248,7 @@ function App() {
   }, [
     addNotice,
     isLive,
+    setVisionSpeechGrounding,
     stopVision,
     toast,
     visionEnabledFromServer,
@@ -3906,22 +3925,10 @@ function App() {
                     </div>
                     <div className="mini-row" style={{ paddingTop: 4 }}>
                       <span className="l" style={{ display: "inline-flex", alignItems: "center" }}>
-                        Ground user turns
+                        After speech
                         <Info k="visionGround" />
                       </span>
-                      <button
-                        type="button"
-                        className={cls("switch", visionGroundTurns && "on")}
-                        role="switch"
-                        aria-checked={visionGroundTurns}
-                        aria-label="Ground user turns with latest visual context"
-                        onClick={() => {
-                          const nextGround = !visionGroundTurns;
-                          setVisionGroundTurns(nextGround);
-                          setSessionProfileId("custom");
-                          sendLiveConfig({ vision_ground_user_turns: nextGround });
-                        }}
-                      />
+                      <span className="v">{visionGroundTurns ? "scene attached" : "off"}</span>
                     </div>
                     <div className="vision-actions">
                       <button

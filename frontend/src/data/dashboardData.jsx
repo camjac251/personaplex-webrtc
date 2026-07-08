@@ -387,12 +387,12 @@ export const PARAM_INFO = {
     ),
   },
   visionGround: {
-    title: "Ground user turns",
+    title: "After speech",
     body: (
       <>
-        After your mic input ends, queue one fresh scene note for the next
-        answer. No ASR is used. Off by default because audio-only turn detection
-        cannot tell whether your request was visual.
+        When vision is running, the latest fresh scene note is queued after your
+        mic input ends. No ASR is used; this is audio-turn timing, not speech
+        recognition.
       </>
     ),
   },
