@@ -194,6 +194,21 @@ def _strip_system_tags(text: str) -> str:
     return cleaned.strip()
 
 
+def _can_replace_vision_context(current_source: str, incoming_source: str) -> bool:
+    """Return whether an incoming context packet may replace a queued one."""
+    current = VISION_CONTEXT_PRIORITY.get(current_source or "", 0)
+    incoming = VISION_CONTEXT_PRIORITY.get(incoming_source or "", 0)
+    return incoming >= current
+
+
+def _context_status_text(text: str, limit: int = 360) -> str:
+    """Clip context text for telemetry without changing what the model sees."""
+    cleaned = " ".join((text or "").split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[:limit].rsplit(" ", 1)[0].strip()
+
+
 def _parse_retry_after(value: Optional[str]) -> Optional[float]:
     """Parse a Retry-After header's delay-seconds form.
 
@@ -262,6 +277,17 @@ TRANSCRIPT_BUFFER_MAX = 80
 # in a pad streak. Cap the queue so a steady Gemini stream cannot let
 # context lag arbitrarily far behind reality.
 VISION_QUEUE_MAX = 64
+
+# Context packets share a single Moshi text-token drip queue. Higher
+# priority sources can replace lower priority packets while they wait for
+# the silence gate; lower priority sources must not overwrite a manual or
+# user-turn grounding packet that has not injected yet.
+VISION_CONTEXT_PRIORITY = {
+    "": -1,
+    "ambient": 0,
+    "user_turn": 1,
+    "manual": 2,
+}
 
 # Necessary (not sufficient) condition for a context inject: at least this
 # many consecutive PAD text tokens. Pulled from NVIDIA/personaplex PR #69's
@@ -920,6 +946,9 @@ class ServerState:
         # ambient, user_turn, manual, or empty. Lets live toggles clear only
         # their own queue instead of deleting an explicit one-shot request.
         self._vision_pending_source: str = ""
+        self._vision_pending_meta: dict = {}
+        self._reinforce_pending_meta: dict = {}
+        self._active_context_meta: dict = {}
         # Inject-window edge detection: track transitions so we can
         # notify the client ("Injecting context...") and log on open/close.
         self._inject_active: bool = False
@@ -1448,8 +1477,7 @@ class ServerState:
                 else:
                     # Cap hit mid-window; drop the rest as stale and let
                     # the next Gemini response repopulate fresh.
-                    self._vision_pending.clear()
-                    self._vision_pending_source = ""
+                    self._clear_vision_pending()
                     self._vision_inject_steps = 0
             else:
                 # Idle: no inject this frame.
@@ -1476,6 +1504,14 @@ class ServerState:
                         self._reinforce_pending.extend(
                             self._reinforce_prompt_tokens
                         )
+                        self._reinforce_pending_meta = {
+                            "source": "reinforce",
+                            "reason": "silence",
+                            "text": _strip_system_tags(
+                                self._active_text_prompt
+                            ),
+                            "tokens": len(self._reinforce_prompt_tokens),
+                        }
                         self._reinforce_inject_steps = 0
                         self._last_reinforce_at = now
                 if self._reinforce_pending:
@@ -1490,14 +1526,14 @@ class ServerState:
                         # abandon the remainder and re-arm on the next
                         # cooldown. A partial re-assertion is harmless; a
                         # forced burst causes degenerate single-token loops.
-                        self._reinforce_pending.clear()
+                        self._clear_reinforce_pending()
                         self._reinforce_inject_steps = 0
             else:
                 # Disabled, no persona, or vision is using the slot this
                 # frame. Abandon any in-flight window so the next eligible
                 # one re-asserts the full persona from the start rather than
                 # resuming a stale fragment.
-                self._reinforce_pending.clear()
+                self._clear_reinforce_pending()
                 self._reinforce_inject_steps = 0
 
             for c in range(codes.shape[-1]):
@@ -1635,11 +1671,11 @@ class ServerState:
                                 # snapshot, and forced frames freeze the pad
                                 # streak; clear them so a pre-rewind caption is
                                 # not dripped into the freshly-restored state.
-                                self._vision_pending.clear()
-                                self._vision_pending_source = ""
+                                self._clear_vision_pending()
                                 self._vision_inject_steps = 0
-                                self._reinforce_pending.clear()
+                                self._clear_reinforce_pending()
                                 self._reinforce_inject_steps = 0
+                                self._active_context_meta = {}
                                 self._vision_pad_streak = 0
                                 self._audio_silence_streak = 0
                                 self._last_rewind_at = now
@@ -1704,23 +1740,42 @@ class ServerState:
                 if now_inject_active:
                     if self._reinforce_inject_steps > 0:
                         reinforce_opened = True
+                        self._active_context_meta = dict(
+                            self._reinforce_pending_meta
+                        )
+                        self._active_context_meta["remaining_tokens"] = len(
+                            self._reinforce_pending
+                        )
                         logger.info(
                             "reinforce inject window opened (%d tokens queued)",
                             len(self._reinforce_pending),
                         )
                     else:
+                        self._active_context_meta = dict(
+                            self._vision_pending_meta
+                        )
+                        self._active_context_meta["remaining_tokens"] = len(
+                            self._vision_pending
+                        )
                         logger.info(
                             "vision inject window opened (%d tokens queued)",
                             len(self._vision_pending),
                         )
                 else:
                     logger.info("inject window closed")
+                    if self._active_context_meta:
+                        self._active_context_meta["remaining_tokens"] = 0
                 sess = self._active_session
                 loop = self._main_loop
                 if sess is not None and loop is not None:
                     try:
                         loop.call_soon_threadsafe(
                             sess.send_inject_status, now_inject_active
+                        )
+                        loop.call_soon_threadsafe(
+                            sess.send_context_status,
+                            "injecting" if now_inject_active else "complete",
+                            self._context_payload(self._active_context_meta),
                         )
                         # Surface persona re-assertions on the diagnostics
                         # rail. DataChannel.send is not thread-safe, so
@@ -1739,6 +1794,12 @@ class ServerState:
                             type(exc).__name__,
                             exc,
                         )
+                if not now_inject_active:
+                    self._active_context_meta = {}
+                    if not self._vision_pending:
+                        self._clear_vision_pending()
+                    if not self._reinforce_pending:
+                        self._clear_reinforce_pending()
 
             # --- server-driven vision cadence ------------------------
             # When the model just entered a pad streak (silence), ask the
@@ -1859,20 +1920,54 @@ class ServerState:
         tokens = self.text_tokenizer.encode(f" {context}")[:VISION_QUEUE_MAX]
         if not tokens:
             return False
+        meta = {
+            "source": source,
+            "reason": reason,
+            "text": context,
+            "caption": clipped,
+            "tokens": len(tokens),
+            "remaining_tokens": len(tokens),
+            "frame_id": frame_id,
+        }
 
         loop = asyncio.get_event_loop()
+        queued = {"ok": False, "blocked_by": ""}
 
         def _set_context() -> None:
             with self._infer_lock:
                 if session_id != self._active_session_id:
                     return
+                current_source = (
+                    self._vision_pending_source if self._vision_pending else ""
+                )
+                if (
+                    current_source
+                    and not _can_replace_vision_context(current_source, source)
+                ):
+                    queued["blocked_by"] = current_source
+                    return
                 self._vision_pending.clear()
                 self._vision_pending.extend(tokens)
                 self._vision_pending_source = source
+                self._vision_pending_meta = dict(meta)
                 self._vision_inject_steps = 0
+                queued["ok"] = True
 
         await loop.run_in_executor(None, _set_context)
         if sess is not None and session_id == self._active_session_id:
+            if not queued["ok"]:
+                sess.send_event(
+                    "vision_grounding",
+                    "Kept higher-priority visual context",
+                    "info",
+                    {
+                        "source": source,
+                        "reason": reason,
+                        "blocked_by": queued["blocked_by"],
+                    },
+                )
+                return False
+            self._send_context_status("queued", meta, sess=sess)
             sess.send_event(
                 "vision_grounding",
                 "Visual context queued",
@@ -2340,6 +2435,17 @@ class ServerState:
                     # drip-feeds the bare text at Mimi cadence and the
                     # state machine in _process_audio_frame gates the
                     # outbound audio while it does.
+                    ambient_tokens = tokens[:VISION_QUEUE_MAX]
+                    ambient_meta = {
+                        "source": "ambient",
+                        "reason": "caption_feed",
+                        "text": text,
+                        "caption": text,
+                        "tokens": len(ambient_tokens),
+                        "remaining_tokens": len(ambient_tokens),
+                        "frame_id": frame_id,
+                    }
+                    ambient_queued = {"ok": False, "blocked_by": ""}
 
                     def _set_vision_context() -> None:
                         with self._infer_lock:
@@ -2357,13 +2463,41 @@ class ServerState:
                             # An in-flight inject finishes its already-
                             # popped tokens; the next window picks up
                             # the fresh context.
-                            self._vision_pending.clear()
-                            self._vision_pending.extend(
-                                tokens[:VISION_QUEUE_MAX]
+                            current_source = (
+                                self._vision_pending_source
+                                if self._vision_pending else ""
                             )
+                            if (
+                                current_source
+                                and not _can_replace_vision_context(
+                                    current_source, "ambient"
+                                )
+                            ):
+                                ambient_queued["blocked_by"] = current_source
+                                return
+                            self._vision_pending.clear()
+                            self._vision_pending.extend(ambient_tokens)
                             self._vision_pending_source = "ambient"
+                            self._vision_pending_meta = dict(ambient_meta)
+                            ambient_queued["ok"] = True
 
                     await loop.run_in_executor(None, _set_vision_context)
+                    if (
+                        ambient_queued["ok"]
+                        and sess is not None
+                        and session_id == self._active_session_id
+                    ):
+                        self._send_context_status("queued", ambient_meta, sess=sess)
+                    elif ambient_queued["blocked_by"] and sess is not None:
+                        sess.send_event(
+                            "vision_grounding",
+                            "Ambient visual context skipped",
+                            "info",
+                            {
+                                "source": "ambient",
+                                "blocked_by": ambient_queued["blocked_by"],
+                            },
+                        )
                 else:
                     err_text = await resp.text()
                     clog.log("warning", f"Gemini Interactions error ({resp.status}): {err_text}")
@@ -2449,6 +2583,38 @@ class ServerState:
             "inject_silence_rms": float(self._inject_silence_rms),
             "inject_silence_streak": int(self._inject_silence_streak),
         }
+
+    def _clear_vision_pending(self) -> None:
+        self._vision_pending.clear()
+        self._vision_pending_source = ""
+        self._vision_pending_meta = {}
+
+    def _clear_reinforce_pending(self) -> None:
+        self._reinforce_pending.clear()
+        self._reinforce_pending_meta = {}
+
+    def _context_payload(self, meta: Optional[dict] = None) -> dict:
+        src = dict(meta or {})
+        text = src.get("text") or src.get("caption") or ""
+        return {
+            "source": src.get("source", ""),
+            "reason": src.get("reason", ""),
+            "text": _context_status_text(str(text)),
+            "caption": _context_status_text(str(src.get("caption", ""))),
+            "tokens": int(src.get("tokens", 0) or 0),
+            "remaining_tokens": int(src.get("remaining_tokens", 0) or 0),
+            "frame_id": str(src.get("frame_id", "")),
+        }
+
+    def _send_context_status(
+        self,
+        status: str,
+        meta: Optional[dict] = None,
+        sess: Optional["RTCSession"] = None,
+    ) -> None:
+        target = sess or self._active_session
+        if target is not None:
+            target.send_context_status(status, self._context_payload(meta))
 
     def _resolve_voice_prompt_path(self, voice_prompt_filename: str) -> tuple[Optional[str], Optional[str]]:
         """Resolve the on-disk path for a voice prompt name.
@@ -3217,13 +3383,13 @@ class ServerState:
                 # other site instead of blocking the event loop.
                 def _reset_session_state():
                     with self._infer_lock:
-                        self._vision_pending.clear()
-                        self._vision_pending_source = ""
+                        self._clear_vision_pending()
                         self._vision_pad_streak = 0
                         self._audio_silence_streak = 0
                         self._vision_inject_steps = 0
-                        self._reinforce_pending.clear()
+                        self._clear_reinforce_pending()
                         self._reinforce_inject_steps = 0
+                        self._active_context_meta = {}
                         # Baseline the reinforce cooldown at session start:
                         # time.monotonic() is host uptime, so a 0.0 baseline
                         # would satisfy REINFORCE_MIN_INTERVAL_SEC immediately
@@ -3397,11 +3563,11 @@ class ServerState:
                                 # Clear the inject queues (not part of the
                                 # snapshot) so a pre-rewind caption is not
                                 # dripped into the restored bookmark state.
-                                self._vision_pending.clear()
-                                self._vision_pending_source = ""
+                                self._clear_vision_pending()
                                 self._vision_inject_steps = 0
-                                self._reinforce_pending.clear()
+                                self._clear_reinforce_pending()
                                 self._reinforce_inject_steps = 0
+                                self._active_context_meta = {}
                                 self._vision_pad_streak = 0
                                 self._audio_silence_streak = 0
                                 self._collapse_triggers.clear()
@@ -3469,11 +3635,11 @@ class ServerState:
                             # Clear the inject queues (not part of the snapshot)
                             # so a pre-rewind caption is not dripped into the
                             # restored state.
-                            self._vision_pending.clear()
-                            self._vision_pending_source = ""
+                            self._clear_vision_pending()
                             self._vision_inject_steps = 0
-                            self._reinforce_pending.clear()
+                            self._clear_reinforce_pending()
                             self._reinforce_inject_steps = 0
+                            self._active_context_meta = {}
                             self._vision_pad_streak = 0
                             self._audio_silence_streak = 0
                             self._collapse_triggers.clear()
@@ -3607,11 +3773,11 @@ class ServerState:
                                 self._interrupt_gate_remaining,
                                 INTERRUPT_YIELD_FRAMES,
                             )
-                            self._vision_pending.clear()
-                            self._vision_pending_source = ""
+                            self._clear_vision_pending()
                             self._vision_inject_steps = 0
-                            self._reinforce_pending.clear()
+                            self._clear_reinforce_pending()
                             self._reinforce_inject_steps = 0
+                            self._active_context_meta = {}
                             self._inject_active = False
 
                     await loop.run_in_executor(None, _do_interrupt)
@@ -3762,8 +3928,7 @@ class ServerState:
                                         if session_id != self._active_session_id:
                                             return
                                         if self._vision_pending_source == "ambient":
-                                            self._vision_pending.clear()
-                                            self._vision_pending_source = ""
+                                            self._clear_vision_pending()
                                             self._vision_inject_steps = 0
 
                                 await loop.run_in_executor(
@@ -3786,8 +3951,7 @@ class ServerState:
                                         if session_id != self._active_session_id:
                                             return
                                         if self._vision_pending_source == "user_turn":
-                                            self._vision_pending.clear()
-                                            self._vision_pending_source = ""
+                                            self._clear_vision_pending()
                                             self._vision_inject_steps = 0
 
                                 await loop.run_in_executor(

@@ -83,6 +83,18 @@ function formatVisionFeed(feed, enabled, injecting = false) {
   return enabled ? "react on" : "react off";
 }
 
+const EMPTY_CONTEXT_STATUS = {
+  status: "idle",
+  source: "",
+  reason: "",
+  text: "",
+  caption: "",
+  tokens: 0,
+  remainingTokens: 0,
+  frameId: "",
+  at: "",
+};
+
 // Stable keys for the fixed-length decorative voice-row waveform bars.
 const GLYPH_BARS = Array.from({ length: 11 }, (_, i) => `glyph-${i}`);
 
@@ -227,6 +239,7 @@ function App() {
   const [currentCaption, setCurrentCaption] = useState("");
   const [captionEntries, setCaptionEntries] = useState([]);
   const [currentVisionFeed, setCurrentVisionFeed] = useState({ mode: "unknown", queued: 0 });
+  const [contextStatus, setContextStatus] = useState(EMPTY_CONTEXT_STATUS);
   const [inspectFrame, setInspectFrame] = useState(null);
   const [visionSourceOpen, setVisionSourceOpen] = useState(false);
 
@@ -506,6 +519,20 @@ function App() {
   const visionCostRemaining = Math.max(0, Number(visionCostLimitUsd || 0) - visionCostUsd);
   const visionFeedStatus = formatVisionFeed(currentVisionFeed, visionFeedModel, visionInjecting);
   const visionTurnStatus = visionGroundTurns ? "after speech" : "manual only";
+  const contextStatusLabel = contextStatus.status === "injecting"
+    ? "injecting"
+    : contextStatus.status === "queued"
+      ? "queued"
+      : contextStatus.status === "complete"
+        ? "last injected"
+        : "idle";
+  const contextSourceLabel = {
+    ambient: "ambient",
+    user_turn: "after speech",
+    manual: "manual",
+    reinforce: "persona",
+  }[contextStatus.source] || "none";
+  const contextPreviewText = contextStatus.text || contextStatus.caption || "No context queued";
   const timelinePreview = useMemo(() => sessionTimeline.slice(0, 14).reverse(), [sessionTimeline]);
   const timelineDurationMs = useMemo(
     () => Math.max(1000, elapsedSec * 1000, ...sessionTimeline.map((item) => item.offsetMs || 0)),
@@ -1264,6 +1291,7 @@ function App() {
     setVisionSpeechGrounding(false);
     setVisionInjecting(false);
     setCurrentCaption("");
+    setContextStatus({ ...EMPTY_CONTEXT_STATUS });
     visionLastSentAtRef.current = 0;
     setVisionLastSentAt(0);
   }, [setVisionSpeechGrounding]);
@@ -1661,6 +1689,21 @@ function App() {
       } else if (message.type === "vision_inject") {
         setVisionInjecting(!!message.active);
         addNotice(message.active ? "info" : "ok", message.active ? "Inject window opened, audio gated" : "Inject window closed", "inject");
+      } else if (message.type === "context_status") {
+        const data = message.data && typeof message.data === "object" ? message.data : {};
+        const tokens = Number(data.tokens);
+        const remainingTokens = Number(data.remaining_tokens);
+        setContextStatus({
+          status: typeof message.status === "string" ? message.status : "idle",
+          source: typeof data.source === "string" ? data.source : "",
+          reason: typeof data.reason === "string" ? data.reason : "",
+          text: typeof data.text === "string" ? data.text : "",
+          caption: typeof data.caption === "string" ? data.caption : "",
+          tokens: Number.isFinite(tokens) ? tokens : 0,
+          remainingTokens: Number.isFinite(remainingTokens) ? remainingTokens : 0,
+          frameId: typeof data.frame_id === "string" ? data.frame_id : "",
+          at: new Date().toTimeString().slice(0, 8),
+        });
       } else if (message.type === "interrupted") {
         pulseInterrupt();
       } else if (message.type === "config_applied") {
@@ -2025,6 +2068,7 @@ function App() {
     assistantTurnRef.current = { startedAt: 0, startLength: 0, lastChunkAt: 0, lastLength: 0, words: 0 };
     setCaptionEntries([]);
     setCurrentCaption("");
+    setContextStatus({ ...EMPTY_CONTEXT_STATUS });
     pendingVisionFramesRef.current.clear();
     setVisionFramesSent(0);
     setVisionFramesGated(0);
@@ -2129,6 +2173,7 @@ function App() {
     userSpokeAtRef.current = 0;
     setCaptionEntries([]);
     setCurrentCaption("");
+    setContextStatus({ ...EMPTY_CONTEXT_STATUS });
     pendingVisionFramesRef.current.clear();
     setNotices([]);
     setSessionTimeline([]);
@@ -4241,6 +4286,17 @@ function App() {
               {visionOn && <Flow label="Gemini vision" value={visionPaused ? "paused" : `frames active · ${visionFeedStatus} · ${visionTurnStatus}`} active={!visionPaused} warn={visionPaused || visionInjecting} branch />}
               <Flow label="Audio graph" value={isLive ? "recording · analysers" : "idle"} active={isLive} />
               <Flow label={gpuLabel} value={gpuValue} active={isLive} />
+            </div>
+            <div className={cls("context-readout", contextStatus.status !== "idle" && "active", contextStatus.status === "injecting" && "hot")}>
+              <div className="context-readout-h">
+                <span>Context</span>
+                <span>{contextStatusLabel} · {contextSourceLabel}</span>
+              </div>
+              <div className="context-readout-text">{contextPreviewText}</div>
+              <div className="context-readout-meta mono">
+                <span>{contextStatus.tokens ? `${contextStatus.tokens} tok` : "no tokens"}</span>
+                <span>{contextStatus.remainingTokens ? `${contextStatus.remainingTokens} left` : contextStatus.at || "waiting"}</span>
+              </div>
             </div>
           </div>
 

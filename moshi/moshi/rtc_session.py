@@ -791,6 +791,18 @@ class RTCSession:
                 )
             )
 
+    def send_context_status(
+        self,
+        status: str,
+        data: Optional[dict] = None,
+    ) -> None:
+        """Push context-queue/inject metadata to the dashboard."""
+        if self._control and self._control.readyState == "open":
+            payload = {"type": "context_status", "status": status}
+            if data is not None:
+                payload["data"] = data
+            self._control.send(json.dumps(payload))
+
     def send_interrupted(self, reason: str) -> None:
         if self._control and self._control.readyState == "open":
             self._control.send(

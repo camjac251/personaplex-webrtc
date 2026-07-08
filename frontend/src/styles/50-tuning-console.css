@@ -302,6 +302,51 @@
   }
   .cons-note b { color: var(--ink-3); font-weight: 500; }
 
+  .context-readout {
+    display: grid;
+    gap: 6px;
+    margin-top: 8px;
+    padding: 8px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-ctrl);
+    background: var(--sunk);
+  }
+  .context-readout.active {
+    border-color: var(--line-2);
+    background: var(--surface);
+  }
+  .context-readout.hot {
+    border-color: color-mix(in srgb, var(--violet) 45%, var(--line));
+  }
+  .context-readout-h,
+  .context-readout-meta {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .context-readout-h {
+    font-family: 'Geist Mono', ui-monospace, monospace;
+    font-size: 9px;
+    color: var(--ink-4);
+    text-transform: uppercase;
+    letter-spacing: 0;
+  }
+  .context-readout-h span:last-child {
+    color: var(--ink-3);
+    text-align: right;
+  }
+  .context-readout-text {
+    max-height: 4.35em;
+    overflow: hidden;
+    color: var(--ink-2);
+    font-size: 10.5px;
+    line-height: 1.45;
+  }
+  .context-readout-meta {
+    color: var(--ink-4);
+    font-size: 9.5px;
+  }
+
   /* ─── Snapshot bookmarks (console D · Snapshots) ─── */
   .bm-list {
     display: flex;
