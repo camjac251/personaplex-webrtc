@@ -15,6 +15,7 @@ import {
   HEARTBEAT_MISSED_LIMIT,
   HEARTBEAT_STALE_AFTER_MS,
   JITTER_BUFFER_SMOOTH_SEC,
+  LEGACY_VISION_PROMPTS,
   PERSONA_PRESETS,
   RECONNECT_GRACE_MS,
   RECONNECT_MAX_ATTEMPTS,
@@ -65,6 +66,21 @@ function formatDiffValue(value) {
   if (typeof value === "boolean") return value ? "on" : "off";
   if (value === null || value === undefined || value === "") return "off";
   return String(value);
+}
+
+function normalizeVisionFeed(feed) {
+  if (!feed || typeof feed !== "object") return { mode: "unknown", queued: 0 };
+  const mode = ["queued", "passive", "detail"].includes(feed.mode) ? feed.mode : "unknown";
+  const queued = Number.isFinite(Number(feed.queued)) ? Math.max(0, Number.parseInt(feed.queued, 10)) : 0;
+  return { mode, queued };
+}
+
+function formatVisionFeed(feed, enabled, injecting = false) {
+  if (injecting) return "injecting";
+  if (feed.mode === "queued") return feed.queued > 0 ? `queued ${feed.queued}` : "react ready";
+  if (feed.mode === "detail") return "detail only";
+  if (feed.mode === "passive") return "react off";
+  return enabled ? "react on" : "react off";
 }
 
 // Stable keys for the fixed-length decorative voice-row waveform bars.
@@ -178,6 +194,8 @@ function App() {
   const [noiseSupp, setNoiseSupp] = useStoredState("pp_noiseSupp", DEFAULTS.noiseSupp, (v) => v === "1", (v) => (v ? "1" : "0"));
   const [autoGain, setAutoGain] = useStoredState("pp_autoGain", DEFAULTS.autoGain, (v) => v === "1", (v) => (v ? "1" : "0"));
   const [visionInTranscript, setVisionInTranscript] = useStoredState("pp_visionInTranscript", false, (v) => v === "1", (v) => (v ? "1" : "0"));
+  const [visionFeedModel, setVisionFeedModel] = useStoredState("pp_visionFeedModel", false, (v) => v === "1", (v) => (v ? "1" : "0"));
+  const [visionGroundTurns, setVisionGroundTurns] = useStoredState("pp_visionGroundTurns", false, (v) => v === "1", (v) => (v ? "1" : "0"));
   const [reinforceInSilences, setReinforceInSilences] = useStoredState("pp_reinforceInSilences", false, (v) => v === "1", (v) => (v ? "1" : "0"));
   const [seedRandom, setSeedRandom] = useStoredState("pp_seedRandom", true, (v) => v === "1", (v) => (v ? "1" : "0"));
   const [seed, setSeed] = useStoredState("pp_seedValue", DEFAULTS.seed, Number);
@@ -207,6 +225,7 @@ function App() {
   const [visionBudgetTripped, setVisionBudgetTripped] = useState(false);
   const [currentCaption, setCurrentCaption] = useState("");
   const [captionEntries, setCaptionEntries] = useState([]);
+  const [currentVisionFeed, setCurrentVisionFeed] = useState({ mode: "unknown", queued: 0 });
   const [inspectFrame, setInspectFrame] = useState(null);
   const [visionSourceOpen, setVisionSourceOpen] = useState(false);
 
@@ -324,6 +343,8 @@ function App() {
     repetition_penalty_context: Number.parseInt(repContext, 10),
     padding_bonus: Number(padBonus),
     max_turn_text_tokens: Number.parseInt(maxTurn, 10),
+    vision_feed_model: !!visionFeedModel,
+    vision_ground_user_turns: !!visionGroundTurns,
     inject_silence_rms: Number(injectSilenceRms),
     inject_silence_streak: Number.parseInt(injectSilenceStreak, 10),
   };
@@ -336,6 +357,12 @@ function App() {
   const sideCollapsed = cfgLocked && !sideExpanded;
   const isBusy = connectionIssue === "busy";
   const isTurnFailed = connectionIssue === "turn";
+
+  useEffect(() => {
+    if (LEGACY_VISION_PROMPTS.includes(visionPrompt)) {
+      setVisionPrompt(DEFAULT_VISION_PROMPT);
+    }
+  }, [setVisionPrompt, visionPrompt]);
 
   const addNotice = useCallback((level, text, kind = "event", extra = {}) => {
     const ts = new Date().toTimeString().slice(0, 8);
@@ -476,6 +503,8 @@ function App() {
   const visionCostUsd = visionFramesSent * VISION_PER_CALL_USD;
   const visionCostLimitActive = Number(visionCostLimitUsd) > 0;
   const visionCostRemaining = Math.max(0, Number(visionCostLimitUsd || 0) - visionCostUsd);
+  const visionFeedStatus = formatVisionFeed(currentVisionFeed, visionFeedModel, visionInjecting);
+  const visionTurnStatus = visionGroundTurns ? "turn ground on" : "turn ground off";
   const timelinePreview = useMemo(() => sessionTimeline.slice(0, 14).reverse(), [sessionTimeline]);
   const timelineDurationMs = useMemo(
     () => Math.max(1000, elapsedSec * 1000, ...sessionTimeline.map((item) => item.offsetMs || 0)),
@@ -526,6 +555,8 @@ function App() {
       noiseSupp: !!noiseSupp,
       autoGain: !!autoGain,
       visionInTranscript: !!visionInTranscript,
+      visionFeedModel: !!visionFeedModel,
+      visionGroundTurns: !!visionGroundTurns,
       reinforceInSilences: !!reinforceInSilences,
       visionPrompt,
       visionIntervalMs: Number(visionIntervalMs),
@@ -554,6 +585,8 @@ function App() {
     textTemp,
     textTopk,
     uploadedVoiceFilename,
+    visionFeedModel,
+    visionGroundTurns,
     visionInTranscript,
     visionCostLimitUsd,
     visionIntervalMs,
@@ -599,6 +632,8 @@ function App() {
     setNoiseSupp(typeof profile.noiseSupp === "boolean" ? profile.noiseSupp : DEFAULTS.noiseSupp);
     setAutoGain(typeof profile.autoGain === "boolean" ? profile.autoGain : DEFAULTS.autoGain);
     setVisionInTranscript(!!profile.visionInTranscript);
+    setVisionFeedModel(!!profile.visionFeedModel);
+    setVisionGroundTurns(!!profile.visionGroundTurns);
     setReinforceInSilences(!!profile.reinforceInSilences);
     setVisionPrompt(profile.visionPrompt || DEFAULT_VISION_PROMPT);
     setVisionIntervalMs(Number.isFinite(Number(profile.visionIntervalMs)) ? Number(profile.visionIntervalMs) : DEFAULTS.visionIntervalMs);
@@ -627,6 +662,8 @@ function App() {
     setTextTemp,
     setTextTopk,
     setVisionInTranscript,
+    setVisionFeedModel,
+    setVisionGroundTurns,
     setReinforceInSilences,
     setVisionIntervalMs,
     setVisionPrompt,
@@ -664,6 +701,8 @@ function App() {
       text_prompt: composeTextPrompt(),
       vision_prompt: visionPrompt || "",
       vision_in_transcript: !!visionInTranscript,
+      vision_feed_model: !!visionFeedModel,
+      vision_ground_user_turns: !!visionGroundTurns,
       reinforce_in_silences: !!reinforceInSilences,
       audio_temperature: Number(audioTemp),
       text_temperature: Number(textTemp),
@@ -690,6 +729,8 @@ function App() {
     composeTextPrompt,
     visionPrompt,
     visionInTranscript,
+    visionFeedModel,
+    visionGroundTurns,
     reinforceInSilences,
     audioTemp,
     textTemp,
@@ -728,6 +769,8 @@ function App() {
     vision: {
       interval_ms: Number(visionIntervalMs),
       cost_limit_usd: Number(visionCostLimitUsd),
+      feed_model: !!visionFeedModel,
+      ground_user_turns: !!visionGroundTurns,
     },
   }), [
     presetId,
@@ -746,6 +789,8 @@ function App() {
     outputDeviceId,
     visionIntervalMs,
     visionCostLimitUsd,
+    visionFeedModel,
+    visionGroundTurns,
   ]);
 
   const applyConfigProfile = useCallback((profile) => {
@@ -770,6 +815,16 @@ function App() {
     }
     if (typeof config.vision_prompt === "string") setVisionPrompt(config.vision_prompt);
     setVisionInTranscript(!!config.vision_in_transcript);
+    setVisionFeedModel(
+      typeof config.vision_feed_model === "boolean"
+        ? config.vision_feed_model
+        : !!profile?.vision?.feed_model,
+    );
+    setVisionGroundTurns(
+      typeof config.vision_ground_user_turns === "boolean"
+        ? config.vision_ground_user_turns
+        : !!profile?.vision?.ground_user_turns,
+    );
     setReinforceInSilences(!!config.reinforce_in_silences);
     setAudioTemp(readNumber(config.audio_temperature, DEFAULTS.audioTemp));
     setTextTemp(readNumber(config.text_temperature, DEFAULTS.textTemp));
@@ -840,7 +895,7 @@ function App() {
     const interval = readNumber(profile?.vision?.interval_ms, visionIntervalMs);
     if (interval >= 1000 && interval <= 30000) setVisionIntervalMs(interval);
     setVisionCostLimitUsd(Math.max(0, readNumber(profile?.vision?.cost_limit_usd, visionCostLimitUsd)));
-  }, [addNotice, allSessionProfiles, clearUploadedVoice, cloneStrength, textPrompt, visionCostLimitUsd, visionIntervalMs, voiceList, setAdherenceMode, setExpressionMode, setAudioTemp, setTextTemp, setTextTopk, setAudioTopk, setRepPenalty, setRepContext, setPadBonus, setMaxTurn, setInjectSilenceRms, setInjectSilenceStreak, setSeedRandom, setSeed, setIdleTimeout, setTextPrompt, setVisionPrompt, setVisionInTranscript, setReinforceInSilences, setVoice, setVoiceBlend, setVoiceB, setBlendMix, setCloneStrength, setEchoCancel, setNoiseSupp, setAutoGain, setOutputDeviceId, setVisionIntervalMs, setVisionCostLimitUsd]);
+  }, [addNotice, allSessionProfiles, clearUploadedVoice, cloneStrength, textPrompt, visionCostLimitUsd, visionIntervalMs, voiceList, setAdherenceMode, setExpressionMode, setAudioTemp, setTextTemp, setTextTopk, setAudioTopk, setRepPenalty, setRepContext, setPadBonus, setMaxTurn, setInjectSilenceRms, setInjectSilenceStreak, setSeedRandom, setSeed, setIdleTimeout, setTextPrompt, setVisionPrompt, setVisionInTranscript, setVisionFeedModel, setVisionGroundTurns, setReinforceInSilences, setVoice, setVoiceBlend, setVoiceB, setBlendMix, setCloneStrength, setEchoCancel, setNoiseSupp, setAutoGain, setOutputDeviceId, setVisionIntervalMs, setVisionCostLimitUsd]);
 
   const exportConfig = useCallback(() => {
     const profile = JSON.stringify(buildConfigProfile(), null, 2);
@@ -1010,6 +1065,8 @@ function App() {
       ["Echo", currentProfileSnapshot.echoCancel, pinned.echoCancel],
       ["Noise", currentProfileSnapshot.noiseSupp, pinned.noiseSupp],
       ["AGC", currentProfileSnapshot.autoGain, pinned.autoGain],
+      ["Vision react", currentProfileSnapshot.visionFeedModel, pinned.visionFeedModel],
+      ["Vision turn", currentProfileSnapshot.visionGroundTurns, pinned.visionGroundTurns],
       ["Vision cadence", currentProfileSnapshot.visionIntervalMs, pinned.visionIntervalMs],
       ["Vision budget", currentProfileSnapshot.visionCostLimitUsd || "off", pinned.visionCostLimitUsd || "off"],
       ["Seed", currentProfileSnapshot.seedRandom ? "random" : currentProfileSnapshot.seed, pinned.seedRandom ? "random" : pinned.seed],
@@ -1458,10 +1515,12 @@ function App() {
         const pendingFrame = frameId ? pendingVisionFramesRef.current.get(frameId) : null;
         const frame = pendingFrame?.frame || lastFramePreviewRef.current;
         const meta = pendingFrame?.meta || lastFrameMetaRef.current;
+        const feed = normalizeVisionFeed(message.feed);
         if (frameId) pendingVisionFramesRef.current.delete(frameId);
         const entryId = frameId || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         setCurrentCaption(text);
-        setCaptionEntries((entries) => [{ id: entryId, ts, text, frame, meta, frameId }, ...entries].slice(0, 14));
+        setCurrentVisionFeed(feed);
+        setCaptionEntries((entries) => [{ id: entryId, ts, text, frame, meta, frameId, feed }, ...entries].slice(0, 14));
         const offsetMs = sessionStartedAtRef.current ? Math.max(0, performance.now() - sessionStartedAtRef.current) : 0;
         setSessionTimeline((items) => [
           {
@@ -1551,7 +1610,9 @@ function App() {
           ? "rewind"
           : kindRaw.includes("inject")
             ? "inject"
-            : "event";
+            : kindRaw.includes("vision")
+              ? "vision"
+              : "event";
         lastServerEventRef.current = { text, at: performance.now() };
         addNotice(message.level || "info", text, kind);
       } else if (message.type === "notice") {
@@ -2290,6 +2351,15 @@ function App() {
       return !paused;
     });
   };
+
+  const useLatestScene = useCallback(() => {
+    if (controlRef.current?.readyState !== "open") {
+      addNotice("warn", "Start a session before using scene context", "vision");
+      return;
+    }
+    controlRef.current.send(JSON.stringify({ type: "use_latest_vision" }));
+    addNotice("info", "Requested latest scene context", "vision");
+  }, [addNotice]);
 
   const rewind = () => {
     const now = performance.now();
@@ -3735,6 +3805,8 @@ function App() {
                   <div className="vision-meta">
                     <span><b>{visionFramesSent}</b> sent</span>
                     <span><b>{visionFramesGated}</b> gated</span>
+                    <span className={cls(visionFeedModel && "hot", visionInjecting && "warn")}>{visionFeedStatus}</span>
+                    <span className={cls(visionGroundTurns && "hot")}>{visionTurnStatus}</span>
                     <span>~$<b>{visionCostUsd.toFixed(4)}</b></span>
                     {visionCostLimitActive && <span><b>${visionCostRemaining.toFixed(4)}</b> left</span>}
                     {visionBudgetTripped && <span className="warn">budget hit</span>}
@@ -3755,6 +3827,9 @@ function App() {
                           title="Inspect source frame"
                         >
                           <span className="ts">{entry.ts}</span>
+                          <span className={cls("feed", entry.feed?.mode === "queued" && "hot")}>
+                            {formatVisionFeed(entry.feed || { mode: "unknown", queued: 0 }, visionFeedModel)}
+                          </span>
                           {entry.text}
                         </button>
                       ))
@@ -3809,6 +3884,55 @@ function App() {
                           sendLiveConfig({ vision_cost_limit_usd: nextLimit });
                         }}
                       />
+                    </div>
+                    <div className="mini-row" style={{ paddingTop: 4 }}>
+                      <span className="l" style={{ display: "inline-flex", alignItems: "center" }}>
+                        Let voice react
+                        <Info k="visionFeed" />
+                      </span>
+                      <button
+                        type="button"
+                        className={cls("switch", visionFeedModel && "on")}
+                        role="switch"
+                        aria-checked={visionFeedModel}
+                        aria-label="Let voice react to vision captions"
+                        onClick={() => {
+                          const nextFeed = !visionFeedModel;
+                          setVisionFeedModel(nextFeed);
+                          setSessionProfileId("custom");
+                          sendLiveConfig({ vision_feed_model: nextFeed });
+                        }}
+                      />
+                    </div>
+                    <div className="mini-row" style={{ paddingTop: 4 }}>
+                      <span className="l" style={{ display: "inline-flex", alignItems: "center" }}>
+                        Ground user turns
+                        <Info k="visionGround" />
+                      </span>
+                      <button
+                        type="button"
+                        className={cls("switch", visionGroundTurns && "on")}
+                        role="switch"
+                        aria-checked={visionGroundTurns}
+                        aria-label="Ground user turns with latest visual context"
+                        onClick={() => {
+                          const nextGround = !visionGroundTurns;
+                          setVisionGroundTurns(nextGround);
+                          setSessionProfileId("custom");
+                          sendLiveConfig({ vision_ground_user_turns: nextGround });
+                        }}
+                      />
+                    </div>
+                    <div className="vision-actions">
+                      <button
+                        type="button"
+                        className="btn ghost block"
+                        disabled={!isLive || !visionOn}
+                        title={currentCaption ? "Queue the latest visual note for the next answer" : "Request a fresh visual note for the next answer"}
+                        onClick={useLatestScene}
+                      >
+                        {Icon.eye} Use latest scene
+                      </button>
                     </div>
                     <div className="mini-row" style={{ paddingTop: 4 }}>
                       <span className="l" style={{ display: "inline-flex", alignItems: "center" }}>
@@ -3999,7 +4123,7 @@ function App() {
               <Flow label="Peer connection" value={isLive ? "connected · turn" : phase === "connecting" ? "gathering ICE" : "idle"} active={isLive || phase === "connecting"} warn={phase === "connecting"} />
               <Flow label="Mimi codec" value={isLive || phase === "warmup" ? "24 kHz · 12.5 fps" : "idle"} active={isLive || phase === "warmup"} />
               <Flow label="LM · personaplex-7b" value={isLive ? `t ${fmt(textTemp, 2)} · k ${textTopk}${visionInjecting ? " · gated" : ""}` : phase === "warmup" ? "warming" : "idle"} active={isLive || phase === "warmup"} warn={visionInjecting} />
-              {visionOn && <Flow label="Gemini vision" value={visionPaused ? "paused" : "frames active"} active={!visionPaused} warn={visionPaused} branch />}
+              {visionOn && <Flow label="Gemini vision" value={visionPaused ? "paused" : `frames active · ${visionFeedStatus} · ${visionTurnStatus}`} active={!visionPaused} warn={visionPaused || visionInjecting} branch />}
               <Flow label="Audio graph" value={isLive ? "recording · analysers" : "idle"} active={isLive} />
               <Flow label={gpuLabel} value={gpuValue} active={isLive} />
             </div>

@@ -711,7 +711,7 @@
 
   .vision-meta {
     padding: 7px 12px;
-    display: flex; justify-content: space-between;
+    display: flex; justify-content: flex-start; flex-wrap: wrap;
     gap: 8px;
     font-family: 'Geist Mono', monospace;
     font-size: 9.5px;
@@ -721,6 +721,7 @@
     border-bottom: 1px solid var(--line);
   }
   .vision-meta b { color: var(--ink); font-weight: 500; }
+  .vision-meta .hot { color: var(--green); }
   .vision-meta .warn { color: var(--amber); }
   .vision-history {
     flex: 1; overflow-y: auto;
@@ -741,6 +742,21 @@
     margin-bottom: 6px;
   }
   .v-entry .ts { color: var(--ink-5); margin-right: 5px; }
+  .v-entry .feed {
+    display: inline-block;
+    margin-right: 5px;
+    padding: 0 4px;
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    color: var(--ink-5);
+    font-size: 9px;
+    line-height: 1.4;
+    text-transform: uppercase;
+  }
+  .v-entry .feed.hot {
+    color: var(--green);
+    border-color: rgba(118, 166, 126, 0.35);
+  }
   .vision-budget {
     width: 100%;
     min-height: 32px;

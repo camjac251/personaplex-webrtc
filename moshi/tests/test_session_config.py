@@ -62,6 +62,8 @@ def test_defaults_are_within_clamp_bounds() -> None:
         clamp_inject_silence_streak(defaults.inject_silence_streak)
         == defaults.inject_silence_streak
     )
+    assert defaults.vision_feed_model is False
+    assert defaults.vision_ground_user_turns is False
 
 
 def test_inject_silence_clamps() -> None:

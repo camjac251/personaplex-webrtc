@@ -384,6 +384,16 @@ class SessionConfig:
     text_prompt: str = ""
     vision_prompt: str = ""
     vision_in_transcript: bool = False
+    # When true, live Gemini captions are drip-fed into Moshi's text
+    # channel during silence windows. Off by default so vision capture is a
+    # passive perception/UI feature unless the user explicitly allows the
+    # voice model to use it.
+    vision_feed_model: bool = False
+    # When true, each detected user-audio turn can receive one fresh scene note
+    # for the next answer. This is separate from ambient vision_feed_model and
+    # does not require ASR/transcription, but it is intentionally opt-in because
+    # it may add visual context to non-visual turns.
+    vision_ground_user_turns: bool = False
     # Connect-time toggle: when set, the server periodically re-asserts the
     # persona body into the model's text channel during pad/silence windows
     # to counter long-session drift. Conditioning-adjacent, so it is fixed
@@ -704,12 +714,19 @@ class RTCSession:
                 json.dumps({"type": "user_text", "v": text, "final": bool(final)})
             )
 
-    def send_vision_caption(self, text: str, frame_id: str = "") -> None:
+    def send_vision_caption(
+        self,
+        text: str,
+        frame_id: str = "",
+        feed: Optional[dict] = None,
+    ) -> None:
         """Push the latest vision-side scene description to the client UI."""
         if self._control and self._control.readyState == "open":
             payload = {"type": "vision_caption", "text": text}
             if frame_id:
                 payload["frame_id"] = frame_id
+            if feed is not None:
+                payload["feed"] = feed
             self._control.send(json.dumps(payload))
 
     def send_vision_status(self, enabled: bool) -> None:
@@ -924,6 +941,15 @@ class RTCSession:
                     vision_prompt=str(payload.get("vision_prompt", defaults.vision_prompt)),
                     vision_in_transcript=bool(
                         payload.get("vision_in_transcript", defaults.vision_in_transcript)
+                    ),
+                    vision_feed_model=bool(
+                        payload.get("vision_feed_model", defaults.vision_feed_model)
+                    ),
+                    vision_ground_user_turns=bool(
+                        payload.get(
+                            "vision_ground_user_turns",
+                            defaults.vision_ground_user_turns,
+                        )
                     ),
                     reinforce_in_silences=bool(
                         payload.get(
