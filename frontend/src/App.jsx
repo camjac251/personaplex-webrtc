@@ -530,14 +530,20 @@ function App() {
     () => customProfiles.find((profile) => profile.id === sessionProfileId) || null,
     [customProfiles, sessionProfileId],
   );
+  const selectedAdherence = useMemo(
+    () => ADHERENCE_MODES.find((item) => item.id === adherenceMode) || ADHERENCE_MODES[0],
+    [adherenceMode],
+  );
+  const selectedExpression = useMemo(
+    () => EXPRESSION_MODES.find((item) => item.id === expressionMode) || EXPRESSION_MODES[0],
+    [expressionMode],
+  );
   const currentProfileSnapshot = useMemo(() => {
     const label = profileName.trim() || "My profile";
-    const adherence = ADHERENCE_MODES.find((item) => item.id === adherenceMode) || ADHERENCE_MODES[0];
-    const expression = EXPRESSION_MODES.find((item) => item.id === expressionMode) || EXPRESSION_MODES[0];
     return {
       custom: true,
       label,
-      desc: `${adherence.label} · ${expression.label} · ${uploadedVoiceFilename ? "uploaded voice" : voice}`,
+      desc: `${selectedAdherence.label} · ${selectedExpression.label} · ${uploadedVoiceFilename ? "uploaded voice" : voice}`,
       presetId,
       textPrompt,
       voice,
@@ -581,6 +587,8 @@ function App() {
     repPenalty,
     seed,
     seedRandom,
+    selectedAdherence,
+    selectedExpression,
     textPrompt,
     textTemp,
     textTopk,
@@ -676,12 +684,29 @@ function App() {
   };
 
   const composeTextPrompt = useCallback(() => {
-    const adherence = ADHERENCE_MODES.find((item) => item.id === adherenceMode) || ADHERENCE_MODES[0];
-    const expression = EXPRESSION_MODES.find((item) => item.id === expressionMode) || EXPRESSION_MODES[0];
-    return [textPrompt || "", adherence.instruction, expression.instruction]
+    return [textPrompt || "", selectedAdherence.instruction, selectedExpression.instruction]
       .filter(Boolean)
       .join("\n\n");
-  }, [adherenceMode, expressionMode, textPrompt]);
+  }, [selectedAdherence, selectedExpression, textPrompt]);
+
+  const resolvedTextPrompt = useMemo(() => composeTextPrompt(), [composeTextPrompt]);
+  const promptPreviewParts = useMemo(() => [
+    {
+      label: "Persona",
+      active: Boolean((textPrompt || "").trim()),
+      state: (textPrompt || "").trim() ? "base" : "empty",
+    },
+    {
+      label: "Adherence",
+      active: Boolean(selectedAdherence.instruction),
+      state: selectedAdherence.instruction ? selectedAdherence.label : "off",
+    },
+    {
+      label: "Expression",
+      active: Boolean(selectedExpression.instruction),
+      state: selectedExpression.instruction ? selectedExpression.label : "off",
+    },
+  ], [selectedAdherence, selectedExpression, textPrompt]);
 
   const buildConfigPayload = useCallback(() => {
     const selectedVoice = uploadedVoiceFilename || (voice ? `${voice}.pt` : "");
@@ -3098,7 +3123,7 @@ function App() {
                 }}
               />
               <div className="field-meta">
-                <span>Wrapped in &lt;system&gt;</span>
+                <span>Connect-time system payload</span>
                 <span>{textPrompt.length} / 2000</span>
               </div>
               <div className="prompt-modes">
@@ -3133,6 +3158,28 @@ function App() {
                   }}
                 />
               </div>
+              <details className="prompt-preview">
+                <summary>
+                  <span className="prompt-preview-copy">
+                    <span className="prompt-preview-title">Final prompt sent</span>
+                    <span className="prompt-preview-sub mono">
+                      {resolvedTextPrompt.length} chars
+                    </span>
+                  </span>
+                  <span className="prompt-preview-state mono">
+                    {promptPreviewParts.filter((part) => part.active).length} parts
+                  </span>
+                </summary>
+                <div className="prompt-preview-parts">
+                  {promptPreviewParts.map((part) => (
+                    <div className={cls("prompt-preview-part", part.active && "active")} key={part.label}>
+                      <span className="k">{part.label}</span>
+                      <span className="v">{part.state}</span>
+                    </div>
+                  ))}
+                </div>
+                <pre>{resolvedTextPrompt || "No prompt configured."}</pre>
+              </details>
               <div className="opt-row">
                 <div className="opt-l">
                   <span className="opt-n" style={{ display: "inline-flex", alignItems: "center" }}>
@@ -3928,7 +3975,21 @@ function App() {
                         After speech
                         <Info k="visionGround" />
                       </span>
-                      <span className="v">{visionGroundTurns ? "scene attached" : "off"}</span>
+                      <span className="vision-mini-action">
+                        <span className="v">{visionGroundTurns ? "scene attached" : "off"}</span>
+                        <button
+                          type="button"
+                          className={cls("switch", visionGroundTurns && "on")}
+                          role="switch"
+                          aria-checked={visionGroundTurns}
+                          aria-label="Attach latest scene after user speech"
+                          onClick={() => {
+                            const nextGround = !visionGroundTurns;
+                            setVisionSpeechGrounding(nextGround);
+                            setSessionProfileId("custom");
+                          }}
+                        />
+                      </span>
                     </div>
                     <div className="vision-actions">
                       <button

@@ -192,6 +192,13 @@
     color: var(--ink);
   }
   .vision-tune .mini-row .l { color: var(--ink-3); }
+  .vision-mini-action {
+    display: inline-flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    min-width: 0;
+  }
   .vision-actions {
     padding: 3px 0 1px;
   }

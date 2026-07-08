@@ -512,6 +512,83 @@
     gap: 8px;
     margin-top: 10px;
   }
+  .prompt-preview {
+    margin-top: 10px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-ctrl);
+    background: var(--sunk);
+    overflow: hidden;
+  }
+  .prompt-preview summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 8px 9px;
+    cursor: pointer;
+    color: var(--ink);
+  }
+  .prompt-preview-copy {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .prompt-preview-title {
+    font-size: 11px;
+    font-weight: 650;
+  }
+  .prompt-preview-sub,
+  .prompt-preview-state {
+    font-size: 9.5px;
+    color: var(--ink-4);
+    text-transform: uppercase;
+  }
+  .prompt-preview-parts {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 5px;
+    padding: 0 9px 8px;
+  }
+  .prompt-preview-part {
+    min-width: 0;
+    border: 1px solid var(--line);
+    border-radius: var(--r-ctrl);
+    background: var(--surface);
+    padding: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .prompt-preview-part.active {
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  }
+  .prompt-preview-part .k {
+    font-family: 'Geist Mono', monospace;
+    font-size: 9px;
+    color: var(--ink-4);
+    text-transform: uppercase;
+  }
+  .prompt-preview-part .v {
+    min-width: 0;
+    font-size: 10.5px;
+    color: var(--ink-2);
+    overflow-wrap: anywhere;
+  }
+  .prompt-preview pre {
+    margin: 0;
+    max-height: 180px;
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    border-top: 1px solid var(--line);
+    padding: 9px;
+    background: var(--bg-2);
+    color: var(--ink-2);
+    font-family: 'Geist Mono', monospace;
+    font-size: 10.5px;
+    line-height: 1.45;
+  }
 
   /* Voice tabs + list */
   .voice-tabs {

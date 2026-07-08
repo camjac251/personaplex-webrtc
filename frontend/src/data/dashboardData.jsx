@@ -124,6 +124,12 @@ export const ADHERENCE_MODES = [
     instruction:
       "Adherence: keep the persona active, but adapt to the user's latest intent when they interrupt, correct, or redirect the conversation.",
   },
+  {
+    id: "none",
+    label: "Off",
+    desc: "Do not append an adherence directive.",
+    instruction: "",
+  },
 ];
 
 export const EXPRESSION_MODES = [
@@ -147,6 +153,12 @@ export const EXPRESSION_MODES = [
     desc: "More prosody and color when useful.",
     instruction:
       "Expression: use vivid phrasing and more vocal energy while still yielding quickly when the user speaks.",
+  },
+  {
+    id: "none",
+    label: "Off",
+    desc: "Do not append an expression directive.",
+    instruction: "",
   },
 ];
 
