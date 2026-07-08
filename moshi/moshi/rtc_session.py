@@ -460,7 +460,7 @@ class RTCSession:
         self._pc.addTrack(self._output_track)
 
         # Buffered queues. Match the existing 200 ms cap on inbound PCM
-        # so GPU stalls drop the newest chunk rather than ballooning.
+        # so GPU stalls shed stale mic audio rather than ballooning latency.
         self._pcm_queue: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=10)
         # Inbound audio is dropped silently until start_processing() runs.
         # Otherwise the warmup phase (~10 s for raw-audio voice prompts)
@@ -1084,11 +1084,16 @@ class RTCSession:
                 try:
                     self._pcm_queue.put_nowait(samples)
                 except asyncio.QueueFull:
+                    try:
+                        self._pcm_queue.get_nowait()
+                        self._pcm_queue.put_nowait(samples)
+                    except (asyncio.QueueEmpty, asyncio.QueueFull):
+                        pass
                     now = asyncio.get_event_loop().time()
                     if now - self._last_drop_warn_at >= 1.0:
                         self._log(
                             "warning",
-                            f"pcm queue full ({self._pcm_queue.qsize()}), dropping inbound audio",
+                            f"pcm queue full ({self._pcm_queue.qsize()}), dropping stale inbound audio",
                         )
                         self._last_drop_warn_at = now
         except asyncio.CancelledError:

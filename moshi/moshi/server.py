@@ -4397,6 +4397,7 @@ class ServerState:
                         "warning",
                         f"config-applied resume notify failed: {type(exc).__name__}: {exc}",
                     )
+            session.start_processing()
             session.send_ready(identity)
             # Tell the client whether the vision pipeline is reachable so
             # it can disable the Add Vision button (or warn the user) when
@@ -4498,7 +4499,6 @@ class ServerState:
                 self._session_tasks.add(_wd_t)
                 _wd_t.add_done_callback(self._session_tasks.discard)
 
-            session.start_processing()
             await session.wait_for_close()
 
         except asyncio.CancelledError:
