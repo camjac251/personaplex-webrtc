@@ -13,6 +13,7 @@ RunPod single-template deployment of NVIDIA PersonaPlex (a Moshi finetune) over 
 - `bunx biome check frontend/src` - lint the dashboard after JS edits.
 - `uv run python moshi/tests/test_rtc_resampler.py` - resampler smoke test.
 - `uv run python moshi/tests/test_session_config.py` - SessionConfig clamp tests.
+- `uv run python moshi/tests/test_vision_chunk.py` - vision chunk reassembly tests.
 
 ## Key files
 

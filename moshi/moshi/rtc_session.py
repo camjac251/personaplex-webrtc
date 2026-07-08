@@ -261,6 +261,102 @@ def clamp_inject_silence_streak(value) -> int:
     return min(INJECT_SILENCE_STREAK_MAX, max(INJECT_SILENCE_STREAK_MIN, int(out)))
 
 
+# Ceiling for one inbound vision frame, in base64 characters. Real frames
+# at /2 downscale + JPEG 0.55 are well under 100 KB; native + 0.8 detail
+# mode stays under ~400 KB. 600 KB headroom catches both without exposing
+# the server to a runaway client. Applies to single vision_frame messages
+# and to the combined size of a chunked frame.
+VISION_FRAME_MAX_CHARS = 600_000
+
+# Chunked vision-frame reassembly bounds. The control channel's SCTP
+# messages are capped at 64 KB, so the client splits larger frames into
+# ordered vision_frame_chunk parts keyed by frame_id. At most this many
+# half-built frames are held at once (the newest capture evicts the
+# oldest), each frame carries at most this many parts, and a partial
+# older than the stale window is dropped (its sender has moved on).
+VISION_CHUNK_MAX_PARTIALS = 4
+VISION_CHUNK_MAX_PARTS = 16
+VISION_CHUNK_STALE_SEC = 10.0
+
+
+def reassemble_vision_chunk(
+    partials: dict,
+    msg: dict,
+    now_mono: float,
+    log: Callable[[str, str], None],
+) -> Optional[dict]:
+    """Fold one vision_frame_chunk message into ``partials``.
+
+    ``partials`` maps frame_id to an accumulator dict and is mutated in
+    place; insertion order doubles as eviction order. Returns the completed
+    vision_frame message once every part of a frame has arrived, else None.
+    A malformed part drops the whole partial: its sender is confused, and a
+    half-trusted frame reaching Gemini is worse than a missed capture.
+    """
+    frame_id = str(msg.get("frame_id") or "")[:128]
+    data = msg.get("data", "")
+    try:
+        seq = int(msg.get("seq"))
+        total = int(msg.get("total"))
+    except (TypeError, ValueError):
+        log("warning", "vision_frame_chunk: bad seq/total; dropping")
+        partials.pop(frame_id, None)
+        return None
+    if (
+        not frame_id
+        or not isinstance(data, str)
+        or not data
+        or not 2 <= total <= VISION_CHUNK_MAX_PARTS
+        or not 0 <= seq < total
+    ):
+        log("warning", f"vision_frame_chunk: bad part {seq}/{total}; dropping")
+        partials.pop(frame_id, None)
+        return None
+    for stale_id in [
+        fid
+        for fid, part in partials.items()
+        if fid != frame_id and now_mono - part["started"] > VISION_CHUNK_STALE_SEC
+    ]:
+        partials.pop(stale_id, None)
+        log("warning", "vision_frame_chunk: dropped stale partial")
+    partial = partials.get(frame_id)
+    if partial is None:
+        while len(partials) >= VISION_CHUNK_MAX_PARTIALS:
+            partials.pop(next(iter(partials)), None)
+            log("warning", "vision_frame_chunk: partial evicted by newer frame")
+        partial = {
+            "parts": [None] * total,
+            "detail": bool(msg.get("detail", False)),
+            "chars": 0,
+            "started": now_mono,
+        }
+        partials[frame_id] = partial
+    if len(partial["parts"]) != total or partial["parts"][seq] is not None:
+        log("warning", "vision_frame_chunk: inconsistent sequence; dropping frame")
+        partials.pop(frame_id, None)
+        return None
+    partial["chars"] += len(data)
+    # Same combined ceiling as a single vision_frame message.
+    if partial["chars"] > VISION_FRAME_MAX_CHARS:
+        log(
+            "warning",
+            f"vision_frame_chunk: combined frame too large: "
+            f"{partial['chars']} chars; dropping",
+        )
+        partials.pop(frame_id, None)
+        return None
+    partial["parts"][seq] = data
+    if any(part is None for part in partial["parts"]):
+        return None
+    partials.pop(frame_id, None)
+    return {
+        "type": "vision_frame",
+        "frame_id": frame_id,
+        "data": "".join(partial["parts"]),
+        "detail": partial["detail"],
+    }
+
+
 @dataclass
 class SessionConfig:
     """Per-session settings the browser sends over the control channel.
