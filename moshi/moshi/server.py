@@ -875,6 +875,12 @@ class ServerState:
         self._reinforce_pending: deque[int] = deque()
         self._reinforce_inject_steps: int = 0
         self._last_reinforce_at: float = 0.0
+        # Last connect-time text prompt body accepted from the client. The
+        # model actually receives wrap_with_system_tags(_active_text_prompt)
+        # at warmup; keep both visible through config_applied so prompt
+        # debugging can compare the client payload with the server-applied
+        # token stream.
+        self._active_text_prompt: str = ""
         # Per-session system prompt for Gemini. Set in _run_rtc_session
         # from cfg.vision_prompt (or DEFAULT_VISION_SYSTEM_PROMPT if blank).
         self._vision_system_prompt: str = DEFAULT_VISION_SYSTEM_PROMPT
@@ -2412,6 +2418,38 @@ class ServerState:
         finally:
             self._vision_in_flight.discard(inflight_key)
 
+    def _applied_config_snapshot(self) -> dict:
+        """Return JSON-safe config values as actually applied server-side."""
+        text_prompt = self._active_text_prompt or ""
+        system_prompt = wrap_with_system_tags(text_prompt) if text_prompt else ""
+        vision_prompt = self._vision_system_prompt or DEFAULT_VISION_SYSTEM_PROMPT
+        return {
+            "text_prompt": text_prompt,
+            "system_prompt": system_prompt,
+            "text_prompt_chars": len(text_prompt),
+            "system_prompt_chars": len(system_prompt),
+            "text_prompt_tokens": len(self.lm_gen.text_prompt_tokens or []),
+            "reinforce_in_silences": bool(self._reinforce_enabled),
+            "reinforce_prompt_tokens": len(self._reinforce_prompt_tokens),
+            "vision_prompt": vision_prompt,
+            "vision_prompt_chars": len(vision_prompt),
+            "vision_in_transcript": bool(self._vision_in_transcript),
+            "vision_feed_model": bool(self._vision_feed_model),
+            "vision_ground_user_turns": bool(self._vision_ground_user_turns),
+            "text_temperature": float(self.lm_gen.temp_text),
+            "audio_temperature": float(self.lm_gen.temp),
+            "text_topk": int(self.lm_gen.top_k_text),
+            "audio_topk": int(self.lm_gen.top_k),
+            "repetition_penalty": float(self.lm_gen.repetition_penalty),
+            "repetition_penalty_context": int(
+                self.lm_gen.repetition_penalty_context
+            ),
+            "padding_bonus": float(self.lm_gen.padding_bonus),
+            "max_turn_text_tokens": int(self.lm_gen.max_turn_text_tokens),
+            "inject_silence_rms": float(self._inject_silence_rms),
+            "inject_silence_streak": int(self._inject_silence_streak),
+        }
+
     def _resolve_voice_prompt_path(self, voice_prompt_filename: str) -> tuple[Optional[str], Optional[str]]:
         """Resolve the on-disk path for a voice prompt name.
 
@@ -3123,9 +3161,14 @@ class ServerState:
                 # Empty list (not None) so _step_text_prompt_core iterates as a
                 # no-op when the user clears the textarea. Iterating None raises
                 # TypeError inside the executor and tears the session down.
+                self._active_text_prompt = cfg.text_prompt or ""
+                wrapped_text_prompt = (
+                    wrap_with_system_tags(self._active_text_prompt)
+                    if self._active_text_prompt else ""
+                )
                 self.lm_gen.text_prompt_tokens = (
-                    self.text_tokenizer.encode(wrap_with_system_tags(cfg.text_prompt))
-                    if cfg.text_prompt else []
+                    self.text_tokenizer.encode(wrapped_text_prompt)
+                    if wrapped_text_prompt else []
                 )
                 # Mid-stream reinforcement re-injects the persona WITHOUT
                 # <system> tags: the model is trained with <system> only at
@@ -3135,7 +3178,7 @@ class ServerState:
                 # leading-space + VISION_QUEUE_MAX slice convention as the
                 # proven vision path.
                 self._reinforce_enabled = bool(cfg.reinforce_in_silences)
-                bare_persona = _strip_system_tags(cfg.text_prompt)
+                bare_persona = _strip_system_tags(self._active_text_prompt)
                 self._reinforce_prompt_tokens = (
                     self.text_tokenizer.encode(f" {bare_persona}")[:VISION_QUEUE_MAX]
                     if (self._reinforce_enabled and bare_persona)
@@ -3251,6 +3294,16 @@ class ServerState:
                         cfg, "inject_silence_streak", INJECT_SILENCE_STREAK_DEFAULT
                     )
                 )
+                try:
+                    session.send_config_applied(
+                        self._applied_config_snapshot(),
+                        source="connect",
+                    )
+                except Exception as exc:
+                    clog.log(
+                        "warning",
+                        f"config-applied notify failed: {type(exc).__name__}: {exc}",
+                    )
 
             # Expose the session and id so vision-side coroutines can push
             # captions back to the client, and so the executor-side
@@ -3797,6 +3850,18 @@ class ServerState:
                         await loop.run_in_executor(None, _apply_live_config)
                     clog.log("info", f"update_config applied: {applied}")
                     try:
+                        session.send_config_applied(
+                            self._applied_config_snapshot(),
+                            source="update",
+                            applied=applied,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "config-applied notify failed: %s: %s",
+                            type(exc).__name__,
+                            exc,
+                        )
+                    try:
                         session.send_event(
                             "config_update",
                             "Live tuning applied",
@@ -4148,6 +4213,16 @@ class ServerState:
                 # this as a brand-new session. A fresh fallback simply
                 # omits the flag.
                 identity["resumed"] = True
+                try:
+                    session.send_config_applied(
+                        self._applied_config_snapshot(),
+                        source="resume",
+                    )
+                except Exception as exc:
+                    clog.log(
+                        "warning",
+                        f"config-applied resume notify failed: {type(exc).__name__}: {exc}",
+                    )
             session.send_ready(identity)
             # Tell the client whether the vision pipeline is reachable so
             # it can disable the Add Vision button (or warn the user) when

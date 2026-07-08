@@ -575,6 +575,34 @@
     color: var(--ink-2);
     overflow-wrap: anywhere;
   }
+  .prompt-preview-server {
+    margin: 0 9px 8px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-ctrl);
+    background: var(--surface);
+    padding: 6px 7px;
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    min-width: 0;
+  }
+  .prompt-preview-server .k {
+    flex: none;
+    font-family: 'Geist Mono', monospace;
+    font-size: 9px;
+    color: var(--ink-4);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .prompt-preview-server .v {
+    min-width: 0;
+    color: var(--ink-2);
+    font-family: 'Geist Mono', monospace;
+    font-size: 9.5px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .prompt-preview pre {
     margin: 0;
     max-height: 180px;

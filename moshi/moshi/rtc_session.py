@@ -772,6 +772,25 @@ class RTCSession:
                 payload["data"] = data
             self._control.send(json.dumps(payload))
 
+    def send_config_applied(
+        self,
+        config: dict,
+        source: str = "connect",
+        applied: Optional[list[str]] = None,
+    ) -> None:
+        """Push the server-applied session config snapshot to the client."""
+        if self._control and self._control.readyState == "open":
+            self._control.send(
+                json.dumps(
+                    {
+                        "type": "config_applied",
+                        "source": source,
+                        "applied": applied or [],
+                        "config": config,
+                    }
+                )
+            )
+
     def send_interrupted(self, reason: str) -> None:
         if self._control and self._control.readyState == "open":
             self._control.send(

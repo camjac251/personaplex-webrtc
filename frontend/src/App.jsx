@@ -142,6 +142,7 @@ function App() {
   // Optional server-side recording status. Stays null unless the server
   // emits a recording event, so the UI is unchanged when the feature is off.
   const [serverRecording, setServerRecording] = useState(null);
+  const [serverAppliedConfig, setServerAppliedConfig] = useState(null);
 
   const [presetId, setPresetId] = useState("teacher");
   const [sessionProfileId, setSessionProfileId] = useState("custom");
@@ -707,6 +708,24 @@ function App() {
       state: selectedExpression.instruction ? selectedExpression.label : "off",
     },
   ], [selectedAdherence, selectedExpression, textPrompt]);
+  const appliedConfig = serverAppliedConfig?.config && typeof serverAppliedConfig.config === "object"
+    ? serverAppliedConfig.config
+    : null;
+  const appliedSystemPrompt = typeof appliedConfig?.system_prompt === "string"
+    ? appliedConfig.system_prompt
+    : "";
+  const promptPreviewText = appliedSystemPrompt || resolvedTextPrompt || "No prompt configured.";
+  const promptPreviewChars = appliedSystemPrompt ? appliedSystemPrompt.length : resolvedTextPrompt.length;
+  const promptPreviewTitle = appliedSystemPrompt ? "Prompt applied by server" : "Final prompt sent";
+  const appliedPromptMeta = appliedConfig
+    ? [
+        Number.isFinite(appliedConfig.text_prompt_tokens)
+          ? `${appliedConfig.text_prompt_tokens} tokens`
+          : "",
+        serverAppliedConfig?.source || "",
+        serverAppliedConfig?.at || "",
+      ].filter(Boolean).join(" · ")
+    : "";
 
   const buildConfigPayload = useCallback(() => {
     const selectedVoice = uploadedVoiceFilename || (voice ? `${voice}.pt` : "");
@@ -1358,7 +1377,10 @@ function App() {
           prev?.url ? { ...prev, active: false, ready: true } : prev,
         );
       }
-      if (!keepPhase) setPhase(showDownload ? "ended" : "idle");
+      if (!keepPhase) {
+        setPhase(showDownload ? "ended" : "idle");
+        setServerAppliedConfig(null);
+      }
     },
     [stopRecording, stopVision, teardownTransport],
   );
@@ -1631,6 +1653,14 @@ function App() {
         addNotice(message.active ? "info" : "ok", message.active ? "Inject window opened, audio gated" : "Inject window closed", "inject");
       } else if (message.type === "interrupted") {
         pulseInterrupt();
+      } else if (message.type === "config_applied") {
+        const config = message.config && typeof message.config === "object" ? message.config : {};
+        setServerAppliedConfig({
+          source: typeof message.source === "string" ? message.source : "",
+          applied: Array.isArray(message.applied) ? message.applied : [],
+          config,
+          at: new Date().toTimeString().slice(0, 8),
+        });
       } else if (message.type === "event") {
         const text = message.text || message.kind || "Server event";
         if (message.kind === "recording") {
@@ -1809,6 +1839,7 @@ function App() {
             addNotice("info", "Control channel open, resuming session");
             return;
           }
+          setServerAppliedConfig(null);
           sentConfigRef.current = payload;
           setPhase("warmup");
           setStageMessage("Loading model and warming audio");
@@ -3161,9 +3192,9 @@ function App() {
               <details className="prompt-preview">
                 <summary>
                   <span className="prompt-preview-copy">
-                    <span className="prompt-preview-title">Final prompt sent</span>
+                    <span className="prompt-preview-title">{promptPreviewTitle}</span>
                     <span className="prompt-preview-sub mono">
-                      {resolvedTextPrompt.length} chars
+                      {promptPreviewChars} chars
                     </span>
                   </span>
                   <span className="prompt-preview-state mono">
@@ -3178,7 +3209,13 @@ function App() {
                     </div>
                   ))}
                 </div>
-                <pre>{resolvedTextPrompt || "No prompt configured."}</pre>
+                {appliedConfig && (
+                  <div className="prompt-preview-server">
+                    <span className="k">Server</span>
+                    <span className="v">{appliedPromptMeta || "applied"}</span>
+                  </div>
+                )}
+                <pre>{promptPreviewText}</pre>
               </details>
               <div className="opt-row">
                 <div className="opt-l">
