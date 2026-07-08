@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.7
+
 FROM runpod/base:1.0.7-cuda1281-ubuntu2404
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -29,11 +31,17 @@ RUN apt-get update --yes \
 
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_NO_MODIFY_PATH=1 sh
 
+COPY pyproject.toml uv.lock ./
+COPY moshi/pyproject.toml ./moshi/pyproject.toml
+
+RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    uv sync --frozen --no-dev --no-install-workspace --compile-bytecode
+
 COPY . .
 
-RUN uv sync --frozen --no-dev --compile-bytecode \
-    && chmod +x docker/runpod-start.sh docker/app-start.sh \
-    && uv cache clean
+RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    uv sync --frozen --no-dev --compile-bytecode \
+    && chmod +x docker/runpod-start.sh docker/app-start.sh
 
 EXPOSE 8888 8998
 
