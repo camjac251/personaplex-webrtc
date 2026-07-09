@@ -818,6 +818,14 @@ class ServerState:
         # stale by one tick is harmless for a slow readout. 0.0 means no
         # measurement yet (session not producing frames).
         self._rtf_ema: float = 0.0
+        self._rtf_last: float = 0.0
+        self._process_frame_ms_last: float = 0.0
+        self._process_frame_ms_ema: float = 0.0
+        self._lm_frame_ms_last: float = 0.0
+        self._lm_frame_ms_ema: float = 0.0
+        self._process_frame_count: int = 0
+        self._gpu_util_last: Optional[int] = None
+        self._vram_used_last: Optional[int] = None
         # Session gate: one RTC session at a time. asyncio.Lock so
         # negotiation and teardown can await without blocking the loop.
         self.lock = asyncio.Lock()
@@ -1037,6 +1045,31 @@ class ServerState:
         self.server_build: str = _resolve_server_build()
         self.mimi.streaming_forever(1)
         self.lm_gen.streaming_forever(1)
+
+    def _backpressure_status(self) -> str:
+        target_ms = self._frame_audio_sec * 1000.0
+        parts = [
+            f"target_ms={target_ms:.1f}",
+            f"frames={self._process_frame_count}",
+        ]
+        if self._rtf_last > 0.0:
+            parts.extend(
+                [
+                    f"rtf_last={self._rtf_last:.3f}",
+                    f"rtf_ema={self._rtf_ema:.3f}",
+                    f"process_ms_last={self._process_frame_ms_last:.1f}",
+                    f"process_ms_ema={self._process_frame_ms_ema:.1f}",
+                    f"lm_ms_last={self._lm_frame_ms_last:.1f}",
+                    f"lm_ms_ema={self._lm_frame_ms_ema:.1f}",
+                ]
+            )
+        else:
+            parts.append("rtf=unmeasured")
+        if self._gpu_util_last is not None:
+            parts.append(f"gpu_util={self._gpu_util_last}%")
+        if self._vram_used_last is not None:
+            parts.append(f"vram_gb={self._vram_used_last / (1024**3):.1f}")
+        return " ".join(parts)
     
     def warmup(self):
         # More warmup iterations for CUDA graphs to stabilize
@@ -1405,6 +1438,7 @@ class ServerState:
         the text channel and zero the outbound audio for that frame.
         Drip cadence is one token per outer call to match Mimi's 12.5 Hz.
         """
+        process_t0 = time.perf_counter()
         chunk = torch.from_numpy(chunk_np).to(device=self.device)[None, None]
         codes = self.mimi.encode(chunk)
         results = []
@@ -1453,11 +1487,11 @@ class ServerState:
                     "ASR feed failed: %s: %s", type(exc).__name__, exc
                 )
 
-        # Real-time-factor timing brackets the whole locked inference body
-        # (one outer frame's worth of step/decode work), not per inner step,
-        # so the elapsed numerator corresponds to the fixed frame-audio
-        # denominator. Two monotonic reads and a multiply-add; no GPU sync,
-        # no extra lock, touches no model state.
+        # LM timing brackets the locked model body (one outer frame's worth
+        # of step/decode work), not per inner step. The full process-frame
+        # RTF is recorded after finalize_user_turn so queue backpressure logs
+        # cover everything that blocks the RTC process loop.
+        lm_elapsed = 0.0
         with self._infer_lock:
             _rtf_t0 = time.perf_counter()
             prev_pad_streak = self._vision_pad_streak
@@ -1844,19 +1878,31 @@ class ServerState:
                     finalize_user_turn = True
                 self._asr_assistant_silent = now_silent
 
-            # --- real-time factor ------------------------------------
-            # Fold this frame's compute time into the smoothed estimate.
-            # Still inside the lock we already hold; the loop-side stat
-            # timer reads _rtf_ema and sends it at a slow cadence.
-            if self._frame_audio_sec > 0:
-                rtf_instant = (time.perf_counter() - _rtf_t0) / self._frame_audio_sec
-                if self._rtf_ema <= 0.0:
-                    self._rtf_ema = rtf_instant
-                else:
-                    self._rtf_ema += RTF_EMA_ALPHA * (rtf_instant - self._rtf_ema)
+            lm_elapsed = time.perf_counter() - _rtf_t0
 
         if finalize_user_turn:
             self._finalize_user_turn()
+        process_elapsed = time.perf_counter() - process_t0
+        if self._frame_audio_sec > 0:
+            rtf_instant = process_elapsed / self._frame_audio_sec
+            process_ms = process_elapsed * 1000.0
+            lm_ms = lm_elapsed * 1000.0
+            self._rtf_last = rtf_instant
+            self._process_frame_ms_last = process_ms
+            self._lm_frame_ms_last = lm_ms
+            self._process_frame_count += 1
+            if self._rtf_ema <= 0.0:
+                self._rtf_ema = rtf_instant
+                self._process_frame_ms_ema = process_ms
+                self._lm_frame_ms_ema = lm_ms
+            else:
+                self._rtf_ema += RTF_EMA_ALPHA * (rtf_instant - self._rtf_ema)
+                self._process_frame_ms_ema += RTF_EMA_ALPHA * (
+                    process_ms - self._process_frame_ms_ema
+                )
+                self._lm_frame_ms_ema += RTF_EMA_ALPHA * (
+                    lm_ms - self._lm_frame_ms_ema
+                )
         return results
 
     def _fresh_vision_context(self) -> tuple[str, float, str]:
@@ -3103,6 +3149,7 @@ class ServerState:
                 process_fn=self._process_audio_frame,
                 log=clog.log,
                 ice_servers=ice_servers,
+                backpressure_status=self._backpressure_status,
             )
             session.set_config_handler(on_config)
 
@@ -3406,10 +3453,17 @@ class ServerState:
                         # and let the first pad streak arm the window.
                         self._last_reinforce_at = time.monotonic()
                         self._transcript_recent.clear()
-                        # Drop the prior session's smoothed RTF and idle-RMS
-                        # so a fresh session does not start by reporting
-                        # stale readouts.
+                        # Drop the prior session's timing and idle-RMS so a
+                        # fresh session does not report stale readouts.
                         self._rtf_ema = 0.0
+                        self._rtf_last = 0.0
+                        self._process_frame_ms_last = 0.0
+                        self._process_frame_ms_ema = 0.0
+                        self._lm_frame_ms_last = 0.0
+                        self._lm_frame_ms_ema = 0.0
+                        self._process_frame_count = 0
+                        self._gpu_util_last = None
+                        self._vram_used_last = None
                         self._observed_idle_rms_ema = 0.0
                         self._latest_vision_caption = ""
                         self._latest_vision_at = 0.0
@@ -4221,6 +4275,8 @@ class ServerState:
                         vram_used, gpu_util = await loop.run_in_executor(
                             None, _sample_device_stats, self.device
                         )
+                        self._vram_used_last = vram_used
+                        self._gpu_util_last = gpu_util
                         if not session.is_alive():
                             break
                         rtf = self._rtf_ema if self._rtf_ema > 0.0 else None

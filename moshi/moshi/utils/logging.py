@@ -20,6 +20,7 @@
 # DEALINGS IN THE SOFTWARE.
 
 import logging
+import os
 import sys
 import random
 import string
@@ -51,12 +52,42 @@ def setup_logger(name: str, log_file=None, level=logging.INFO):
     return logger
 
 
-def print_log(level: str, msg: str, prefix: Optional[str] = None, info_color: Optional[str] = None):
-    colorized_msg = make_log(level, msg) if info_color is None or level != "info" else colorize(msg, info_color)
-    if prefix is None:
-        print(colorized_msg)
+def _truthy_env(value: Optional[str]) -> bool:
+    return value is not None and value.lower() not in ("", "0", "false", "no", "off")
+
+
+def _log_colors_enabled() -> bool:
+    explicit = os.environ.get("MOSHI_LOG_COLOR")
+    if explicit is not None:
+        return _truthy_env(explicit)
+    if "NO_COLOR" in os.environ:
+        return False
+    if _truthy_env(os.environ.get("FORCE_COLOR")):
+        return True
+    return sys.stdout.isatty()
+
+
+def _plain_log(level: str, msg: str) -> str:
+    if level == "warning":
+        prefix = "[Warn]"
+    elif level == "info":
+        prefix = "[Info]"
+    elif level == "error":
+        prefix = "[Err ]"
     else:
-        print(prefix + colorized_msg)
+        raise ValueError(f"Unknown level {level}")
+    return prefix + " " + msg
+
+
+def print_log(level: str, msg: str, prefix: Optional[str] = None, info_color: Optional[str] = None):
+    if _log_colors_enabled():
+        colorized_msg = make_log(level, msg) if info_color is None or level != "info" else colorize(msg, info_color)
+    else:
+        colorized_msg = _plain_log(level, msg)
+    if prefix is None:
+        print(colorized_msg, flush=True)
+    else:
+        print(prefix + colorized_msg, flush=True)
 
 
 class ColorizedLog(object):
@@ -71,5 +102,5 @@ class ColorizedLog(object):
     def randomize(cls):
         cid = random_id()
         color = random.choice(["91", "92", "93", "94", "95", "96", "97"])
-        prefix = colorize(f"[{cid}] ", color)
+        prefix = colorize(f"[{cid}] ", color) if _log_colors_enabled() else f"[{cid}] "
         return cls(prefix=prefix, info_color=color)

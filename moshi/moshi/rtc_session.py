@@ -53,6 +53,7 @@ DEFAULT_STUN_FALLBACK: tuple[dict, ...] = (
 
 ProcessFrameFn = Callable[[np.ndarray], list[tuple[np.ndarray, Optional[str]]]]
 LogFn = Callable[[str, str], None]
+BackpressureStatusFn = Callable[[], str]
 
 
 def ice_servers_to_aiortc(servers: list[dict]) -> list[RTCIceServer]:
@@ -438,6 +439,7 @@ class RTCSession:
         process_fn: ProcessFrameFn,
         log: LogFn,
         ice_servers: Optional[list[dict]] = None,
+        backpressure_status: Optional[BackpressureStatusFn] = None,
     ) -> None:
         """Create a peer-connection session.
 
@@ -449,6 +451,7 @@ class RTCSession:
         self._frame_size = frame_size
         self._process_fn = process_fn
         self._log = log
+        self._backpressure_status = backpressure_status
 
         configured = ice_servers if ice_servers else list(DEFAULT_STUN_FALLBACK)
         self._pc = RTCPeerConnection(
@@ -1091,9 +1094,25 @@ class RTCSession:
                         pass
                     now = asyncio.get_event_loop().time()
                     if now - self._last_drop_warn_at >= 1.0:
+                        diagnostics = ""
+                        if self._backpressure_status is not None:
+                            try:
+                                diagnostics = self._backpressure_status()
+                            except Exception as exc:
+                                diagnostics = (
+                                    f"diagnostics_error={type(exc).__name__}: {exc}"
+                                )
+                        diagnostics_suffix = (
+                            f"; {diagnostics}" if diagnostics else ""
+                        )
+                        incoming_ms = samples.size / MIMI_SAMPLE_RATE * 1000.0
                         self._log(
                             "warning",
-                            f"pcm queue full ({self._pcm_queue.qsize()}), dropping stale inbound audio",
+                            "pcm queue full "
+                            f"q={self._pcm_queue.qsize()}/{self._pcm_queue.maxsize} "
+                            f"incoming_ms={incoming_ms:.1f}, "
+                            "dropping stale inbound audio"
+                            f"{diagnostics_suffix}",
                         )
                         self._last_drop_warn_at = now
         except asyncio.CancelledError:
