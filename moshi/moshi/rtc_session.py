@@ -41,6 +41,11 @@ WEBRTC_SAMPLE_RATE = 48_000
 OUTBOUND_FRAME_MS = 20
 OUTBOUND_FRAME_SAMPLES = WEBRTC_SAMPLE_RATE * OUTBOUND_FRAME_MS // 1000  # 960
 OUTBOUND_BUFFER_CAP_SAMPLES = WEBRTC_SAMPLE_RATE * 2  # 2 seconds; sanity cap.
+# Backlog level at which recv() drains faster than real time. One Mimi
+# decode lump is 80 ms (3840 samples at 48 kHz) and the healthy buffer
+# sawtooths between zero and roughly one lump, so two lumps of queued
+# audio means a stall left standing latency behind.
+OUTBOUND_DRAIN_BACKLOG_SAMPLES = OUTBOUND_FRAME_SAMPLES * 8
 
 # STUN-only fallback used when no TURN credentials are configured. Works
 # only when both peers can reach each other directly over UDP, which is
@@ -189,10 +194,25 @@ class MimiOutputTrack(MediaStreamTrack):
         ) / WEBRTC_SAMPLE_RATE
         now = loop.time()
         if now - target >= frame_duration:
-            self._start_time = now - (self._timestamp / WEBRTC_SAMPLE_RATE)
-            target = now + frame_duration
+            self._start_time = now - (
+                (self._timestamp + OUTBOUND_FRAME_SAMPLES) / WEBRTC_SAMPLE_RATE
+            )
+            target = now
         delay = target - now
         if delay > 0:
+            # A rebase fixes the send schedule but strands already-decoded
+            # speech in the buffer: production and the schedule both advance
+            # at 1x, so that backlog persists as standing latency until the
+            # buffer cap silently drops the oldest (audible) samples. While
+            # the backlog exceeds a healthy producer lump, emit at 2x via
+            # half-frame sleeps and pull the schedule origin back by the
+            # time gained so the shed latency stays shed.
+            async with self._buffer_lock:
+                backlog = self._buffer.size
+            if backlog >= OUTBOUND_DRAIN_BACKLOG_SAMPLES:
+                capped = min(delay, frame_duration / 2)
+                self._start_time -= delay - capped
+                delay = capped
             await asyncio.sleep(delay)
 
         chunk = await self._pop_chunk()

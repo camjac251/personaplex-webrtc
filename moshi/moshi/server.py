@@ -2462,6 +2462,9 @@ class ServerState:
         self._clear_vision_pending()
         self._clear_reinforce_pending()
         self._active_context_meta = {}
+        # The restored LM state predates any injected caption, so the
+        # dedupe key must not keep treating that caption as delivered.
+        self._last_injected_vision_key = ""
         self._vision_pad_streak = 0
         self._audio_silence_streak = 0
         self._collapse_triggers.clear()
@@ -4706,6 +4709,14 @@ class ServerState:
                     def _reset_vision_source() -> None:
                         with self._infer_lock:
                             if session_id != self._active_session_id:
+                                return
+                            # Re-check under the lock: handlers run as
+                            # separate tasks and suspend before this executor
+                            # job, so a stale transition can arrive here after
+                            # a newer one already applied. Letting it through
+                            # would roll the generation backward and silently
+                            # drop every frame the client sends afterwards.
+                            if source_generation < self._vision_source_generation:
                                 return
                             self._vision_source_generation = source_generation
                             self._vision_source_active = (

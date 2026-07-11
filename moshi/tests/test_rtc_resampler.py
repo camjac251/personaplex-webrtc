@@ -175,6 +175,51 @@ def test_output_track_rebases_after_scheduler_stall() -> None:
     ), f"RTP timestamp spacing changed after pacing rebase: {pts}"
 
 
+def test_output_track_drains_backlog_after_stall() -> None:
+    """Audio stranded in the buffer by a stall must drain faster than 1x.
+
+    Production and pacing both advance at real time, so without a drain
+    path a stall's backlog becomes permanent added speech latency until
+    the buffer cap silently chops the oldest samples.
+    """
+    track = MimiOutputTrack()
+    # 480 ms of audio resamples to ~24 outbound frames: three times the
+    # drain threshold, as if a long stall queued a burst of decodes.
+    sine_24k = _sine_wave_f32(1000.0, 0.48, MIMI_SAMPLE_RATE)
+
+    async def run() -> tuple[float, list[int], int]:
+        await track.push_24k_f32(sine_24k)
+        started_at = time.perf_counter()
+        pts: list[int] = []
+        for _ in range(20):
+            frame = await track.recv()
+            assert frame.pts is not None
+            pts.append(frame.pts)
+        elapsed = time.perf_counter() - started_at
+        async with track._buffer_lock:
+            remaining = int(track._buffer.size)
+        return elapsed, pts, remaining
+
+    elapsed, pts, remaining = asyncio.run(run())
+    print(
+        f"  twenty frames with 480 ms backlog: {elapsed * 1000:.1f} ms, "
+        f"{remaining} samples still queued"
+    )
+    # Plain 1x pacing takes ~400 ms for 20 frames. Draining the above-
+    # threshold portion at 2x lands the run near 230 ms; a burst would
+    # finish in well under 100 ms.
+    assert elapsed <= 0.33, (
+        f"backlog did not drain faster than real time: {elapsed * 1000:.1f} ms"
+    )
+    assert elapsed >= 0.15, (
+        f"backlog drained as an unpaced burst: {elapsed * 1000:.1f} ms"
+    )
+    assert all(
+        later - earlier == OUTBOUND_FRAME_SAMPLES
+        for earlier, later in zip(pts, pts[1:])
+    ), f"RTP timestamp spacing changed during backlog drain: {pts}"
+
+
 if __name__ == "__main__":
     print("test_int_float_round_trip ...")
     test_int_float_round_trip()
@@ -187,5 +232,8 @@ if __name__ == "__main__":
     print("  ok")
     print("test_output_track_rebases_after_scheduler_stall ...")
     test_output_track_rebases_after_scheduler_stall()
+    print("  ok")
+    print("test_output_track_drains_backlog_after_stall ...")
+    test_output_track_drains_backlog_after_stall()
     print("  ok")
     print("all resampler tests passed")

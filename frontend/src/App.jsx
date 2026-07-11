@@ -150,7 +150,18 @@ function storedVisionReactionMode() {
   try {
     const groundTurns = localStorage.getItem("pp_visionGroundTurns") === "1";
     const feedModel = localStorage.getItem("pp_visionFeedModel") === "1";
-    return visionReactionModeFromFlags(feedModel, groundTurns);
+    // The two-toggle UI labelled its both-off state "manual" and kept the
+    // Use latest scene button enabled, so a stored both-off state means the
+    // on-demand workflow, not passive captions. Passive stays the fallback
+    // for fresh installs only.
+    const legacyPresent =
+      localStorage.getItem("pp_visionGroundTurns") !== null ||
+      localStorage.getItem("pp_visionFeedModel") !== null;
+    return visionReactionModeFromFlags(
+      feedModel,
+      groundTurns,
+      legacyPresent ? "manual" : "passive",
+    );
   } catch {
     return "passive";
   }
@@ -1118,11 +1129,17 @@ function App() {
     const configGroundTurns = typeof config.vision_ground_user_turns === "boolean"
       ? config.vision_ground_user_turns
       : !!profile?.vision?.ground_user_turns;
+    // A profile exported before reaction modes carries only the two booleans;
+    // its both-off state meant the on-demand "manual" workflow, not passive.
+    const legacyProfile =
+      typeof profile?.vision?.reaction_mode !== "string" &&
+      (typeof config.vision_feed_model === "boolean" ||
+        typeof profile?.vision?.feed_model === "boolean");
     setVisionReactionMode(
       visionReactionModeFromFlags(
         configFeedModel,
         configGroundTurns,
-        profile?.vision?.reaction_mode,
+        profile?.vision?.reaction_mode ?? (legacyProfile ? "manual" : "passive"),
       ),
     );
     setReinforceInSilences(!!config.reinforce_in_silences);
@@ -1967,8 +1984,15 @@ function App() {
         pulseInterrupt();
       } else if (message.type === "config_applied") {
         const config = message.config && typeof message.config === "object" ? message.config : {};
+        // Live updates echo the FULL config snapshot with the touched keys
+        // listed in `applied`. Reconciling untouched fields would clobber
+        // local slider state mid-drag (the commit-only Audio Top-k slider in
+        // particular), so only connect/resume snapshots sync everything.
+        const appliedFields = new Set(Array.isArray(message.applied) ? message.applied : []);
+        const fullSync = message.source !== "update";
         const reconcileInference = (field, key, setter) => {
           if (!Object.hasOwn(config, field)) return;
+          if (!fullSync && !appliedFields.has(field)) return;
           setter(clampInferenceValue(key, config[field], liveTuningRef.current[field]));
         };
         reconcileInference("text_temperature", "textTemp", setTextTemp);

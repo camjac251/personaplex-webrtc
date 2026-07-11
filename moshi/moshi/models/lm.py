@@ -59,6 +59,12 @@ AUDIO_TOKENS_PER_STREAM = 8
 FRAME_RATE_HZ = 12.5
 MAX_REPETITION_CONTEXT = 256
 SILENCE_TOKENS = np.array([948, 243, 1178, 546, 1736, 1030, 1978, 2008], dtype=np.int64)
+
+# Floor for the acoustic sampling temperature tensor. The depformer divides
+# logits by it inside a CUDA graph, where a Python zero-check cannot run; at
+# this floor the softmax collapses to a one-hot at the argmax, so temperature
+# 0 still means greedy decoding instead of NaN probabilities.
+MIN_AUDIO_TEMPERATURE = 1e-6
 SINE_TOKENS    = np.array([430, 1268, 381, 1611, 1095, 1495, 56, 472], dtype=np.int64)
 
 
@@ -739,7 +745,9 @@ class LMGen(StreamingModule[_LMGenState]):
         # Python constant because it changes the topk operator's output shape;
         # set_audio_sampling() resets that graph only when top-k changes.
         self._audio_temperature = torch.tensor(
-            float(temp), dtype=torch.float32, device=self.lm_model.device
+            max(float(temp), MIN_AUDIO_TEMPERATURE),
+            dtype=torch.float32,
+            device=self.lm_model.device,
         )
         self.check = check
         self.report_loss = report_loss
@@ -1233,7 +1241,7 @@ class LMGen(StreamingModule[_LMGenState]):
         top_k = int(top_k)
         top_k_changed = top_k != self.top_k
         self.temp = temperature
-        self._audio_temperature.fill_(temperature)
+        self._audio_temperature.fill_(max(temperature, MIN_AUDIO_TEMPERATURE))
         self.top_k = top_k
         state = self._streaming_state
         if top_k_changed and state is not None:
