@@ -592,7 +592,11 @@ class SessionConfig:
     repetition_penalty: float = 1.15
     repetition_penalty_context: int = 64
     # Keep these aligned with the embedded client's advanced slider defaults.
-    padding_bonus: float = 1.0
+    # Padding bonus defaults off: it taxes response onset every frame (PAD
+    # competes directly with EPAD at the moment the model would start
+    # speaking) and truncates turns mid-thought. The turn-scoped repetition
+    # penalty plus the max-turn cap carry the anti-collapse duty.
+    padding_bonus: float = 0.0
     max_turn_text_tokens: int = 120
     # Session length cap in seconds; 0 disables the watchdog (no time bound).
     # The client sends minutes converted to seconds, so the server stores and

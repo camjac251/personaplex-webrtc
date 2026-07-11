@@ -167,7 +167,7 @@ export const DEFAULTS = {
   audioTopk: 250,
   repPenalty: 1.15,
   repContext: 64,
-  padBonus: 1.0,
+  padBonus: 0,
   maxTurn: 120,
   injectSilenceRms: 0.01,
   injectSilenceStreak: 6,
@@ -366,7 +366,8 @@ export const PARAM_INFO = {
     body: (
       <>
         Adds a logit boost to the silence/PAD token so the model yields sooner.
-        Default is <b>1.0</b>. Larger values can cut replies short.
+        Default is <b>0</b> (off): the boost competes with the model starting
+        its reply, so it slows response onset and can cut replies short.
       </>
     ),
   },

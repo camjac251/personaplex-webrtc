@@ -58,6 +58,12 @@ logger = logging.getLogger(__name__)
 AUDIO_TOKENS_PER_STREAM = 8
 FRAME_RATE_HZ = 12.5
 MAX_REPETITION_CONTEXT = 256
+# Natural PAD/EPAD frames that mark a turn boundary for the repetition
+# ring (~1 s at 12.5 Hz). Words inside a turn are separated by only a few
+# pad frames; a run this long means the utterance ended. The ring clears
+# there so the penalty suppresses within-turn token loops without
+# penalizing the next turn's natural opening words.
+REPETITION_TURN_BREAK_FRAMES = 12
 SILENCE_TOKENS = np.array([948, 243, 1178, 546, 1736, 1030, 1978, 2008], dtype=np.int64)
 
 # Floor for the acoustic sampling temperature tensor. The depformer divides
@@ -595,12 +601,14 @@ class _LMGenState:
     graphed_depth: CUDAGraphed
     recent_text_tokens: torch.Tensor  # [B, MAX_REPETITION_CONTEXT], -1 = empty
     recent_text_offset: torch.Tensor  # [B], advances only on meaningful text
+    repetition_pad_streak: torch.Tensor  # [B], natural PAD/EPAD frames in a row
     offset: int = 0
 
     def reset(self):
         self.offset = 0
         self.recent_text_offset.zero_()
         self.recent_text_tokens.fill_(-1)
+        self.repetition_pad_streak.zero_()
         self.provided[:] = False
 
 
@@ -817,6 +825,9 @@ class LMGen(StreamingModule[_LMGenState]):
         recent_text_offset = torch.zeros(
             (batch_size,), device=lm_model.device, dtype=torch.long
         )
+        repetition_pad_streak = torch.zeros(
+            (batch_size,), device=lm_model.device, dtype=torch.long
+        )
 
         return _LMGenState(
             cache,
@@ -827,6 +838,7 @@ class LMGen(StreamingModule[_LMGenState]):
             graphed_depth,
             recent_text_tokens,
             recent_text_offset,
+            repetition_pad_streak,
         )
     
     @torch.no_grad()
@@ -1046,9 +1058,6 @@ class LMGen(StreamingModule[_LMGenState]):
                 turn_pad_forced = True
 
         # Update repetition penalty ring buffer with the chosen text token.
-        # Skip pad (0) and silence (3) so they do not crowd the context. Also,
-        # filtering 0 here is what makes the duplicate-index scatter in
-        # apply_repetition_penalty unambiguous (the sentinel for empty slots).
         # Exclude forced (externally-injected) tokens, mirroring the
         # max-turn streak guard above. Without this, injected caption/persona
         # words enter the ring buffer and the model is later penalized for
@@ -1058,15 +1067,7 @@ class LMGen(StreamingModule[_LMGenState]):
             and self.repetition_penalty_context > 0
             and not text_was_forced
         ):
-            ctx = self.repetition_penalty_context
-            keep_mask = (next_text_token != 0) & (next_text_token != 3)
-            slots = torch.remainder(state.recent_text_offset, ctx).unsqueeze(1)
-            existing = state.recent_text_tokens.gather(1, slots)
-            values = torch.where(
-                keep_mask.unsqueeze(1), next_text_token.unsqueeze(1), existing
-            )
-            state.recent_text_tokens.scatter_(1, slots, values)
-            state.recent_text_offset.add_(keep_mask.to(dtype=torch.long))
+            self._update_repetition_ring(next_text_token)
 
         if self.return_logits:
             sampled_audio_tokens, audio_logits = state.graphed_depth(next_text_token, transformer_out, target_[:,lm_model.audio_offset:,0], provided_[:,lm_model.audio_offset:,0], self._audio_temperature) # [B, K_audio, Card_audio]
@@ -1226,6 +1227,33 @@ class LMGen(StreamingModule[_LMGenState]):
 
     def _encode_sine_frame(self) -> torch.Tensor:
         return self._sine_codes
+
+    def _update_repetition_ring(self, next_text_token: torch.Tensor) -> None:
+        """Track recent meaningful text for the repetition penalty.
+
+        Skips PAD (3) and EPAD (0) so they never crowd the context; filtering
+        0 also keeps the duplicate-index scatter in apply_repetition_penalty
+        unambiguous (the sentinel for empty slots). The ring is turn-scoped:
+        a sustained run of natural PAD/EPAD frames marks a turn boundary and
+        clears it, so the penalty kills within-turn token loops without
+        penalizing the next turn's natural opening words. All tensor ops so
+        no per-step CUDA sync.
+        """
+        state = self._streaming_state
+        ctx = self.repetition_penalty_context
+        keep_mask = (next_text_token != 0) & (next_text_token != 3)
+        boundary = state.repetition_pad_streak >= REPETITION_TURN_BREAK_FRAMES
+        state.recent_text_tokens.masked_fill_(boundary.unsqueeze(1), -1)
+        state.recent_text_offset.masked_fill_(boundary, 0)
+        state.repetition_pad_streak.add_(1).clamp_(max=REPETITION_TURN_BREAK_FRAMES)
+        state.repetition_pad_streak.masked_fill_(keep_mask, 0)
+        slots = torch.remainder(state.recent_text_offset, ctx).unsqueeze(1)
+        existing = state.recent_text_tokens.gather(1, slots)
+        values = torch.where(
+            keep_mask.unsqueeze(1), next_text_token.unsqueeze(1), existing
+        )
+        state.recent_text_tokens.scatter_(1, slots, values)
+        state.recent_text_offset.add_(keep_mask.to(dtype=torch.long))
 
     def set_audio_sampling(self, temperature: float, top_k: int) -> bool:
         """Apply acoustic sampling controls and invalidate shape-bound graphs.

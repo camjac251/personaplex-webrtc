@@ -100,17 +100,31 @@ const DEFAULT_PERSONA_PRESET =
   PERSONA_PRESETS.find((preset) => preset.id === "assistant") || PERSONA_PRESETS[0];
 
 const PROMPT_DEFAULTS_VERSION = "2026-07-09-grounded-vision-contract";
-const TUNING_DEFAULTS_VERSION = "2026-07-10-stable-audio-sampling";
-const PREVIOUS_TUNING_DEFAULTS = {
-  textTemp: 0.7,
-  textTopk: 25,
-  audioTemp: 0.8,
-  audioTopk: 250,
-  repPenalty: 1.0,
-  repContext: 64,
-  padBonus: 0.0,
-  maxTurn: 120,
-};
+const TUNING_DEFAULTS_VERSION = "2026-07-11-turn-scoped-repetition";
+// Prior shipped default sets. Stored tuning that exactly matches one of
+// these follows the defaults forward; hand-tuned values are left alone.
+const PREVIOUS_TUNING_DEFAULTS = [
+  {
+    textTemp: 0.7,
+    textTopk: 25,
+    audioTemp: 0.8,
+    audioTopk: 250,
+    repPenalty: 1.0,
+    repContext: 64,
+    padBonus: 0.0,
+    maxTurn: 120,
+  },
+  {
+    textTemp: 0.7,
+    textTopk: 25,
+    audioTemp: 0.7,
+    audioTopk: 250,
+    repPenalty: 1.15,
+    repContext: 64,
+    padBonus: 1.0,
+    maxTurn: 120,
+  },
+];
 const REPLACED_DEFAULT_TEXT_PROMPTS = [
   "You enjoy talking with people. Speak as yourself: warm, perceptive, relaxed, and honest. Listen closely, say what you mean plainly, and keep turns short unless there is something worth unpacking.",
 ];
@@ -565,9 +579,8 @@ function App() {
     currentTuningValues,
     "safe",
   );
-  const previousTuningDefaultsActive = inferenceValuesMatch(
-    currentTuningValues,
-    PREVIOUS_TUNING_DEFAULTS,
+  const previousTuningDefaultsActive = PREVIOUS_TUNING_DEFAULTS.some(
+    (defaults) => inferenceValuesMatch(currentTuningValues, defaults),
   );
 
   const addNotice = useCallback((level, text, kind = "event", extra = {}) => {
@@ -2983,7 +2996,7 @@ function App() {
     if (tuningDefaultsVersion === TUNING_DEFAULTS_VERSION) return;
     if (tuningOutsideSafeRange || previousTuningDefaultsActive) {
       resetTuningDefaults(false);
-      addNotice("warn", "Stored tuning was reset after the audio sampler update");
+      addNotice("warn", "Stored tuning was reset to the current stable defaults");
     }
     setTuningDefaultsVersion(TUNING_DEFAULTS_VERSION);
   }, [
