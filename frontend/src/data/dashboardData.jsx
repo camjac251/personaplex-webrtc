@@ -8,7 +8,8 @@ export const PERSONA_PRESETS = [
   {
     id: "assistant",
     label: "Companion",
-    prompt: "You enjoy having a good conversation.",
+    prompt:
+      "You enjoy talking with people. Speak as yourself: warm, perceptive, relaxed, and honest. Listen closely, say what you mean plainly, and keep turns short unless there is something worth unpacking.",
   },
   {
     id: "medical",
@@ -237,11 +238,11 @@ export const SESSION_PROFILES = [
     voice: "VARF4",
     adherenceMode: "balanced",
     expressionMode: "expressive",
-    textTemp: 0.9,
-    textTopk: 64,
-    audioTemp: 1.05,
-    audioTopk: 420,
-    repPenalty: 1.08,
+    textTemp: 0.82,
+    textTopk: 40,
+    audioTemp: 0.9,
+    audioTopk: 320,
+    repPenalty: 1.12,
     repContext: 64,
     padBonus: 1.0,
     maxTurn: 120,

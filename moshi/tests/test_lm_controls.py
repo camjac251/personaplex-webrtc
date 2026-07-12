@@ -97,11 +97,42 @@ def test_repetition_ring_is_turn_scoped() -> None:
     assert state.recent_text_offset.item() == 1
 
 
+def test_forced_pads_do_not_break_the_turn() -> None:
+    lm_gen, state = _ring_lm_gen()
+
+    def step(token: int, *, forced: bool = False) -> None:
+        lm_gen._update_repetition_ring(
+            torch.tensor([token], dtype=torch.long), pad_was_forced=forced
+        )
+
+    for token in (11, 12, 13):
+        step(token)
+
+    # A max-turn cap trip forces a full turn-break's worth of PAD frames.
+    # Forced silence is not the model yielding: the streak stays frozen and
+    # the ring survives, so the repetition penalty still applies when the
+    # model resumes.
+    for _ in range(REPETITION_TURN_BREAK_FRAMES * 2):
+        step(3, forced=True)
+    step(14)
+    ring = state.recent_text_tokens[0].tolist()
+    assert {11, 12, 13, 14} <= set(ring), ring
+
+    # Natural pads after the forced window still accumulate to a boundary.
+    for _ in range(REPETITION_TURN_BREAK_FRAMES + 1):
+        step(3)
+    step(15)
+    ring = state.recent_text_tokens[0].tolist()
+    assert 15 in ring, ring
+    assert not ({11, 12, 13, 14} & set(ring)), ring
+
+
 if __name__ == "__main__":
     tests = [
         test_temperature_updates_graph_input_without_reset,
         test_top_k_invalidates_only_depformer_graph,
         test_repetition_ring_is_turn_scoped,
+        test_forced_pads_do_not_break_the_turn,
     ]
     for test in tests:
         print(f"{test.__name__} ...")

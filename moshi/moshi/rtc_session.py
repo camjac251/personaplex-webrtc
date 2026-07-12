@@ -18,6 +18,7 @@ import asyncio
 import fractions
 import json
 import math
+from collections import deque
 from dataclasses import dataclass
 from typing import AsyncIterator, Awaitable, Callable, Optional
 
@@ -46,6 +47,14 @@ OUTBOUND_BUFFER_CAP_SAMPLES = WEBRTC_SAMPLE_RATE * 2  # 2 seconds; sanity cap.
 # sawtooths between zero and roughly one lump, so two lumps of queued
 # audio means a stall left standing latency behind.
 OUTBOUND_DRAIN_BACKLOG_SAMPLES = OUTBOUND_FRAME_SAMPLES * 8
+# A stall can also leave a sub-threshold backlog (1-7 frames) that the level
+# gate above never sees: production and consumption both advance at 1x, so
+# the residue persists as permanent reply latency. The floor of the backlog
+# over a window of recv() calls measures that standing latency directly --
+# the healthy sawtooth touches zero every production period, so a floor of
+# a frame or more means a stall left residue behind. 25 calls ~= 500 ms
+# spans several 80 ms production lumps plus jitter.
+OUTBOUND_STANDING_BACKLOG_WINDOW = 25
 
 # STUN-only fallback used when no TURN credentials are configured. Works
 # only when both peers can reach each other directly over UDP, which is
@@ -131,6 +140,11 @@ class MimiOutputTrack(MediaStreamTrack):
         self._buffer_lock = asyncio.Lock()
         self._timestamp = 0
         self._start_time: Optional[float] = None
+        # Rolling backlog readings, one per recv(); the window minimum is
+        # the standing latency the drain logic in recv() sheds.
+        self._backlog_window: deque[int] = deque(
+            maxlen=OUTBOUND_STANDING_BACKLOG_WINDOW
+        )
         # Persistent resampler so its internal anti-alias filter state
         # carries between chunks. Recreating per-call breaks continuity.
         self._resampler = AudioResampler(
@@ -168,6 +182,9 @@ class MimiOutputTrack(MediaStreamTrack):
         """Drop queued assistant audio immediately."""
         async with self._buffer_lock:
             self._buffer = np.empty(0, dtype=np.float32)
+            # Pre-flush readings would keep the standing-backlog floor high
+            # for another window; the flush already shed that latency.
+            self._backlog_window.clear()
             self._resampler = AudioResampler(
                 format="s16", layout="mono", rate=WEBRTC_SAMPLE_RATE
             )
@@ -203,13 +220,24 @@ class MimiOutputTrack(MediaStreamTrack):
             # A rebase fixes the send schedule but strands already-decoded
             # speech in the buffer: production and the schedule both advance
             # at 1x, so that backlog persists as standing latency until the
-            # buffer cap silently drops the oldest (audible) samples. While
-            # the backlog exceeds a healthy producer lump, emit at 2x via
-            # half-frame sleeps and pull the schedule origin back by the
-            # time gained so the shed latency stays shed.
+            # buffer cap silently drops the oldest (audible) samples. Two
+            # signals identify shed-able backlog: an outright level above a
+            # healthy producer lump (fast path, large stalls), and a rolling
+            # backlog floor that stays off zero (sub-threshold residue the
+            # level gate never sees -- a healthy sawtooth touches zero every
+            # production period). Either way, emit at 2x via half-frame
+            # sleeps and pull the schedule origin back by the time gained so
+            # the shed latency stays shed.
             async with self._buffer_lock:
                 backlog = self._buffer.size
-            if backlog >= OUTBOUND_DRAIN_BACKLOG_SAMPLES:
+            self._backlog_window.append(backlog)
+            standing = (
+                len(self._backlog_window) == self._backlog_window.maxlen
+                and min(self._backlog_window) >= OUTBOUND_FRAME_SAMPLES
+            )
+            if backlog >= OUTBOUND_DRAIN_BACKLOG_SAMPLES or (
+                standing and backlog >= OUTBOUND_FRAME_SAMPLES * 2
+            ):
                 capped = min(delay, frame_duration / 2)
                 self._start_time -= delay - capped
                 delay = capped

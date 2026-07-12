@@ -79,11 +79,15 @@ def test_clipping_preserves_complete_untruncated_text() -> None:
 
 def test_fit_context_keeps_complete_words_within_token_window() -> None:
     state = _bare_state()
-    caption = " ".join(f"word{i}" for i in range(VISION_QUEUE_MAX + 4))
-    context, tokens = state._fit_vision_context(caption)
-    assert len(tokens) == VISION_QUEUE_MAX
+    words = [f"word{i}" for i in range(VISION_QUEUE_MAX + 4)]
+    context, tokens = state._fit_vision_context(" ".join(words))
+    # Whichever budget binds first (chars or tokens), the fit must stay
+    # inside the token window and emit only complete leading words.
+    assert 0 < len(tokens) <= VISION_QUEUE_MAX
     assert context.endswith(".")
-    assert context.split()[-1] == f"word{VISION_QUEUE_MAX - 1}."
+    emitted = context.rstrip(".").split()
+    assert emitted == words[: len(emitted)]
+    assert len(emitted) < len(words)
 
 
 def test_waiting_packet_never_splices_active_packet() -> None:

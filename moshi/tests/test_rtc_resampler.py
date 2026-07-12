@@ -19,6 +19,7 @@ sys.path.insert(0, "moshi")
 
 from moshi.rtc_session import (  # noqa: E402
     MIMI_SAMPLE_RATE,
+    OUTBOUND_DRAIN_BACKLOG_SAMPLES,
     OUTBOUND_FRAME_SAMPLES,
     WEBRTC_SAMPLE_RATE,
     MimiOutputTrack,
@@ -220,6 +221,72 @@ def test_output_track_drains_backlog_after_stall() -> None:
     ), f"RTP timestamp spacing changed during backlog drain: {pts}"
 
 
+def test_output_track_sheds_standing_subthreshold_backlog() -> None:
+    """Residue below the level gate must still drain via the backlog floor.
+
+    A stall can leave 1-7 frames of standing latency: production and
+    consumption both advance at 1x afterwards, so the residue never grows
+    past the 8-frame drain gate and never shrinks on its own. The rolling
+    backlog floor identifies it and recv() sheds it.
+    """
+    track = MimiOutputTrack()
+    # 60 ms residue: three outbound frames. Small enough that even the
+    # sawtooth peak (residue + one fresh lump) stays below the 8-frame
+    # level gate, so only the backlog-floor path can shed it.
+    residue_24k = _sine_wave_f32(1000.0, 0.06, MIMI_SAMPLE_RATE)
+    # One healthy 80 ms producer lump.
+    lump_24k = _sine_wave_f32(1000.0, 0.08, MIMI_SAMPLE_RATE)
+
+    async def run() -> list[int]:
+        loop = asyncio.get_event_loop()
+        await track.push_24k_f32(residue_24k)
+
+        async def producer() -> None:
+            # Absolute schedule so sleep drift cannot starve the consumer
+            # and fake a zero floor. The first lump lands immediately so the
+            # residue is standing latency from the start, not warm-up food.
+            started_at = loop.time()
+            for i in range(200):
+                await asyncio.sleep(max(0.0, started_at + i * 0.08 - loop.time()))
+                await track.push_24k_f32(lump_24k)
+
+        feed = asyncio.ensure_future(producer())
+        backlogs: list[int] = []
+        try:
+            for _ in range(80):
+                await track.recv()
+                async with track._buffer_lock:
+                    backlogs.append(int(track._buffer.size))
+        finally:
+            feed.cancel()
+            try:
+                await feed
+            except asyncio.CancelledError:
+                pass
+        return backlogs
+
+    backlogs = asyncio.run(run())
+    early_floor = min(backlogs[5:25])
+    early_peak = max(backlogs[:25])
+    final_floor = min(backlogs[-25:])
+    print(
+        f"  standing 60 ms residue: early floor {early_floor}, "
+        f"early peak {early_peak}, final floor {final_floor} samples"
+    )
+    assert early_floor >= OUTBOUND_FRAME_SAMPLES, (
+        "test setup failed to create a standing backlog: "
+        f"early floor {early_floor}"
+    )
+    assert early_peak < OUTBOUND_DRAIN_BACKLOG_SAMPLES, (
+        "residue reached the level gate; this test must exercise the "
+        f"backlog-floor path: early peak {early_peak}"
+    )
+    assert final_floor < OUTBOUND_FRAME_SAMPLES, (
+        "standing sub-threshold backlog was never shed: "
+        f"final floor {final_floor} samples"
+    )
+
+
 if __name__ == "__main__":
     print("test_int_float_round_trip ...")
     test_int_float_round_trip()
@@ -235,5 +302,8 @@ if __name__ == "__main__":
     print("  ok")
     print("test_output_track_drains_backlog_after_stall ...")
     test_output_track_drains_backlog_after_stall()
+    print("  ok")
+    print("test_output_track_sheds_standing_subthreshold_backlog ...")
+    test_output_track_sheds_standing_subthreshold_backlog()
     print("  ok")
     print("all resampler tests passed")

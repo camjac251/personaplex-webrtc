@@ -164,7 +164,18 @@ def _restore_streaming_state_from_keys(streaming_state: State,
                         restored_value.detach().clone().to(device),
                     )
             elif isinstance(restored_value, (int, float, str, bool)):
-                setattr(streaming_state, key, restored_value)
+                if isinstance(existing_value, torch.Tensor) and isinstance(
+                    restored_value, (int, float, bool)
+                ):
+                    # A numeric scalar for a tensor field is an older state
+                    # layout (e.g. pre-tensor recent_text_offset sidecars).
+                    # Writing into the live tensor preserves the storage that
+                    # CUDA graphs and later restores rely on; setattr would
+                    # replace it with a Python scalar and poison every
+                    # subsequent session.
+                    existing_value.fill_(restored_value)
+                else:
+                    setattr(streaming_state, key, restored_value)
             else:
                 raise TypeError(
                     f"Unsupported restored value {type(restored_value)} for {full_key}."

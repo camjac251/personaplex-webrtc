@@ -255,9 +255,14 @@ def _sanitize_vision_text(text: str) -> str:
         count=1,
         flags=re.IGNORECASE,
     )
-    sentence = re.match(r"^(.+?[.!?])(?:\s|$)", cleaned)
-    if sentence is not None:
-        cleaned = sentence.group(1)
+    # Keep the leading sentence, but only cut at a terminator once enough
+    # text has accumulated to be a plausible sentence: a bare first-match
+    # cut turns "Dr. Smith holds a mug." into "Dr." whenever the caption
+    # opens with an abbreviation or initial.
+    for match in re.finditer(r"[.!?](?:\s|$)", cleaned):
+        if match.start() + 1 >= VISION_SENTENCE_MIN_CHARS:
+            cleaned = cleaned[: match.start() + 1]
+            break
     if len(cleaned) <= VISION_TEXT_MAX_CHARS:
         return cleaned
     trimmed = cleaned[:VISION_TEXT_MAX_CHARS].rsplit(" ", 1)[0]
@@ -338,12 +343,18 @@ DETAIL_VISION_SYSTEM_PROMPT = (
 # Maximum Gemini caption length shown to the client and injected into Moshi.
 VISION_TEXT_MAX_CHARS = 240
 VISION_DETAIL_TEXT_MAX_CHARS = 1000
+# A sentence terminator earlier than this is an abbreviation or initial
+# ("Dr.", "No. 5"), not the end of the caption's first sentence.
+VISION_SENTENCE_MIN_CHARS = 30
 
 # Vision-context tokens are pushed into a waiting packet and drained
 # one per audio frame (Mimi runs at ~12.5 Hz) only while the model is
 # in a pad streak. Cap the queue so a steady Gemini stream cannot let
-# context lag arbitrarily far behind reality.
-VISION_QUEUE_MAX = 16
+# context lag arbitrarily far behind reality. 32 tokens is ~2.6 s of
+# drip at 12.5 Hz: enough for a full scene note (16 truncated most
+# captions mid-thought) while staying well under the ~5 s windows that
+# made injects audible as dead air.
+VISION_QUEUE_MAX = 32
 
 # Context packets share a single Moshi text-token drip queue. Higher
 # priority sources can replace lower priority packets while they wait for
@@ -502,8 +513,10 @@ ASR_SILENCE_RMS = 0.005
 # One-shot visual grounding. Passive captions update this state; manual or
 # opt-in user-turn grounding can then feed one compact packet into Moshi. Keep
 # the freshness short so "this/that" does not bind to stale camera state.
+# The char budget tracks VISION_QUEUE_MAX (~32 tokens fit ~180 chars); a
+# tighter budget wastes inject tokens the sanitizer already paid for.
 VISION_CONTEXT_MAX_AGE_SEC = 20.0
-VISION_CONTEXT_MAX_CHARS = 120
+VISION_CONTEXT_MAX_CHARS = 180
 # Separate from ASR_SILENCE_RMS on purpose: visual grounding is a behavioral
 # gate, not a transcription quality gate. A slightly higher speech floor and
 # longer release hold avoid queueing visual context on short pauses, breath
@@ -771,7 +784,21 @@ class _AsrEngine:
         with self._lock:
             self._buffer.append(np.asarray(chunk, dtype=np.float32).reshape(-1).copy())
             self._buffered_samples += int(chunk.size)
-            return self._buffered_samples >= self._max_samples
+            full = self._buffered_samples >= self._max_samples
+            # The caller only finalizes (and thereby drains) once user
+            # speech has latched. A feed that never crosses the speech RMS
+            # floor -- muted mic, comfort noise -- would otherwise grow this
+            # buffer for the life of the session (~96 KB/s at 24 kHz f32).
+            # Keep the newest turn's worth; a turn that latches later only
+            # needs recent audio anyway.
+            while (
+                len(self._buffer) > 1
+                and self._buffered_samples - self._buffer[0].size
+                >= self._max_samples
+            ):
+                dropped = self._buffer.pop(0)
+                self._buffered_samples -= int(dropped.size)
+            return full
 
     def _drain(self) -> Optional[np.ndarray]:
         """Pop and concatenate the buffered turn audio under the lock."""
@@ -874,7 +901,7 @@ class ServerState:
                  recordings_dir: str | None = None,
                  preview_cache_dir: str | None = None,
                  asr: "Optional[_AsrEngine]" = None,
-                 periodic_snapshots: bool = False,
+                 periodic_snapshots: bool = True,
                  save_voice_prompt_embeddings: bool = False):
         self.mimi = mimi
         self.lm_gen = lm_gen
@@ -1761,6 +1788,12 @@ class ServerState:
                         inject_token = self._reinforce_pending.popleft()
                         self._reinforce_inject_steps += 1
                         inject_meta = dict(self._reinforce_pending_meta)
+                        if not self._reinforce_pending:
+                            # Fully drained: close the window now. Leaving
+                            # the step count armed keeps the inject state
+                            # (and the client's "Injecting context" status)
+                            # open until the next window replaces it.
+                            self._reinforce_inject_steps = 0
                     else:
                         # Window interrupted (streak broke or cap hit):
                         # abandon the remainder and re-arm on the next
@@ -2856,10 +2889,13 @@ class ServerState:
                         parsed_output = json.loads(raw_output)
                     except (TypeError, json.JSONDecodeError):
                         parsed_output = None
-                    if (
-                        not isinstance(parsed_output, dict)
-                        or set(parsed_output) != {"caption"}
-                        or not isinstance(parsed_output.get("caption"), str)
+                    # Require a string caption but tolerate extra keys: the
+                    # response schema requests exactly {"caption"}, yet a
+                    # provider-side schema drift that adds a field would
+                    # otherwise hit the failure counter three times and
+                    # permanently auto-disable vision mid-session.
+                    if not isinstance(parsed_output, dict) or not isinstance(
+                        parsed_output.get("caption"), str
                     ):
                         text = ""
                     elif detail:
@@ -3117,7 +3153,11 @@ class ServerState:
     def _vision_context_key(meta: Optional[dict]) -> str:
         if not meta:
             return ""
-        caption = str(meta.get("caption") or meta.get("text") or "")
+        # Key on the fitted inject text ("text"), not the display caption:
+        # the ambient path stores the unfitted caption while the grounding
+        # path stores the fitted one, so keying on "caption" lets the same
+        # scene slip past the duplicate guard when it crosses paths.
+        caption = str(meta.get("text") or meta.get("caption") or "")
         return " ".join(caption.lower().split()).rstrip(".!?")
 
     def _queue_waiting_vision_context(
@@ -4694,7 +4734,16 @@ class ServerState:
                         )
                     except (TypeError, ValueError, OverflowError):
                         return
-                    if source_generation < self._vision_source_generation:
+                    # The client reuses one generation for a start and the
+                    # stop that ends it, so stops may re-apply at an equal
+                    # generation but a start must be strictly newer: letting
+                    # an equal-generation start through would replay a stale
+                    # started after the stopped that shares its generation
+                    # and leave the source marked live with the camera off.
+                    if source_generation < self._vision_source_generation or (
+                        source_generation == self._vision_source_generation
+                        and mtype == "vision_source_started"
+                    ):
                         return
                     pending_tasks = list(
                         self._vision_live_tasks.get(session_id, set())
@@ -4862,9 +4911,10 @@ class ServerState:
                 try:
                     await warmup_done.wait()
                     while session.is_alive():
-                        # Full-state copies hold the inference lock and can
-                        # interrupt realtime audio. This task exists only
-                        # when the operator explicitly enables it.
+                        # Full-state copies hold the inference lock briefly
+                        # (~3 ms measured for the 1.6 GB LM+Mimi clone on a
+                        # Blackwell-class GPU). Operators on much slower
+                        # hardware can opt out with --no-periodic-snapshots.
                         await asyncio.sleep(60.0)
                         if not session.is_alive():
                             break
@@ -5026,7 +5076,20 @@ class ServerState:
                 warmup_done.set()
             # The model state is primed from here on: an unexpected
             # transport death past this point is worth a resume grant.
+            # Bind the session-time budget in the same breath: the early
+            # return below otherwise leaves effective_timeout_sec at 0, and
+            # a grant recorded on that path carries timeout_remaining_sec=0,
+            # which redemption reads as "unbounded" rather than the
+            # configured cap.
             went_live = True
+            timeout_sec = (
+                int(resume_state["timeout_remaining_sec"])
+                if resuming
+                else cfg.session_timeout_sec
+            )
+            effective_timeout_sec = timeout_sec
+            if timeout_sec > 0:
+                session_started_at = time.monotonic()
 
             if not session.is_alive():
                 clog.log("info", "client disconnected during warmup")
@@ -5153,19 +5216,14 @@ class ServerState:
                 )
             # Bound how long the live session may run so a quiet or
             # stalled client can't hold the single-session lock until the
-            # process restarts. The timer starts now (post-warmup), so it
-            # measures conversation time, not connect/warmup time. A limit
-            # of 0 leaves the session unbounded. A resumed session runs on
-            # the previous leg's remaining budget so a transport blip
-            # cannot extend the cap.
-            timeout_sec = (
-                int(resume_state["timeout_remaining_sec"])
-                if resuming
-                else cfg.session_timeout_sec
-            )
-            effective_timeout_sec = timeout_sec
+            # process restarts. The budget (timeout_sec, session_started_at)
+            # was bound at went_live above so a pre-watchdog transport death
+            # still records it in the resume grant; the timer measures
+            # conversation time, not connect/warmup time. A limit of 0
+            # leaves the session unbounded. A resumed session runs on the
+            # previous leg's remaining budget so a transport blip cannot
+            # extend the cap.
             if timeout_sec > 0:
-                session_started_at = time.monotonic()
 
                 async def watchdog_task():
                     """End the session once it has run for timeout_sec.
@@ -5516,11 +5574,13 @@ def main():
     parser.add_argument(
         "--periodic-snapshots",
         action=argparse.BooleanOptionalAction,
-        default=_environment_flag("PERSONAPLEX_PERIODIC_SNAPSHOTS", False),
+        default=_environment_flag("PERSONAPLEX_PERIODIC_SNAPSHOTS", True),
         help=(
-            "Clone live model state once per minute for automatic rewind. "
-            "Disabled by default because full GPU-state copies can interrupt "
-            "realtime inference. Explicit baseline rewind and bookmarks remain."
+            "Clone live model state once per minute so auto-rewind and manual "
+            "Rewind restore a recent state instead of the session-start "
+            "baseline. A full capture (LM + Mimi + RNG, ~1.6 GB) measures "
+            "~3 ms on a modern GPU, well inside one 80 ms frame budget. "
+            "--no-periodic-snapshots restores the capture-free behavior."
         ),
     )
     parser.add_argument("--gradio-tunnel", action='store_true', help='Activate a gradio tunnel.')

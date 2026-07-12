@@ -1067,7 +1067,9 @@ class LMGen(StreamingModule[_LMGenState]):
             and self.repetition_penalty_context > 0
             and not text_was_forced
         ):
-            self._update_repetition_ring(next_text_token)
+            self._update_repetition_ring(
+                next_text_token, pad_was_forced=turn_pad_forced
+            )
 
         if self.return_logits:
             sampled_audio_tokens, audio_logits = state.graphed_depth(next_text_token, transformer_out, target_[:,lm_model.audio_offset:,0], provided_[:,lm_model.audio_offset:,0], self._audio_temperature) # [B, K_audio, Card_audio]
@@ -1170,6 +1172,7 @@ class LMGen(StreamingModule[_LMGenState]):
         if exists(state_path) and exists(meta_path):
             logger.info("loading full streaming state from %s", state_path)
             full_state = load_streaming_state(state_path, meta_path, device=self.lm_model.device)
+            self._migrate_legacy_full_state(full_state)
             # Stash the dict; _step_voice_prompt_core applies it during
             # priming, after the callers' reset_streaming().
             self.voice_prompt_full_state = full_state
@@ -1190,6 +1193,33 @@ class LMGen(StreamingModule[_LMGenState]):
         self.voice_prompt_cache = data["cache"].to(self.lm_model.device)
         self.voice_prompt_full_state = None
         self.voice_prompt = path
+
+    def _migrate_legacy_full_state(self, state: dict) -> None:
+        """Upgrade a pre-tensor-ring voice sidecar layout in place.
+
+        Sidecars written before the turn-scoped repetition ring store
+        recent_text_offset as a plain int and carry no repetition_pad_streak
+        key. Restoring that layout unmigrated replaces the live offset
+        tensor with an int and then fails on the missing key, corrupting
+        the process-global streaming state for every later session.
+        """
+        device = self.lm_model.device
+        for key in list(state.keys()):
+            prefix, _, leaf = key.rpartition(".")
+            if leaf != "recent_text_offset":
+                continue
+            value = state[key]
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int):
+                state[key] = torch.full(
+                    (1,), value, dtype=torch.long, device=device
+                )
+            sibling = f"{prefix}.repetition_pad_streak"
+            if sibling not in state:
+                state[sibling] = torch.zeros(
+                    (1,), dtype=torch.long, device=device
+                )
 
     def _load_voice_prompt_embedding_sequence(self, path: str) -> torch.Tensor:
         """Load a voice's stacked per-frame embeddings from a legacy .pt file.
@@ -1228,7 +1258,9 @@ class LMGen(StreamingModule[_LMGenState]):
     def _encode_sine_frame(self) -> torch.Tensor:
         return self._sine_codes
 
-    def _update_repetition_ring(self, next_text_token: torch.Tensor) -> None:
+    def _update_repetition_ring(
+        self, next_text_token: torch.Tensor, *, pad_was_forced: bool = False
+    ) -> None:
         """Track recent meaningful text for the repetition penalty.
 
         Skips PAD (3) and EPAD (0) so they never crowd the context; filtering
@@ -1236,8 +1268,11 @@ class LMGen(StreamingModule[_LMGenState]):
         unambiguous (the sentinel for empty slots). The ring is turn-scoped:
         a sustained run of natural PAD/EPAD frames marks a turn boundary and
         clears it, so the penalty kills within-turn token loops without
-        penalizing the next turn's natural opening words. All tensor ops so
-        no per-step CUDA sync.
+        penalizing the next turn's natural opening words. Max-turn-cap forced
+        PADs are not the model yielding — counting them would wipe the ring
+        right after every cap trip, forgiving the exact repetition that
+        tripped it — so they freeze the streak instead of advancing it. All
+        tensor ops so no per-step CUDA sync.
         """
         state = self._streaming_state
         ctx = self.repetition_penalty_context
@@ -1245,7 +1280,10 @@ class LMGen(StreamingModule[_LMGenState]):
         boundary = state.repetition_pad_streak >= REPETITION_TURN_BREAK_FRAMES
         state.recent_text_tokens.masked_fill_(boundary.unsqueeze(1), -1)
         state.recent_text_offset.masked_fill_(boundary, 0)
-        state.repetition_pad_streak.add_(1).clamp_(max=REPETITION_TURN_BREAK_FRAMES)
+        if not pad_was_forced:
+            state.repetition_pad_streak.add_(1).clamp_(
+                max=REPETITION_TURN_BREAK_FRAMES
+            )
         state.repetition_pad_streak.masked_fill_(keep_mask, 0)
         slots = torch.remainder(state.recent_text_offset, ctx).unsqueeze(1)
         existing = state.recent_text_tokens.gather(1, slots)
