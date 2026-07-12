@@ -85,6 +85,12 @@ console requires a value, use:
 | `TURN_KEY_ID` | `{{ RUNPOD_SECRET_TURN_KEY_ID }}` |
 | `TURN_KEY_API_TOKEN` | `{{ RUNPOD_SECRET_TURN_KEY_API_TOKEN }}` |
 | `GEMINI_API_KEY` | `{{ RUNPOD_SECRET_GEMINI_API_KEY }}` (optional) |
+| `PERSONAPLEX_HF_REVISION` | Override the pinned tested model revision (optional) |
+
+The image launcher pins the PersonaPlex Hugging Face snapshot used by this
+build, so restarting an unchanged image cannot silently pick up different
+weights or voice assets. Set `PERSONAPLEX_HF_REVISION=main` only when
+deliberately testing new upstream assets.
 
 Use **Stop** / **Start** on the same Pod to keep `/workspace`. Terminating a
 regular Pod deletes its volume disk; use a network volume if you need the cache
@@ -121,7 +127,9 @@ bash -c "curl -sL https://raw.githubusercontent.com/camjac251/Personaplex-runpod
 
 ### 6. Launch and connect
 
-Pick a GPU with at least 12 GB VRAM (RTX 4090 / A6000 / L40S all work). Start the pod with the template above.
+Use a GPU with at least 24 GB VRAM for the default resident model plus rewind
+snapshot (RTX 4090 / A6000 / L40S all work). Lower-memory cards require CPU
+offload and have substantially higher latency.
 
 First boot downloads ~14 GB of weights and voice prompts. Expect 30-60 minutes depending on the data centre. The volume disk caches them, so subsequent boots reach "ready" in under a minute.
 
@@ -164,7 +172,7 @@ Tested on RTX 4090 (24 GB) with the default RunPod driver. Any modern NVIDIA car
 Audio path:
 
 1. Browser captures mic via `getUserMedia` and sends Opus-encoded frames over `RTCPeerConnection`.
-2. Server (aiortc) decodes to 48 kHz, resamples to Mimi's 24 kHz, feeds the inference pipeline. GPU work runs in a thread executor so the asyncio loop stays responsive.
+2. Server (aiortc) decodes to 48 kHz, resamples to Mimi's 24 kHz, and feeds the inference pipeline. All model work stays on one persistent inference thread so CUDA context and graph state remain warm while the asyncio loop stays responsive.
 3. TTS PCM goes back the same way: 24 kHz -> 48 kHz -> Opus -> `<audio>` element in the browser.
 4. A `RTCDataChannel` labelled `control` carries the session config (voice, sampling parameters, prompts) and streams text tokens for the transcript.
 

@@ -17,7 +17,7 @@ import numpy as np
 
 sys.path.insert(0, "moshi")
 
-from moshi.server import ServerState  # noqa: E402
+from moshi.server import ServerState, SnapshotDeferred  # noqa: E402
 
 
 def _bare_diagnostics_state() -> ServerState:
@@ -130,6 +130,20 @@ def test_snapshot_waits_for_cuda_copy_completion() -> None:
     assert sync_calls == [0]
 
 
+def test_snapshot_defers_mid_context_injection() -> None:
+    state = ServerState.__new__(ServerState)
+    state._infer_lock = threading.Lock()
+    state._inject_active = True
+    state._vision_active = deque([1])
+    state._reinforce_pending = deque()
+    try:
+        state._take_snapshot("periodic")
+    except SnapshotDeferred:
+        pass
+    else:
+        raise AssertionError("mid-inject snapshot was not deferred")
+
+
 def test_restore_waits_for_cuda_copy_completion() -> None:
     class _RestoreModule:
         def set_streaming_state_inplace(self, _state: dict) -> None:
@@ -166,6 +180,48 @@ def test_restore_waits_for_cuda_copy_completion() -> None:
     assert sync_calls == [0]
 
 
+def test_short_noise_burst_does_not_complete_user_turn() -> None:
+    def bare_state() -> ServerState:
+        state = ServerState.__new__(ServerState)
+        state._user_audio_active = False
+        state._user_audio_attack_streak = 0
+        state._user_audio_active_frames = 0
+        state._user_audio_silence_streak = 0
+        return state
+
+    state = bare_state()
+    for _ in range(3):
+        started, ended = state._update_user_turn_activity(0.01)
+    assert started is True and ended is False
+    for _ in range(7):
+        _, ended = state._update_user_turn_activity(0.0)
+    assert ended is False
+
+    state = bare_state()
+    for _ in range(4):
+        state._update_user_turn_activity(0.01)
+    for _ in range(7):
+        _, ended = state._update_user_turn_activity(0.0)
+    assert ended is True
+
+
+def test_clearing_resume_grant_cancels_snapshot_retaining_timer() -> None:
+    class _Handle:
+        cancelled = False
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    state = ServerState.__new__(ServerState)
+    handle = _Handle()
+    state._resume_grant = {"snapshots": [object()]}
+    state._resume_grant_expiry_handle = handle
+    state._clear_resume_grant()
+    assert state._resume_grant is None
+    assert state._resume_grant_expiry_handle is None
+    assert handle.cancelled is True
+
+
 if __name__ == "__main__":
     tests = [
         test_periodic_snapshots_default_on,
@@ -174,7 +230,10 @@ if __name__ == "__main__":
         test_tracked_inference_lock_clears_phase_after_error,
         test_failed_input_transfer_clears_inflight_frame,
         test_snapshot_waits_for_cuda_copy_completion,
+        test_snapshot_defers_mid_context_injection,
         test_restore_waits_for_cuda_copy_completion,
+        test_short_noise_burst_does_not_complete_user_turn,
+        test_clearing_resume_grant_cancels_snapshot_retaining_timer,
     ]
     for test in tests:
         print(f"{test.__name__} ...")

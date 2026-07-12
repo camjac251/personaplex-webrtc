@@ -3,13 +3,17 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import tarfile
+import tempfile
 from pathlib import Path
 
 from huggingface_hub import hf_hub_download, snapshot_download
 
 
 HF_REPO = "nvidia/personaplex-7b-v1"
+HF_REVISION = "fdaf4090a61cb315c138a1faee287ffd6c716309f"
+VOICE_REVISION_MARKER = ".personaplex-hf-revision"
 
 
 def has_voice_files(path: Path) -> bool:
@@ -25,30 +29,117 @@ def safe_extract(archive: Path, destination: Path) -> None:
             target = (destination / member.name).resolve()
             if not target.is_relative_to(destination):
                 raise RuntimeError(f"unsafe archive path: {member.name}")
-        tf.extractall(path=destination)
+            if member.issym() or member.islnk():
+                raise RuntimeError(f"archive links are not allowed: {member.name}")
+        tf.extractall(path=destination, filter="data")
 
 
-def ensure_voices(voice_dir: Path, token: str | None) -> None:
-    if has_voice_files(voice_dir):
-        print(f"[assets] voices already present at {voice_dir}", flush=True)
+def _extracted_voice_root(destination: Path) -> Path:
+    files = [
+        child
+        for child in destination.rglob("*")
+        if child.is_file() and child.suffix in {".pt", ".safetensors"}
+    ]
+    if not files:
+        raise RuntimeError("voices.tgz contained no voice prompt files")
+    common = Path(os.path.commonpath([str(child.parent) for child in files]))
+    if not common.is_relative_to(destination.resolve()):
+        raise RuntimeError("voice archive resolved outside extraction directory")
+    return common
+
+
+def _is_commit_revision(revision: str) -> bool:
+    return len(revision) == 40 and all(
+        char in "0123456789abcdefABCDEF" for char in revision
+    )
+
+
+def _resolved_cache_revision(archive: Path, requested: str) -> str:
+    # Hugging Face snapshot files are symlinks into ``blobs/``; resolving the
+    # path would discard the commit-bearing ``snapshots/<sha>/`` component.
+    parts = archive.parts
+    try:
+        index = parts.index("snapshots")
+    except ValueError:
+        return requested
+    if index + 1 >= len(parts):
+        return requested
+    resolved = parts[index + 1]
+    return resolved if _is_commit_revision(resolved) else requested
+
+
+def ensure_voices(
+    voice_dir: Path, token: str | None, revision: str
+) -> None:
+    voice_dir = voice_dir.expanduser().resolve()
+    marker = voice_dir / VOICE_REVISION_MARKER
+    installed_revision = ""
+    try:
+        installed_revision = marker.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        pass
+    if (
+        _is_commit_revision(revision)
+        and has_voice_files(voice_dir)
+        and installed_revision == revision
+    ):
+        print(
+            f"[assets] voices already present at {voice_dir} "
+            f"for revision {revision}",
+            flush=True,
+        )
         return
 
     print(f"[assets] downloading voices.tgz into HF cache for {voice_dir}", flush=True)
-    archive = Path(hf_hub_download(HF_REPO, "voices.tgz", token=token))
+    archive = Path(
+        hf_hub_download(
+            HF_REPO,
+            "voices.tgz",
+            token=token,
+            revision=revision,
+        )
+    )
+    resolved_revision = _resolved_cache_revision(archive, revision)
+    if (
+        has_voice_files(voice_dir)
+        and installed_revision == resolved_revision
+    ):
+        print(
+            f"[assets] voices already present at {voice_dir} "
+            f"for revision {resolved_revision}",
+            flush=True,
+        )
+        return
     voice_dir.parent.mkdir(parents=True, exist_ok=True)
-    safe_extract(archive, voice_dir.parent)
+    # The upstream archive currently contains a top-level ``voices/`` folder.
+    # Extracting straight into ``voice_dir.parent`` therefore only works when
+    # the requested directory is literally named ``voices``. Stage and copy
+    # the discovered prompt root so arbitrary persistent-volume paths work.
+    with tempfile.TemporaryDirectory(
+        prefix="personaplex-voices-", dir=voice_dir.parent
+    ) as tmp:
+        staging = Path(tmp)
+        safe_extract(archive, staging)
+        source = _extracted_voice_root(staging)
+        shutil.copytree(source, voice_dir, dirs_exist_ok=True)
 
     if not has_voice_files(voice_dir):
         raise RuntimeError(f"voices.tgz did not populate {voice_dir}")
+    marker.write_text(f"{resolved_revision}\n", encoding="utf-8")
 
-    print(f"[assets] voices ready at {voice_dir}", flush=True)
+    print(
+        f"[assets] voices ready at {voice_dir} "
+        f"for revision {resolved_revision}",
+        flush=True,
+    )
 
 
-def ensure_model(token: str | None) -> None:
+def ensure_model(token: str | None, revision: str) -> None:
     print("[assets] prefetching model snapshot without voices.tgz", flush=True)
     snapshot_download(
         HF_REPO,
         token=token,
+        revision=revision,
         ignore_patterns=["voices.tgz"],
     )
     print("[assets] model snapshot ready", flush=True)
@@ -59,15 +150,16 @@ def main() -> None:
     parser.add_argument("--voice-dir", required=True, type=Path)
     parser.add_argument("--skip-model", action="store_true")
     parser.add_argument("--skip-voices", action="store_true")
+    parser.add_argument("--revision", default=HF_REVISION)
     args = parser.parse_args()
 
     token = os.environ.get("HF_TOKEN") or None
 
     if not args.skip_voices:
-        ensure_voices(args.voice_dir, token)
+        ensure_voices(args.voice_dir, token, args.revision)
 
     if not args.skip_model:
-        ensure_model(token)
+        ensure_model(token, args.revision)
 
 
 if __name__ == "__main__":

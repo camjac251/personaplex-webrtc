@@ -2228,6 +2228,9 @@ function App() {
           addNotice("info", "Config sent, waiting for server warmup");
         };
         control.onmessage = (event) => {
+          // A queued message from the transport we just replaced must not
+          // mutate (or end) the fresh resumed session.
+          if (controlRef.current !== control) return;
           if (typeof event.data !== "string") return;
           try {
             handleControlMessage(JSON.parse(event.data));

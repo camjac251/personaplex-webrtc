@@ -16,6 +16,7 @@ from moshi.models.lm import (  # noqa: E402
     REPETITION_TURN_BREAK_FRAMES,
     LMGen,
 )
+from moshi.utils.sampling import sample_top_k_dynamic  # noqa: E402
 
 
 class _Graph:
@@ -32,6 +33,7 @@ def _bare_lm_gen() -> tuple[LMGen, _Graph]:
     lm_gen.temp = 0.8
     lm_gen.top_k = 250
     lm_gen._audio_temperature = torch.tensor(0.8)
+    lm_gen._audio_top_k = torch.tensor(250, dtype=torch.long)
     lm_gen._streaming_state = SimpleNamespace(graphed_depth=graph)
     return lm_gen, graph
 
@@ -45,13 +47,37 @@ def test_temperature_updates_graph_input_without_reset() -> None:
     assert graph.resets == []
 
 
-def test_top_k_invalidates_only_depformer_graph() -> None:
+def test_top_k_updates_graph_input_without_reset() -> None:
     lm_gen, graph = _bare_lm_gen()
     changed = lm_gen.set_audio_sampling(0.7, 512)
     assert changed is True
     assert lm_gen.temp == 0.7
     assert lm_gen.top_k == 512
-    assert graph.resets == [0]
+    assert lm_gen._audio_top_k.item() == 512
+    assert graph.resets == []
+
+
+def test_dynamic_top_k_masks_candidates_without_graph_shape_changes() -> None:
+    probs = torch.tensor([[0.05, 0.15, 0.80]], dtype=torch.float32)
+    for _ in range(20):
+        assert sample_top_k_dynamic(probs, torch.tensor(1)).item() == 2
+
+    torch.manual_seed(1234)
+    top_two = {
+        sample_top_k_dynamic(probs, torch.tensor(2)).item()
+        for _ in range(100)
+    }
+    assert top_two <= {1, 2}
+    assert 0 not in top_two
+
+    # Zero retains the legacy "no top-k limit" meaning; oversized values
+    # clamp to the fixed vocabulary size.
+    for k in (0, 99):
+        samples = {
+            sample_top_k_dynamic(probs, torch.tensor(k)).item()
+            for _ in range(200)
+        }
+        assert samples <= {0, 1, 2}
 
 
 def _ring_lm_gen(ctx: int = 4) -> tuple[LMGen, SimpleNamespace]:
@@ -127,12 +153,49 @@ def test_forced_pads_do_not_break_the_turn() -> None:
     assert not ({11, 12, 13, 14} & set(ring)), ring
 
 
+def test_new_turn_clears_history_before_penalty() -> None:
+    lm_gen, state = _ring_lm_gen()
+    lm_gen.repetition_penalty = 2.0
+    state.recent_text_tokens[0, 0] = 1
+    state.recent_text_offset.fill_(1)
+    state.repetition_pad_streak.fill_(REPETITION_TURN_BREAK_FRAMES)
+    # Token 1 wins without a penalty. If stale history leaked into the new
+    # turn it would be divided to 1.0 and token 2 would win at 1.5.
+    logits = torch.tensor([[[[0.0, 2.0, 1.5, 0.0]]]])
+    penalized = lm_gen._apply_text_repetition_penalty(logits)
+    assert penalized.argmax(dim=-1).item() == 1
+    assert state.recent_text_tokens.eq(-1).all()
+
+
+def test_interrupt_force_window_works_with_turn_cap_disabled() -> None:
+    lm_gen = LMGen.__new__(LMGen)
+    lm_gen.max_turn_text_tokens = 0
+    lm_gen._pad_force_remaining = 2
+    natural = torch.tensor([17], dtype=torch.long)
+
+    first, forced = lm_gen._consume_forced_pad(
+        natural, 3, text_was_forced=False
+    )
+    assert forced is True and first.item() == 3
+    second, forced = lm_gen._consume_forced_pad(
+        natural, 3, text_was_forced=False
+    )
+    assert forced is True and second.item() == 3
+    third, forced = lm_gen._consume_forced_pad(
+        natural, 3, text_was_forced=False
+    )
+    assert forced is False and third.item() == 17
+
+
 if __name__ == "__main__":
     tests = [
         test_temperature_updates_graph_input_without_reset,
-        test_top_k_invalidates_only_depformer_graph,
+        test_top_k_updates_graph_input_without_reset,
+        test_dynamic_top_k_masks_candidates_without_graph_shape_changes,
         test_repetition_ring_is_turn_scoped,
         test_forced_pads_do_not_break_the_turn,
+        test_new_turn_clears_history_before_penalty,
+        test_interrupt_force_window_works_with_turn_cap_disabled,
     ]
     for test in tests:
         print(f"{test.__name__} ...")

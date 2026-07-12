@@ -43,6 +43,7 @@ class _GateLock:
 
 def _bare_state() -> ServerState:
     state = ServerState.__new__(ServerState)
+    state._infer_executor = None
     state.text_tokenizer = _Tokenizer()
     state._vision_pending = deque()
     state._vision_pending_source = ""

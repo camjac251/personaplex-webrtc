@@ -15,6 +15,7 @@ Text and control messages travel on a single bidirectional
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import Executor
 import fractions
 import json
 import math
@@ -42,7 +43,7 @@ WEBRTC_SAMPLE_RATE = 48_000
 OUTBOUND_FRAME_MS = 20
 OUTBOUND_FRAME_SAMPLES = WEBRTC_SAMPLE_RATE * OUTBOUND_FRAME_MS // 1000  # 960
 OUTBOUND_BUFFER_CAP_SAMPLES = WEBRTC_SAMPLE_RATE * 2  # 2 seconds; sanity cap.
-# Backlog level at which recv() drains faster than real time. One Mimi
+# Backlog level at which recv() drops stale decoded content. One Mimi
 # decode lump is 80 ms (3840 samples at 48 kHz) and the healthy buffer
 # sawtooths between zero and roughly one lump, so two lumps of queued
 # audio means a stall left standing latency behind.
@@ -55,6 +56,11 @@ OUTBOUND_DRAIN_BACKLOG_SAMPLES = OUTBOUND_FRAME_SAMPLES * 8
 # a frame or more means a stall left residue behind. 25 calls ~= 500 ms
 # spans several 80 ms production lumps plus jitter.
 OUTBOUND_STANDING_BACKLOG_WINDOW = 25
+# Resampling can make a nominal 20 ms residue a few dozen samples short of a
+# full RTP frame. Treat a persistent half-frame floor as standing latency;
+# healthy production still reaches zero during each 80 ms sawtooth.
+OUTBOUND_STANDING_BACKLOG_MIN_SAMPLES = OUTBOUND_FRAME_SAMPLES // 2
+CONTROL_TASK_MAX = 128
 
 # STUN-only fallback used when no TURN credentials are configured. Works
 # only when both peers can reach each other directly over UDP, which is
@@ -210,37 +216,41 @@ class MimiOutputTrack(MediaStreamTrack):
             self._timestamp + OUTBOUND_FRAME_SAMPLES
         ) / WEBRTC_SAMPLE_RATE
         now = loop.time()
+        rebased = False
         if now - target >= frame_duration:
             self._start_time = now - (
                 (self._timestamp + OUTBOUND_FRAME_SAMPLES) / WEBRTC_SAMPLE_RATE
             )
             target = now
+            rebased = True
         delay = target - now
-        if delay > 0:
-            # A rebase fixes the send schedule but strands already-decoded
-            # speech in the buffer: production and the schedule both advance
-            # at 1x, so that backlog persists as standing latency until the
-            # buffer cap silently drops the oldest (audible) samples. Two
-            # signals identify shed-able backlog: an outright level above a
-            # healthy producer lump (fast path, large stalls), and a rolling
-            # backlog floor that stays off zero (sub-threshold residue the
-            # level gate never sees -- a healthy sawtooth touches zero every
-            # production period). Either way, emit at 2x via half-frame
-            # sleeps and pull the schedule origin back by the time gained so
-            # the shed latency stays shed.
-            async with self._buffer_lock:
-                backlog = self._buffer.size
+        # A rebase fixes sender pacing but can strand decoded speech in this
+        # buffer. Sending RTP packets at 2x does not make a receiver play them
+        # at 2x (timestamps still advance at the audio clock); it only grows
+        # the remote jitter buffer. Shed stale *content* here instead, then
+        # keep a steady 20 ms RTP cadence.
+        async with self._buffer_lock:
+            backlog = self._buffer.size
             self._backlog_window.append(backlog)
             standing = (
                 len(self._backlog_window) == self._backlog_window.maxlen
-                and min(self._backlog_window) >= OUTBOUND_FRAME_SAMPLES
+                and min(self._backlog_window)
+                >= OUTBOUND_STANDING_BACKLOG_MIN_SAMPLES
             )
-            if backlog >= OUTBOUND_DRAIN_BACKLOG_SAMPLES or (
+            if (rebased and backlog >= OUTBOUND_DRAIN_BACKLOG_SAMPLES) or (
                 standing and backlog >= OUTBOUND_FRAME_SAMPLES * 2
             ):
-                capped = min(delay, frame_duration / 2)
-                self._start_time -= delay - capped
-                delay = capped
+                target = (
+                    OUTBOUND_FRAME_SAMPLES * 4
+                    if backlog >= OUTBOUND_DRAIN_BACKLOG_SAMPLES
+                    else OUTBOUND_FRAME_SAMPLES
+                )
+                drop = max(0, backlog - target)
+                if drop > 0:
+                    self._buffer = self._buffer[drop:]
+                    self._backlog_window.clear()
+                    self._backlog_window.append(self._buffer.size)
+        if delay > 0:
             await asyncio.sleep(delay)
 
         chunk = await self._pop_chunk()
@@ -730,6 +740,7 @@ class RTCSession:
         log: LogFn,
         ice_servers: Optional[list[dict]] = None,
         backpressure_status: Optional[BackpressureStatusFn] = None,
+        process_executor: Optional[Executor] = None,
     ) -> None:
         """Create a peer-connection session.
 
@@ -742,6 +753,7 @@ class RTCSession:
         self._process_fn = process_fn
         self._log = log
         self._backpressure_status = backpressure_status
+        self._process_executor = process_executor
 
         configured = ice_servers if ice_servers else list(DEFAULT_STUN_FALLBACK)
         self._pc = RTCPeerConnection(
@@ -779,6 +791,15 @@ class RTCSession:
         # Strong refs to short-lived control-message handler tasks so the
         # event loop doesn't garbage-collect them mid-execution.
         self._control_tasks: set[asyncio.Task] = set()
+        # SCTP delivers this channel in order, but spawning one coroutine per
+        # message would otherwise let commands overtake at their first await
+        # (for example, rewind racing the bookmark immediately before it, or
+        # two CUDA-graph recaptures running concurrently).  Pings stay on the
+        # fast path; state-changing commands cross this lock in wire order.
+        self._control_message_lock = asyncio.Lock()
+        self._accept_control = True
+        self._active_control_task: Optional[asyncio.Task] = None
+        self._last_control_overflow_warn_at = 0.0
         self._closed = asyncio.Event()
         self._on_config: Optional[Callable[[SessionConfig], Awaitable[None]]] = None
         self._on_message: Optional[Callable[[dict], Awaitable[None]]] = None
@@ -973,16 +994,29 @@ class RTCSession:
     async def close(self) -> None:
         """Idempotent shutdown.
 
-        Awaits the cancelled inbound/process tasks before returning so that
-        any in-flight GPU work (shielded inside ``_process_loop``) finishes
-        and releases its grip on shared lm_gen / mimi state. Without this
-        await, the caller's ``self.lock.release()`` could fire while the
-        GPU thread is still mutating those tensors, racing the next
-        session's ``reset_streaming()``.
+        First freezes model-facing work, then closes the peer connection.
         """
+        await self.stop_processing()
+        try:
+            await self._pc.close()
+        except Exception as exc:
+            self._log("warning", f"pc.close raised: {type(exc).__name__}: {exc}")
+
+    async def stop_processing(self) -> None:
+        """Freeze and drain all model-facing work without closing the PC.
+
+        A runner calls this before deciding whether resident state is safe to
+        offer for resume. A control handler or audio frame may be awaiting
+        ``run_in_executor``; cancelling its asyncio Future does not stop the
+        worker thread, so every active task is drained before returning.
+        Keeping the PC open briefly lets teardown send a recording-ready
+        notification after the model state has already been frozen.
+        """
+        self._accept_control = False
+        self._processing_paused = True
         self._closed.set()
         pending: list[asyncio.Task] = []
-        for task in (self._inbound_task, self._process_task, *self._control_tasks):
+        for task in (self._inbound_task, self._process_task):
             if task is not None and not task.done():
                 task.cancel()
                 pending.append(task)
@@ -996,10 +1030,23 @@ class RTCSession:
                     "warning",
                     f"task drain raised: {type(exc).__name__}: {exc}",
                 )
-        try:
-            await self._pc.close()
-        except Exception as exc:
-            self._log("warning", f"pc.close raised: {type(exc).__name__}: {exc}")
+        # Cancel commands that are merely queued behind the serial lock; they
+        # have submitted no executor work and must not run against a closed
+        # session.  Only the active handler is allowed to finish so any worker
+        # it already launched is fully drained before the session lock drops.
+        current = asyncio.current_task()
+        active = self._active_control_task
+        control_waiters = [
+            task
+            for task in tuple(self._control_tasks)
+            if task is not active and task is not current and not task.done()
+        ]
+        for task in control_waiters:
+            task.cancel()
+        if control_waiters:
+            await asyncio.gather(*control_waiters, return_exceptions=True)
+        if active is not None and active is not current and not active.done():
+            await asyncio.gather(active, return_exceptions=True)
 
     async def clear_output_audio(self) -> None:
         await self._output_track.clear_buffer()
@@ -1011,6 +1058,49 @@ class RTCSession:
                 queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
+
+    def _trim_standing_inbound_backlog(self) -> float:
+        """Keep at most one fresh model frame of queued microphone audio.
+
+        After a one-off GPU stall, an 8-9 chunk queue never reaches the
+        full-queue replacement path again: capture and inference both resume
+        at 1x, preserving ~160 ms of stale latency forever.  Trim oldest
+        chunks at each completed frame while preserving wire order.
+
+        Returns dropped audio duration in milliseconds.
+        """
+        queued: list[tuple[int, np.ndarray]] = []
+        while True:
+            try:
+                queued.append(self._pcm_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        if not queued:
+            return 0.0
+
+        kept_reversed: list[tuple[int, np.ndarray]] = []
+        kept_samples = 0
+        dropped_samples = 0
+        for generation, samples in reversed(queued):
+            if generation != self._pipeline_generation:
+                dropped_samples += samples.size
+                continue
+            if (
+                kept_reversed
+                and kept_samples + samples.size > self._frame_size
+            ):
+                dropped_samples += samples.size
+                continue
+            kept_reversed.append((generation, samples))
+            kept_samples += samples.size
+        for item in reversed(kept_reversed):
+            self._pcm_queue.put_nowait(item)
+        if dropped_samples <= 0:
+            return 0.0
+        self._pcm_drop_events += 1
+        dropped_ms = dropped_samples / MIMI_SAMPLE_RATE * 1000.0
+        self._pcm_dropped_ms += dropped_ms
+        return dropped_ms
 
     async def pause_and_flush_audio(self) -> int:
         """Pause inference and invalidate queued or in-flight audio."""
@@ -1246,13 +1336,55 @@ class RTCSession:
 
         @channel.on("message")
         def _on_message(message: object) -> None:
+            if not self._accept_control or self._closed.is_set():
+                return
+            if len(self._control_tasks) >= CONTROL_TASK_MAX:
+                now = asyncio.get_event_loop().time()
+                if now - self._last_control_overflow_warn_at >= 1.0:
+                    self._log(
+                        "warning",
+                        "control queue full; dropping excess message",
+                    )
+                    self._last_control_overflow_warn_at = now
+                return
             # Hold a strong ref so the event loop's weak set can't GC the
             # task mid-handler.
             task = asyncio.create_task(self._handle_control_message(message))
             self._control_tasks.add(task)
-            task.add_done_callback(self._control_tasks.discard)
+            task.add_done_callback(self._control_task_done)
+
+    def _control_task_done(self, task: asyncio.Task) -> None:
+        """Retrieve handler failures and terminate a potentially torn session."""
+        self._control_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is None:
+            return
+        self.close_reason = "error"
+        self._log(
+            "error",
+            f"control handler: {type(exc).__name__}: {exc}",
+        )
+        try:
+            reason = f"control_error: {type(exc).__name__}: {exc}"
+            self.send_error(reason[:512])
+        except Exception as send_exc:
+            self._log(
+                "warning",
+                "control error notify failed: "
+                f"{type(send_exc).__name__}: {send_exc}",
+            )
+        # A failed mutation may have partially changed model state.  Wake the
+        # runner so it tears down without issuing a resume grant.
+        self._closed.set()
 
     async def _handle_control_message(self, message: object) -> None:
+        if not self._accept_control or self._closed.is_set():
+            return
         if not isinstance(message, str):
             self._log(
                 "warning",
@@ -1284,19 +1416,30 @@ class RTCSession:
                 else:
                     self._log("warning", f"control: ping bad 'seq': {seq_raw!r}")
             self.send_pong(t, seq)
-        elif kind == "config":
-            try:
-                cfg = parse_session_config(payload)
-            except (TypeError, ValueError, OverflowError) as exc:
-                self._log("warning", f"control: bad config: {exc}")
-                self.send_error(f"bad_config: {exc}")
+            return
+
+        async with self._control_message_lock:
+            if not self._accept_control or self._closed.is_set():
                 return
-            if self._on_config is not None:
-                await self._on_config(cfg)
-        elif self._on_message is not None:
-            await self._on_message(payload)
-        else:
-            self._log("warning", f"control: unknown type {kind!r}")
+            task = asyncio.current_task()
+            self._active_control_task = task
+            try:
+                if kind == "config":
+                    try:
+                        cfg = parse_session_config(payload)
+                    except (TypeError, ValueError, OverflowError) as exc:
+                        self._log("warning", f"control: bad config: {exc}")
+                        self.send_error(f"bad_config: {exc}")
+                        return
+                    if self._on_config is not None:
+                        await self._on_config(cfg)
+                elif self._on_message is not None:
+                    await self._on_message(payload)
+                else:
+                    self._log("warning", f"control: unknown type {kind!r}")
+            finally:
+                if self._active_control_task is task:
+                    self._active_control_task = None
 
     async def _inbound_loop(self, track: MediaStreamTrack) -> None:
         # Persistent resampler keeps anti-alias filter state across frames.
@@ -1405,7 +1548,9 @@ class RTCSession:
                     generation = self._pipeline_generation
                     self._process_idle.clear()
                     in_flight = asyncio.ensure_future(
-                        loop.run_in_executor(None, self._process_fn, chunk)
+                        loop.run_in_executor(
+                            self._process_executor, self._process_fn, chunk
+                        )
                     )
                     try:
                         results = await asyncio.shield(in_flight)
@@ -1417,6 +1562,17 @@ class RTCSession:
                         raise
                     finally:
                         self._process_idle.set()
+                    trimmed_ms = self._trim_standing_inbound_backlog()
+                    if trimmed_ms > 0:
+                        now = loop.time()
+                        if now - self._last_drop_warn_at >= 1.0:
+                            self._log(
+                                "warning",
+                                "trimmed standing inbound audio backlog "
+                                f"dropped_ms={trimmed_ms:.1f} "
+                                f"q={self._pcm_queue.qsize()}/{self._pcm_queue.maxsize}",
+                            )
+                            self._last_drop_warn_at = now
                     if (
                         self._processing_paused
                         or generation != self._pipeline_generation

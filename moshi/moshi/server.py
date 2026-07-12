@@ -409,6 +409,10 @@ COLLAPSE_WINDOW_SEC = 30.0
 AUTO_REWIND_MIN_INTERVAL_SEC = 60.0
 AUTO_REWIND_SNAPSHOT_MAX_AGE_SEC = 90.0
 
+
+class SnapshotDeferred(RuntimeError):
+    """Snapshot capture was postponed until a context drip completes."""
+
 # Max user-pinned labelled snapshots per session. Each is a full
 # streaming-state clone, independent of the auto-rewind ring, so keep the
 # cap small to bound host/GPU memory. On overflow the oldest is evicted so
@@ -582,6 +586,8 @@ class _SessionRecorder:
         if chunk.size == 0:
             return False
         with self._lock:
+            if self._finalized:
+                return False
             self._buffer.append(chunk)
             self._buffered_samples += chunk.size
             if self._buffered_samples >= self._max_buffer_samples and not self._spill_pending:
@@ -955,6 +961,15 @@ class ServerState:
         # executor before acquiring) so they cannot interleave with an
         # in-flight step().
         self._infer_lock = threading.Lock()
+        # One persistent host thread owns every CUDA/model submission. The
+        # default asyncio pool freely rotates workers; on a cold worker,
+        # CUDA/cuBLAS lazy initialization can stall an audio frame for ~7 s.
+        # Model work is serialized by design already, so a single worker loses
+        # no useful parallelism and makes thread-local CUDA state reusable.
+        self._infer_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="personaplex-infer",
+        )
         # Set in _run_rtc_session for the lifetime of an active session.
         # Lets vision-side coroutines push captions back to the client
         # without plumbing a session reference through every call site.
@@ -1158,6 +1173,7 @@ class ServerState:
         # matching resume_session_id, discarded by any fresh session start,
         # and ignored after the deadline.
         self._resume_grant: Optional[dict] = None
+        self._resume_grant_expiry_handle: Optional[asyncio.TimerHandle] = None
         # Rewind history: session_id -> [(monotonic_ts, versioned_snapshot)].
         # Each snapshot owns cloned LM, Mimi, and RNG state.
         self._session_snapshots: dict[str, list[tuple[float, dict]]] = {}
@@ -1264,6 +1280,158 @@ class ServerState:
             torch.cuda.synchronize()
             # Clear CUDA cache after warmup to free any fragmented memory
             torch.cuda.empty_cache()
+
+    def _configure_fresh_session_model(
+        self,
+        cfg: SessionConfig,
+        voice_prompt_path: Optional[str],
+        voice_prompt_b_path: Optional[str],
+        blend_active: bool,
+    ) -> dict:
+        """Load conditioning and reset model state under the inference lock.
+
+        This runs on an executor worker.  Session teardown can leave a
+        snapshot/restore worker finishing after its asyncio waiter was
+        cancelled, so every fresh-session LM/Mimi mutation must wait on the
+        same lock instead of racing it from the event-loop thread.
+        """
+        voice_load_ms = 0.0
+        voice_description = ""
+        with self._infer_lock:
+            if blend_active:
+                blend_id = (
+                    f"{voice_prompt_path}+{voice_prompt_b_path}"
+                    f"@{cfg.voice_blend_mix:.2f}"
+                )
+                if self.lm_gen.voice_prompt != blend_id:
+                    started = time.monotonic()
+                    self.lm_gen.load_voice_prompt_blend(
+                        voice_prompt_path,
+                        voice_prompt_b_path,
+                        cfg.voice_blend_mix,
+                    )
+                    voice_load_ms = (time.monotonic() - started) * 1000.0
+                    voice_description = f"blend {blend_id}"
+            elif (
+                voice_prompt_path is not None
+                and self.lm_gen.voice_prompt != voice_prompt_path
+            ):
+                started = time.monotonic()
+                if voice_prompt_path.endswith(".pt"):
+                    self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
+                else:
+                    self.lm_gen.load_voice_prompt(voice_prompt_path)
+                voice_load_ms = (time.monotonic() - started) * 1000.0
+                voice_description = voice_prompt_path
+            elif not voice_prompt_path:
+                # Prompt caches persist on LMGen across sessions.  Clear every
+                # representation, including full-state sidecars, so a no-voice
+                # session neither inherits conditioning nor pins its GPU clone.
+                self.lm_gen.voice_prompt = None
+                self.lm_gen.voice_prompt_audio = None
+                self.lm_gen.voice_prompt_cache = None
+                self.lm_gen.voice_prompt_embeddings = None
+                self.lm_gen.voice_prompt_full_state = None
+
+            self.lm_gen.voice_prompt_strength = (
+                cfg.clone_strength
+                if cfg.voice_prompt.startswith(UPLOAD_PREFIX)
+                else 1.0
+            )
+            self._active_text_prompt = cfg.text_prompt or ""
+            wrapped_text_prompt = (
+                wrap_with_system_tags(self._active_text_prompt)
+                if self._active_text_prompt
+                else ""
+            )
+            self.lm_gen.text_prompt_tokens = (
+                self.text_tokenizer.encode(wrapped_text_prompt)
+                if wrapped_text_prompt
+                else []
+            )
+
+            self._reinforce_enabled = bool(cfg.reinforce_in_silences)
+            bare_persona = _strip_system_tags(self._active_text_prompt)
+            compact_persona = _sanitize_vision_text(bare_persona)
+            if self._reinforce_enabled and compact_persona:
+                (
+                    self._reinforce_prompt_text,
+                    self._reinforce_prompt_tokens,
+                ) = self._fit_vision_context(compact_persona)
+            else:
+                self._reinforce_prompt_text = ""
+                self._reinforce_prompt_tokens = []
+
+            if cfg.seed is not None and cfg.seed != -1:
+                seed_all(cfg.seed)
+            self.lm_gen.temp_text = cfg.text_temperature
+            self.lm_gen.top_k_text = min(
+                max(1, cfg.text_topk), self.lm_gen.lm_model.text_card
+            )
+            audio_top_k = min(
+                max(1, cfg.audio_topk), self.lm_gen.lm_model.card
+            )
+            audio_top_k_changed = self.lm_gen.set_audio_sampling(
+                cfg.audio_temperature, audio_top_k
+            )
+            self.lm_gen.repetition_penalty = max(
+                1.0, cfg.repetition_penalty
+            )
+            self.lm_gen.repetition_penalty_context = max(
+                0,
+                min(
+                    cfg.repetition_penalty_context,
+                    MAX_REPETITION_CONTEXT,
+                ),
+            )
+            self.lm_gen.padding_bonus = max(0.0, cfg.padding_bonus)
+            self.lm_gen.max_turn_text_tokens = max(
+                0, cfg.max_turn_text_tokens
+            )
+            self.lm_gen._non_pad_streak = 0
+            self.lm_gen._pad_force_remaining = 0
+            self.mimi.reset_streaming()
+            self.lm_gen.reset_streaming()
+
+            self._clear_vision_pending()
+            self._vision_pad_streak = 0
+            self._audio_silence_streak = 0
+            self._vision_inject_steps = 0
+            self._clear_reinforce_pending()
+            self._reinforce_inject_steps = 0
+            self._active_context_meta = {}
+            self._last_reinforce_at = time.monotonic()
+            self._rtf_ema = 0.0
+            self._rtf_last = 0.0
+            self._process_frame_ms_last = 0.0
+            self._process_frame_ms_ema = 0.0
+            self._lm_frame_ms_last = 0.0
+            self._lm_frame_ms_ema = 0.0
+            self._process_frame_count = 0
+            self._gpu_util_last = None
+            self._vram_used_last = None
+            self._observed_idle_rms_ema = 0.0
+            self._latest_vision_caption = ""
+            self._latest_vision_at = 0.0
+            self._latest_vision_frame_id = ""
+            self._last_injected_vision_key = ""
+            self._vision_source_generation = 0
+            self._vision_source_active = False
+            self._user_audio_active = False
+            self._user_audio_attack_streak = 0
+            self._user_audio_active_frames = 0
+            self._user_audio_silence_streak = 0
+
+        return {
+            "voice_load_ms": voice_load_ms,
+            "voice_description": voice_description,
+            "audio_top_k": audio_top_k,
+            "audio_top_k_changed": audio_top_k_changed,
+        }
+
+    def _reset_mimi_streaming_locked(self) -> None:
+        with self._infer_lock:
+            self.mimi.reset_streaming()
 
     def _resolve_upload_path(self, name: str) -> Optional[str]:
         """Return an absolute path inside uploads_dir, or None if unsafe/missing.
@@ -1508,6 +1676,7 @@ class ServerState:
                 self.lm_gen.voice_prompt_audio = None
                 self.lm_gen.voice_prompt_cache = None
                 self.lm_gen.voice_prompt_embeddings = None
+                self.lm_gen.voice_prompt_full_state = None
                 self.mimi.reset_streaming()
 
         if not generated_frames:
@@ -1581,9 +1750,22 @@ class ServerState:
                 return web.json_response({"error": "session_busy"}, status=409)
             try:
                 loop = asyncio.get_event_loop()
-                cache_path = await loop.run_in_executor(
-                    None, self._synthesize_voice_preview, voice_prompt_path, cache_path
+                preview_future = loop.run_in_executor(
+                    self._infer_executor,
+                    self._synthesize_voice_preview,
+                    voice_prompt_path,
+                    cache_path,
                 )
+                try:
+                    cache_path = await asyncio.shield(preview_future)
+                except asyncio.CancelledError:
+                    # Cancelling the HTTP request cannot stop the GPU worker.
+                    # Keep the session gate held until it restores model state.
+                    try:
+                        await preview_future
+                    except BaseException:
+                        pass
+                    raise
             except Exception as exc:
                 logger.warning(
                     "voice preview synth failed for %s: %s: %s",
@@ -1604,6 +1786,39 @@ class ServerState:
                 "Cache-Control": "public, max-age=86400",
             },
         )
+
+    def _update_user_turn_activity(self, chunk_rms: float) -> tuple[bool, bool]:
+        """Advance lightweight speech activity; return (started, ended)."""
+        user_turn_ended = False
+        user_turn_started = False
+        if self._user_audio_active:
+            if chunk_rms <= USER_TURN_RELEASE_RMS:
+                self._user_audio_silence_streak += 1
+            else:
+                # Count voiced frames only. Including the seven release-
+                # silence frames made the four-frame minimum impossible to
+                # fail, so a three-frame bump always triggered grounding.
+                self._user_audio_active_frames += 1
+                self._user_audio_silence_streak = 0
+            if self._user_audio_silence_streak >= USER_TURN_END_SILENCE_STREAK:
+                user_turn_ended = (
+                    self._user_audio_active_frames
+                    >= USER_TURN_MIN_ACTIVE_FRAMES
+                )
+                self._user_audio_active = False
+                self._user_audio_attack_streak = 0
+                self._user_audio_active_frames = 0
+                self._user_audio_silence_streak = 0
+        elif chunk_rms >= USER_TURN_SPEECH_RMS:
+            self._user_audio_attack_streak += 1
+            if self._user_audio_attack_streak >= USER_TURN_ATTACK_STREAK:
+                self._user_audio_active = True
+                self._user_audio_active_frames = self._user_audio_attack_streak
+                self._user_audio_silence_streak = 0
+                user_turn_started = True
+        else:
+            self._user_audio_attack_streak = 0
+        return user_turn_started, user_turn_ended
 
     @torch.no_grad()
     @_track_inflight_frame
@@ -1629,32 +1844,9 @@ class ServerState:
             if chunk_np.size
             else 0.0
         )
-        user_turn_ended = False
-        user_turn_started = False
-        if self._user_audio_active:
-            self._user_audio_active_frames += 1
-            if chunk_rms <= USER_TURN_RELEASE_RMS:
-                self._user_audio_silence_streak += 1
-            else:
-                self._user_audio_silence_streak = 0
-            if self._user_audio_silence_streak >= USER_TURN_END_SILENCE_STREAK:
-                user_turn_ended = (
-                    self._user_audio_active_frames
-                    >= USER_TURN_MIN_ACTIVE_FRAMES
-                )
-                self._user_audio_active = False
-                self._user_audio_attack_streak = 0
-                self._user_audio_active_frames = 0
-                self._user_audio_silence_streak = 0
-        elif chunk_rms >= USER_TURN_SPEECH_RMS:
-            self._user_audio_attack_streak += 1
-            if self._user_audio_attack_streak >= USER_TURN_ATTACK_STREAK:
-                self._user_audio_active = True
-                self._user_audio_active_frames = self._user_audio_attack_streak
-                self._user_audio_silence_streak = 0
-                user_turn_started = True
-        else:
-            self._user_audio_attack_streak = 0
+        user_turn_started, user_turn_ended = self._update_user_turn_activity(
+            chunk_rms
+        )
         if user_turn_started:
             # A real user turn separates valid long assistant responses. Do
             # not let max-turn cap events accumulate across conversation turns
@@ -2164,6 +2356,7 @@ class ServerState:
         if (
             session_id != self._active_session_id
             or not self._vision_source_active
+            or (source == "user_turn" and not self._vision_ground_user_turns)
         ):
             return False
         source_generation = self._vision_source_generation
@@ -2227,6 +2420,10 @@ class ServerState:
                     session_id != self._active_session_id
                     or not self._vision_source_active
                     or source_generation != self._vision_source_generation
+                    or (
+                        source == "user_turn"
+                        and not self._vision_ground_user_turns
+                    )
                 ):
                     return
                 ok, blocked_by, duplicate = self._queue_waiting_vision_context(
@@ -2236,12 +2433,13 @@ class ServerState:
                 queued["blocked_by"] = blocked_by
                 queued["duplicate"] = duplicate
 
-        await loop.run_in_executor(None, _set_context)
+        await loop.run_in_executor(self._infer_executor, _set_context)
         if (
             sess is not None
             and session_id == self._active_session_id
             and self._vision_source_active
             and source_generation == self._vision_source_generation
+            and (source != "user_turn" or self._vision_ground_user_turns)
         ):
             if not queued["ok"]:
                 if queued["duplicate"]:
@@ -2385,43 +2583,6 @@ class ServerState:
         snapshot.update(metadata)
         return snapshot
 
-    def _recapture_depformer_graph_locked(self) -> None:
-        """Capture a new acoustic sampler graph without advancing the session."""
-        lm_state = self._clone_streaming_state(self.lm_gen)
-        rng_cpu = torch.get_rng_state().clone()
-        rng_cuda = None
-        if self.device.type == "cuda" and torch.cuda.is_available():
-            rng_cuda = torch.cuda.get_rng_state(
-                _cuda_device_index(self.device)
-            ).clone()
-        non_pad_streak = self.lm_gen._non_pad_streak
-        pad_force_remaining = self.lm_gen._pad_force_remaining
-        try:
-            zero_codes = self.lm_gen._encode_zero_frame()
-            output = self.lm_gen.step(
-                input_tokens=zero_codes,
-                moshi_tokens=zero_codes,
-                text_token=self.lm_gen.zero_text_code,
-            )
-            if output is None:
-                output = self.lm_gen.step(
-                    input_tokens=zero_codes,
-                    moshi_tokens=zero_codes,
-                    text_token=self.lm_gen.zero_text_code,
-                )
-            if output is None:
-                raise RuntimeError("depformer graph recapture produced no step")
-        finally:
-            self.lm_gen.set_streaming_state_inplace(dict(lm_state))
-            torch.set_rng_state(rng_cpu)
-            if rng_cuda is not None:
-                torch.cuda.set_rng_state(
-                    rng_cuda,
-                    device=_cuda_device_index(self.device),
-                )
-            self.lm_gen._non_pad_streak = non_pad_streak
-            self.lm_gen._pad_force_remaining = pad_force_remaining
-
     def _take_snapshot(self, kind: str = "manual") -> dict:
         """Atomically clone LM, Mimi, RNG, and turn-safety state."""
         started_at = time.perf_counter()
@@ -2430,6 +2591,14 @@ class ServerState:
         sync_ms = 0.0
         with self._infer_lock:
             lock_acquired_at = time.perf_counter()
+            if (
+                getattr(self, "_inject_active", False)
+                or getattr(self, "_vision_active", ())
+                or getattr(self, "_reinforce_pending", ())
+            ):
+                raise SnapshotDeferred(
+                    "context injection is active; retry at the next boundary"
+                )
             snapshot = {
                 "version": 2,
                 "captured_at": time.monotonic(),
@@ -2541,7 +2710,17 @@ class ServerState:
                     ) * 1000.0
                     restored["ok"] = True
 
-            await loop.run_in_executor(None, _restore)
+            restore_future = loop.run_in_executor(
+                self._infer_executor, _restore
+            )
+            try:
+                await asyncio.shield(restore_future)
+            except asyncio.CancelledError:
+                try:
+                    await restore_future
+                except BaseException:
+                    pass
+                raise
             if restored["ok"]:
                 self._last_rewind_at = time.monotonic()
                 logger.info(
@@ -2554,6 +2733,11 @@ class ServerState:
                 )
                 if self.asr is not None:
                     self.asr.reset()
+                # Restore clears inject queues in-place. Emit the close edge
+                # explicitly; frame-side edge detection now also sees false
+                # and cannot repair a dashboard left in "injecting" state.
+                session.send_inject_status(False)
+                session.send_context_status("complete", {})
             return restored["ok"]
         finally:
             session.resume_audio(generation)
@@ -2616,10 +2800,15 @@ class ServerState:
         them resident until the next connect discards the grant.
         """
 
+        if self._resume_grant_expiry_handle is not None:
+            self._resume_grant_expiry_handle.cancel()
+            self._resume_grant_expiry_handle = None
+
         def _expire() -> None:
             if self._resume_grant is not grant:
                 return
             self._resume_grant = None
+            self._resume_grant_expiry_handle = None
             logger.info("resume window expired unused; dropping grant")
             if torch.cuda.is_available():
                 try:
@@ -2632,7 +2821,16 @@ class ServerState:
                     )
 
         delay = max(0.0, grant["deadline"] - time.monotonic()) + 1.0
-        asyncio.get_event_loop().call_later(delay, _expire)
+        self._resume_grant_expiry_handle = asyncio.get_event_loop().call_later(
+            delay, _expire
+        )
+
+    def _clear_resume_grant(self) -> None:
+        """Release a superseded grant and its timer-held snapshot clones."""
+        self._resume_grant = None
+        if self._resume_grant_expiry_handle is not None:
+            self._resume_grant_expiry_handle.cancel()
+            self._resume_grant_expiry_handle = None
 
     async def handle_vision_frame(
         self,
@@ -3033,7 +3231,9 @@ class ServerState:
                             ambient_queued["blocked_by"] = blocked_by
                             ambient_queued["duplicate"] = duplicate
 
-                    await loop.run_in_executor(None, _set_vision_context)
+                    await loop.run_in_executor(
+                        self._infer_executor, _set_vision_context
+                    )
                     if (
                         ambient_queued["ok"]
                         and sess is not None
@@ -3586,10 +3786,9 @@ class ServerState:
             await self.lock.acquire()
             return True
         waiter = asyncio.create_task(self.lock.acquire())
-        try:
-            await asyncio.wait_for(asyncio.shield(waiter), timeout=timeout)
-            return True
-        except asyncio.TimeoutError:
+
+        async def _cancel_waiter_and_release() -> None:
+            """Drain a shielded acquire and undo a same-tick acquisition."""
             waiter.cancel()
             try:
                 await waiter
@@ -3597,19 +3796,32 @@ class ServerState:
                 pass
             except Exception:
                 pass
-            # If the cancellation arrived after acquire() returned True,
-            # the task is done with no exception and the lock is held by
-            # this coroutine. Release it so future offers can proceed.
+            # Cancellation can lose the race with Lock.acquire().  In that
+            # case this waiter owns the otherwise orphaned lock.
             if (
                 waiter.done()
                 and not waiter.cancelled()
                 and waiter.exception() is None
+                and waiter.result() is True
             ):
                 try:
                     self.lock.release()
                 except RuntimeError:
                     pass
+
+        try:
+            await asyncio.wait_for(asyncio.shield(waiter), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            await _cancel_waiter_and_release()
             return False
+        except BaseException:
+            # The HTTP request itself can be cancelled while the shielded
+            # waiter remains queued.  Without draining it here, it later
+            # acquires the single-session lock with no owner and every future
+            # offer receives 409 until the process restarts.
+            await _cancel_waiter_and_release()
+            raise
 
     async def handle_rtc_offer(self, request):
         """WebRTC signaling: accept SDP offer, return SDP answer.
@@ -3736,6 +3948,7 @@ class ServerState:
                 log=clog.log,
                 ice_servers=ice_servers,
                 backpressure_status=self._backpressure_status,
+                process_executor=self._infer_executor,
             )
             session.set_config_handler(on_config)
 
@@ -3768,7 +3981,7 @@ class ServerState:
             # Any session start supersedes the resume window: a matching
             # resume consumes the grant, and a fresh session is about to
             # reset the model state the grant was protecting.
-            self._resume_grant = None
+            self._clear_resume_grant()
             task = asyncio.create_task(
                 self._run_rtc_session(
                     session,
@@ -3825,6 +4038,7 @@ class ServerState:
         _cad_t: Optional[asyncio.Task] = None
         _stat_t: Optional[asyncio.Task] = None
         _wd_t: Optional[asyncio.Task] = None
+        recording_spill_tasks: set[asyncio.Future] = set()
         resuming = resume_state is not None
         cfg: Optional[SessionConfig] = None
         # Teardown bookkeeping for the resume grant: whether this session
@@ -3918,108 +4132,39 @@ class ServerState:
                     if voice_prompt_b_path is None or not voice_prompt_b_path.endswith(".pt"):
                         blend_active = False
 
-                if blend_active:
-                    blend_id = (
-                        f"{voice_prompt_path}+{voice_prompt_b_path}@{cfg.voice_blend_mix:.2f}"
-                    )
-                    if self.lm_gen.voice_prompt != blend_id:
-                        t_vp = time.monotonic()
-                        self.lm_gen.load_voice_prompt_blend(
-                            voice_prompt_path, voice_prompt_b_path, cfg.voice_blend_mix
-                        )
-                        clog.log(
-                            "info",
-                            f"timing: voice prompt blend load {(time.monotonic() - t_vp) * 1000:.0f} ms ({blend_id})",
-                        )
-                elif voice_prompt_path is not None and self.lm_gen.voice_prompt != voice_prompt_path:
-                    t_vp = time.monotonic()
-                    if voice_prompt_path.endswith(".pt"):
-                        self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
-                    else:
-                        self.lm_gen.load_voice_prompt(voice_prompt_path)
+                loop = asyncio.get_event_loop()
+                configure_future = loop.run_in_executor(
+                    self._infer_executor,
+                    self._configure_fresh_session_model,
+                    cfg,
+                    voice_prompt_path,
+                    voice_prompt_b_path,
+                    blend_active,
+                )
+                try:
+                    configure_result = await asyncio.shield(configure_future)
+                except asyncio.CancelledError:
+                    # The worker owns model state until it releases
+                    # _infer_lock; drain it before session teardown proceeds.
+                    try:
+                        await configure_future
+                    except BaseException:
+                        pass
+                    raise
+                if configure_result["voice_description"]:
                     clog.log(
                         "info",
-                        f"timing: voice prompt load {(time.monotonic() - t_vp) * 1000:.0f} ms ({voice_prompt_path})",
+                        "timing: voice prompt load "
+                        f"{configure_result['voice_load_ms']:.0f} ms "
+                        f"({configure_result['voice_description']})",
                     )
-                elif not voice_prompt_path:
-                    # lm_gen.voice_prompt persists across sessions; without an explicit reset, a no-prompt session inherits the prior session's loaded voice cache
-                    self.lm_gen.voice_prompt = None
-                    self.lm_gen.voice_prompt_audio = None
-                    self.lm_gen.voice_prompt_cache = None
-                    self.lm_gen.voice_prompt_embeddings = None
-
-                # Clone strength scales how much of an uploaded clip primes the
-                # cache. Only the raw-audio upload path honors it; preset (.pt)
-                # and blended prompts keep full conditioning, so reset to 1.0 for
-                # them. Applied even when the same clip is already cached above,
-                # because the strength can differ from the prior session. Read by
-                # _step_voice_prompt during the off-loop warmup; set here on the
-                # event loop before that executor work starts.
-                self.lm_gen.voice_prompt_strength = (
-                    cfg.clone_strength
-                    if cfg.voice_prompt.startswith(UPLOAD_PREFIX)
-                    else 1.0
-                )
-
-                # Empty list (not None) so _step_text_prompt_core iterates as a
-                # no-op when the user clears the textarea. Iterating None raises
-                # TypeError inside the executor and tears the session down.
-                self._active_text_prompt = cfg.text_prompt or ""
-                wrapped_text_prompt = (
-                    wrap_with_system_tags(self._active_text_prompt)
-                    if self._active_text_prompt else ""
-                )
-                self.lm_gen.text_prompt_tokens = (
-                    self.text_tokenizer.encode(wrapped_text_prompt)
-                    if wrapped_text_prompt else []
-                )
-                # Mid-stream reinforcement re-injects the persona WITHOUT
-                # <system> tags: the model is trained with <system> only at
-                # t=0, so the wrap is off-distribution mid-stream (same reason
-                # the vision drip injects bare text). Strip any <system> the
-                # startup path or the user added, then encode with the same
-                # leading-space + VISION_QUEUE_MAX slice convention as the
-                # proven vision path.
-                self._reinforce_enabled = bool(cfg.reinforce_in_silences)
-                bare_persona = _strip_system_tags(self._active_text_prompt)
-                compact_persona = _sanitize_vision_text(bare_persona)
-                if self._reinforce_enabled and compact_persona:
-                    (
-                        self._reinforce_prompt_text,
-                        self._reinforce_prompt_tokens,
-                    ) = self._fit_vision_context(compact_persona)
-                else:
-                    self._reinforce_prompt_text = ""
-                    self._reinforce_prompt_tokens = []
-                if cfg.seed is not None and cfg.seed != -1:
-                    seed_all(cfg.seed)
-
-                self.lm_gen.temp_text = cfg.text_temperature
-                # torch.topk raises for k larger than the sampled vocabulary,
-                # so cap top-k at the model's real cardinalities.
-                self.lm_gen.top_k_text = min(
-                    max(1, cfg.text_topk), self.lm_gen.lm_model.text_card
-                )
-                audio_top_k = min(
-                    max(1, cfg.audio_topk), self.lm_gen.lm_model.card
-                )
-                graph_reset = self.lm_gen.set_audio_sampling(
-                    cfg.audio_temperature, audio_top_k
-                )
-                if graph_reset:
+                audio_top_k = configure_result["audio_top_k"]
+                if configure_result["audio_top_k_changed"]:
                     clog.log(
                         "info",
-                        f"audio sampling graph invalidated for top-k={audio_top_k}; "
-                        "recapturing during prompt priming",
+                        f"audio top-k tensor updated to {audio_top_k} "
+                        "without graph recapture",
                     )
-                self.lm_gen.repetition_penalty = max(1.0, cfg.repetition_penalty)
-                self.lm_gen.repetition_penalty_context = max(
-                    0, min(cfg.repetition_penalty_context, MAX_REPETITION_CONTEXT)
-                )
-                self.lm_gen.padding_bonus = max(0.0, cfg.padding_bonus)
-                self.lm_gen.max_turn_text_tokens = max(0, cfg.max_turn_text_tokens)
-                self.lm_gen._non_pad_streak = 0
-                self.lm_gen._pad_force_remaining = 0
                 clog.log(
                     "info",
                     "inference config: "
@@ -4033,54 +4178,6 @@ class ServerState:
                     f"max_turn={self.lm_gen.max_turn_text_tokens}",
                 )
 
-                self.mimi.reset_streaming()
-                self.lm_gen.reset_streaming()
-
-                # Reset the vision-inject state machine and the transcript
-                # buffer. Leftover state from a previous session would
-                # otherwise leak into this one. _infer_lock is a threading.Lock
-                # and a straggler from the prior session's teardown can still
-                # hold it, so acquire it on an executor thread like every
-                # other site instead of blocking the event loop.
-                def _reset_session_state():
-                    with self._infer_lock:
-                        self._clear_vision_pending()
-                        self._vision_pad_streak = 0
-                        self._audio_silence_streak = 0
-                        self._vision_inject_steps = 0
-                        self._clear_reinforce_pending()
-                        self._reinforce_inject_steps = 0
-                        self._active_context_meta = {}
-                        # Baseline the reinforce cooldown at session start:
-                        # time.monotonic() is host uptime, so a 0.0 baseline
-                        # would satisfy REINFORCE_MIN_INTERVAL_SEC immediately
-                        # and let the first pad streak arm the window.
-                        self._last_reinforce_at = time.monotonic()
-                        # Drop the prior session's timing and idle-RMS so a
-                        # fresh session does not report stale readouts.
-                        self._rtf_ema = 0.0
-                        self._rtf_last = 0.0
-                        self._process_frame_ms_last = 0.0
-                        self._process_frame_ms_ema = 0.0
-                        self._lm_frame_ms_last = 0.0
-                        self._lm_frame_ms_ema = 0.0
-                        self._process_frame_count = 0
-                        self._gpu_util_last = None
-                        self._vram_used_last = None
-                        self._observed_idle_rms_ema = 0.0
-                        self._latest_vision_caption = ""
-                        self._latest_vision_at = 0.0
-                        self._latest_vision_frame_id = ""
-                        self._last_injected_vision_key = ""
-                        self._vision_source_generation = 0
-                        self._vision_source_active = False
-                        self._user_audio_active = False
-                        self._user_audio_attack_streak = 0
-                        self._user_audio_active_frames = 0
-                        self._user_audio_silence_streak = 0
-
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, _reset_session_state)
                 # Apply the per-session vision system prompt. Falls back to
                 # the generic default when the client didn't supply one.
                 self._vision_system_prompt = (
@@ -4330,10 +4427,32 @@ class ServerState:
                         at_sec = 0.0
                     clog.log("info", f"bookmarking snapshot {label!r}")
                     # Reuse the lock-correct clone path off the event loop.
-                    snap = await loop.run_in_executor(
-                        None, self._take_snapshot, "bookmark"
-                    )
-                    marks = self._session_bookmarks.setdefault(session_id, [])
+                    try:
+                        snap = await loop.run_in_executor(
+                            self._infer_executor,
+                            self._take_snapshot,
+                            "bookmark",
+                        )
+                    except SnapshotDeferred:
+                        session.send_event(
+                            "bookmark",
+                            "Bookmark deferred; context is still injecting",
+                            "warn",
+                        )
+                        session.send_notice(
+                            "Wait for context injection to finish, then bookmark"
+                        )
+                        return
+                    marks = self._session_bookmarks.get(session_id)
+                    if (
+                        marks is None
+                        or session_id != self._active_session_id
+                        or not session.is_alive()
+                    ):
+                        # Teardown may have removed the bucket while the GPU
+                        # clone was in flight. Never resurrect an orphaned
+                        # session id that no future teardown will release.
+                        return
                     marks.append(
                         {
                             "id": bm_id,
@@ -4389,6 +4508,10 @@ class ServerState:
                                 INTERRUPT_YIELD_FRAMES,
                             )
                             self.lm_gen._non_pad_streak = 0
+                            # A user stop is a real turn boundary, unlike the
+                            # automatic max-turn cap. Do not carry abandoned
+                            # response words into the next reply's penalty.
+                            self.lm_gen.reset_repetition_state()
                             self._prev_pad_force_remaining = (
                                 self.lm_gen._pad_force_remaining
                             )
@@ -4403,7 +4526,9 @@ class ServerState:
                             self._active_context_meta = {}
                             self._inject_active = False
 
-                    await loop.run_in_executor(None, _do_interrupt)
+                    await loop.run_in_executor(
+                        self._infer_executor, _do_interrupt
+                    )
                     await session.clear_output_audio()
                     clog.log("info", f"interrupt applied ({reason})")
                     try:
@@ -4444,8 +4569,8 @@ class ServerState:
                             )
                         return
                     # Most sampling and anti-collapse scalars are read on
-                    # every frame. Acoustic top-k is graph-shape-bound and
-                    # therefore uses an explicit paused recapture boundary.
+                    # every frame. Acoustic top-k is copied into the graph's
+                    # scalar input and applied by a fixed-shape rank mask.
                     # voice_prompt / text_prompt / seed are deliberately
                     # absent: they change conditioning or RNG state and
                     # cannot move mid-stream.
@@ -4557,7 +4682,8 @@ class ServerState:
                                         self._clear_vision_source("ambient")
 
                                 await loop.run_in_executor(
-                                    None, _clear_vision_feed_queue
+                                    self._infer_executor,
+                                    _clear_vision_feed_queue,
                                 )
                         if vision_ground_user_turns is not None:
                             self._vision_ground_user_turns = (
@@ -4578,7 +4704,8 @@ class ServerState:
                                         self._clear_vision_source("user_turn")
 
                                 await loop.run_in_executor(
-                                    None, _clear_turn_grounding_queue
+                                    self._infer_executor,
+                                    _clear_turn_grounding_queue,
                                 )
                         if vision_cost_limit is not None:
                             self._vision_cost_limit_usd = vision_cost_limit
@@ -4623,31 +4750,6 @@ class ServerState:
                         return
 
                     if updates or audio_temperature is not None or audio_top_k is not None:
-                        graph_reset = {"value": False}
-                        recapture_ms = {"value": 0.0}
-                        graph_generation: Optional[int] = None
-                        audio_top_k_changed = (
-                            audio_top_k is not None
-                            and audio_top_k != int(self.lm_gen.top_k)
-                        )
-                        if audio_top_k_changed:
-                            try:
-                                session.send_event(
-                                    "config_update",
-                                    "Applying acoustic sampler update",
-                                    "info",
-                                    {"applied": ["audio_topk"]},
-                                )
-                            except Exception as exc:
-                                logger.warning(
-                                    "audio top-k notify failed: %s: %s",
-                                    type(exc).__name__,
-                                    exc,
-                                )
-                            graph_generation = (
-                                await session.pause_and_flush_audio()
-                            )
-
                         def _apply_live_config():
                             # Mutate scalars under the inference lock so the
                             # assignment cannot tear a concurrent step() read
@@ -4659,38 +4761,29 @@ class ServerState:
                                     audio_temperature is not None
                                     or audio_top_k is not None
                                 ):
-                                    graph_reset["value"] = (
-                                        self.lm_gen.set_audio_sampling(
-                                            audio_temperature
-                                            if audio_temperature is not None
-                                            else self.lm_gen.temp,
-                                            audio_top_k
-                                            if audio_top_k is not None
-                                            else self.lm_gen.top_k,
-                                        )
+                                    self.lm_gen.set_audio_sampling(
+                                        audio_temperature
+                                        if audio_temperature is not None
+                                        else self.lm_gen.temp,
+                                        audio_top_k
+                                        if audio_top_k is not None
+                                        else self.lm_gen.top_k,
                                     )
-                                    if graph_reset["value"]:
-                                        recapture_started = time.monotonic()
-                                        self._recapture_depformer_graph_locked()
-                                        recapture_ms["value"] = (
-                                            time.monotonic() - recapture_started
-                                        ) * 1000.0
+                                if (
+                                    "repetition_penalty" in updates
+                                    or "repetition_penalty_context" in updates
+                                ):
+                                    # A disabled or differently-sized ring
+                                    # cannot safely be resumed later: its
+                                    # tokens may be arbitrarily stale and a
+                                    # wrapped ring's prefix is not the newest N.
+                                    self.lm_gen.reset_repetition_state()
                                 for attr, val in updates.items():
                                     setattr(self.lm_gen, attr, val)
 
-                        try:
-                            await loop.run_in_executor(
-                                None, _apply_live_config
-                            )
-                        finally:
-                            if graph_generation is not None:
-                                session.resume_audio(graph_generation)
-                        if graph_reset["value"]:
-                            clog.log(
-                                "info",
-                                "audio top-k changed; depformer graph "
-                                f"recaptured in {recapture_ms['value']:.0f} ms",
-                            )
+                        await loop.run_in_executor(
+                            self._infer_executor, _apply_live_config
+                        )
                     applied_snapshot = self._applied_config_snapshot()
                     applied_values = {
                         key: applied_snapshot[key]
@@ -4765,7 +4858,10 @@ class ServerState:
                             # a newer one already applied. Letting it through
                             # would roll the generation backward and silently
                             # drop every frame the client sends afterwards.
-                            if source_generation < self._vision_source_generation:
+                            if source_generation < self._vision_source_generation or (
+                                source_generation == self._vision_source_generation
+                                and mtype == "vision_source_started"
+                            ):
                                 return
                             self._vision_source_generation = source_generation
                             self._vision_source_active = (
@@ -4782,7 +4878,9 @@ class ServerState:
                             self._vision_pad_streak = 0
                             self._audio_silence_streak = 0
 
-                    await loop.run_in_executor(None, _reset_vision_source)
+                    await loop.run_in_executor(
+                        self._infer_executor, _reset_vision_source
+                    )
                     clog.log(
                         "info",
                         f"vision source {'started' if self._vision_source_active else 'stopped'} "
@@ -4910,22 +5008,46 @@ class ServerState:
                 snapshot_future = None
                 try:
                     await warmup_done.wait()
+                    next_delay = 60.0
                     while session.is_alive():
                         # Full-state copies hold the inference lock briefly
-                        # (~3 ms measured for the 1.6 GB LM+Mimi clone on a
-                        # Blackwell-class GPU). Operators on much slower
-                        # hardware can opt out with --no-periodic-snapshots.
-                        await asyncio.sleep(60.0)
+                        # after the initial allocation. Operators on lower-
+                        # headroom hardware can opt out with
+                        # --no-periodic-snapshots.
+                        await asyncio.sleep(next_delay)
+                        next_delay = 60.0
                         if not session.is_alive():
                             break
                         clog.log("info", "scheduling periodic session snapshot")
                         snapshot_future = asyncio.ensure_future(
                             loop.run_in_executor(
-                                None, self._take_snapshot, "periodic"
+                                self._infer_executor,
+                                self._take_snapshot,
+                                "periodic",
                             )
                         )
-                        snap = await asyncio.shield(snapshot_future)
-                        snapshot_future = None
+                        try:
+                            snap = await asyncio.shield(snapshot_future)
+                            snapshot_future = None
+                        except SnapshotDeferred:
+                            snapshot_future = None
+                            next_delay = 1.0
+                            clog.log(
+                                "info",
+                                "periodic snapshot deferred during context inject",
+                            )
+                            continue
+                        except Exception as exc:
+                            snapshot_future = None
+                            # A transient clone/OOM failure must not kill the
+                            # cadence permanently and age auto-rewind out.
+                            next_delay = 5.0
+                            clog.log(
+                                "warning",
+                                "periodic snapshot failed; retrying: "
+                                f"{type(exc).__name__}: {exc}",
+                            )
+                            continue
                         # Teardown can pop the bucket while the executor is
                         # cloning. setdefault here would resurrect a stale
                         # entry that lives forever.
@@ -5051,7 +5173,9 @@ class ServerState:
                         break
                     phase_started = time.monotonic()
                     in_flight = asyncio.ensure_future(
-                        loop.run_in_executor(None, phase_fn, *phase_args)
+                        loop.run_in_executor(
+                            self._infer_executor, phase_fn, *phase_args
+                        )
                     )
                     try:
                         await asyncio.shield(in_flight)
@@ -5068,7 +5192,20 @@ class ServerState:
                     )
                 if warmup_aborted:
                     return
-                self.mimi.reset_streaming()
+                reset_future = asyncio.ensure_future(
+                    loop.run_in_executor(
+                        self._infer_executor,
+                        self._reset_mimi_streaming_locked,
+                    )
+                )
+                try:
+                    await asyncio.shield(reset_future)
+                except asyncio.CancelledError:
+                    try:
+                        await reset_future
+                    except BaseException:
+                        pass
+                    raise
                 clog.log(
                     "info",
                     f"timing: system prompts {(time.monotonic() - t_sp) * 1000:.0f} ms",
@@ -5099,9 +5236,21 @@ class ServerState:
             # manual Rewind remains available without periodic snapshots.
             if not resuming:
                 try:
-                    baseline = await loop.run_in_executor(
-                        None, self._take_snapshot, "baseline"
+                    baseline_future = asyncio.ensure_future(
+                        loop.run_in_executor(
+                            self._infer_executor,
+                            self._take_snapshot,
+                            "baseline",
+                        )
                     )
+                    try:
+                        baseline = await asyncio.shield(baseline_future)
+                    except asyncio.CancelledError:
+                        try:
+                            await baseline_future
+                        except BaseException:
+                            pass
+                        raise
                     self._session_snapshots.setdefault(session_id, []).append(
                         (time.monotonic(), baseline)
                     )
@@ -5146,7 +5295,25 @@ class ServerState:
                         # the executor, so the loop never blocks on disk.
                         try:
                             if _rec.feed(frame):
-                                _loop.run_in_executor(None, _rec.spill)
+                                spill_future = _loop.run_in_executor(
+                                    None, _rec.spill
+                                )
+                                recording_spill_tasks.add(spill_future)
+
+                                def _spill_done(done: asyncio.Future) -> None:
+                                    recording_spill_tasks.discard(done)
+                                    if done.cancelled():
+                                        return
+                                    try:
+                                        done.result()
+                                    except Exception as exc:
+                                        logger.warning(
+                                            "recording spill failed: %s: %s",
+                                            type(exc).__name__,
+                                            exc,
+                                        )
+
+                                spill_future.add_done_callback(_spill_done)
                         except Exception as exc:
                             logger.warning(
                                 "recording capture failed: %s: %s",
@@ -5309,6 +5476,22 @@ class ServerState:
             except Exception:
                 pass
         finally:
+            # Freeze and drain audio/control work before inspecting resident
+            # state for a resume grant. Transport close only sets the session
+            # event; an already-buffered process frame or active executor-backed
+            # control command can otherwise keep mutating LM/Mimi while the
+            # grant is being recorded (and while recording I/O is finalized).
+            state_frozen = False
+            try:
+                await session.stop_processing()
+                state_frozen = True
+            except Exception as exc:
+                server_ended = True
+                clog.log(
+                    "error",
+                    "failed to drain model work during teardown: "
+                    f"{type(exc).__name__}: {exc}",
+                )
             if session_id is not None:
                 # Bounded resume window: an unexpected transport death (not
                 # a server-initiated end, not an internal error) leaves the
@@ -5317,6 +5500,7 @@ class ServerState:
                 # session start discards it; redemption consumes it.
                 if (
                     went_live
+                    and state_frozen
                     and not server_ended
                     and not client_ended
                     and session.close_reason is None
@@ -5331,6 +5515,7 @@ class ServerState:
                                 - (time.monotonic() - session_started_at)
                             ),
                         )
+                    self._clear_resume_grant()
                     self._resume_grant = {
                         "session_id": session_id,
                         "deadline": time.monotonic() + RESUME_GRANT_WINDOW_SEC,
@@ -5350,6 +5535,7 @@ class ServerState:
                     # so nothing touched the model state: put the grant
                     # back, re-keyed to the id this client now knows, for
                     # another attempt within the original deadline.
+                    self._clear_resume_grant()
                     self._resume_grant = {**resume_state, "session_id": session_id}
                     self._schedule_resume_grant_expiry(self._resume_grant)
                 else:
@@ -5417,6 +5603,15 @@ class ServerState:
             self._session_recorder = None
             if recorder is not None:
                 try:
+                    # Stop accepting frames before waiting for every spill;
+                    # otherwise finalize can race a late feed/write and omit a
+                    # part that has not reached _spill_parts yet.
+                    session.set_pcm_observer(None)
+                    if recording_spill_tasks:
+                        await asyncio.gather(
+                            *tuple(recording_spill_tasks),
+                            return_exceptions=True,
+                        )
                     finalize_loop = asyncio.get_event_loop()
                     written = await finalize_loop.run_in_executor(
                         None, recorder.finalize
@@ -5469,7 +5664,11 @@ class ServerState:
                 clog.log("info", "session closed, lock released")
 
 
-def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Optional[str]:
+def _get_voice_prompt_dir(
+    voice_prompt_dir: Optional[str],
+    hf_repo: str,
+    hf_revision: Optional[str] = None,
+) -> Optional[str]:
     """
     If voice_prompt_dir is None:
       - try to download voices.tgz from HF
@@ -5504,7 +5703,12 @@ def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Opti
 
     # Try to download voices.tgz, but it's optional
     try:
-        voices_tgz = hf_hub_download(hf_repo, "voices.tgz", token=hf_token)
+        voices_tgz = hf_hub_download(
+            hf_repo,
+            "voices.tgz",
+            token=hf_token,
+            revision=hf_revision,
+        )
         voices_tgz = Path(voices_tgz)
         voices_dir = voices_tgz.parent / "voices"
 
@@ -5578,8 +5782,9 @@ def main():
         help=(
             "Clone live model state once per minute so auto-rewind and manual "
             "Rewind restore a recent state instead of the session-start "
-            "baseline. A full capture (LM + Mimi + RNG, ~1.6 GB) measures "
-            "~3 ms on a modern GPU, well inside one 80 ms frame budget. "
+            "baseline. The first ~1.6 GB snapshot allocation occurs before "
+            "the session becomes ready; later captures usually fit inside "
+            "one 80 ms frame on a modern GPU. "
             "--no-periodic-snapshots restores the capture-free behavior."
         ),
     )
@@ -5593,6 +5798,15 @@ def main():
     parser.add_argument("--hf-repo", type=str, default=loaders.DEFAULT_REPO,
                         help="HF repo to look into, defaults PersonaPlex. "
                              "Use this to select a different pre-trained model.")
+    parser.add_argument(
+        "--hf-revision",
+        type=str,
+        default=None,
+        help=(
+            "Optional immutable Hugging Face revision for model, tokenizer, "
+            "and voice assets. The RunPod launcher pins the tested revision."
+        ),
+    )
     parser.add_argument("--device", type=str, default="cuda", help="Device on which to run, defaults to 'cuda'.")
     parser.add_argument("--cpu-offload", action="store_true",
                         help="Offload LM model layers to CPU when GPU memory is insufficient. "
@@ -5669,9 +5883,12 @@ def main():
     )
 
     args = parser.parse_args()
+    if args.hf_revision:
+        logger.info("Hugging Face revision pinned to %s", args.hf_revision)
     args.voice_prompt_dir = _get_voice_prompt_dir(
         args.voice_prompt_dir,
         args.hf_repo,
+        args.hf_revision,
     )
     if args.voice_prompt_dir is not None:
         assert os.path.exists(args.voice_prompt_dir), \
@@ -5766,18 +5983,33 @@ def main():
     
     logger.info("loading mimi")
     if args.mimi_weight is None:
-        args.mimi_weight = hf_hub_download(args.hf_repo, loaders.MIMI_NAME, token=hf_token)
+        args.mimi_weight = hf_hub_download(
+            args.hf_repo,
+            loaders.MIMI_NAME,
+            token=hf_token,
+            revision=args.hf_revision,
+        )
     t = time.monotonic()
     mimi = loaders.get_mimi(args.mimi_weight, args.device)
     logger.info("mimi loaded in %.1f s", time.monotonic() - t)
 
     if args.tokenizer is None:
-        args.tokenizer = hf_hub_download(args.hf_repo, loaders.TEXT_TOKENIZER_NAME, token=hf_token)
+        args.tokenizer = hf_hub_download(
+            args.hf_repo,
+            loaders.TEXT_TOKENIZER_NAME,
+            token=hf_token,
+            revision=args.hf_revision,
+        )
     text_tokenizer = sentencepiece.SentencePieceProcessor(args.tokenizer)  # type: ignore
 
     logger.info("loading moshi")
     if args.moshi_weight is None:
-        args.moshi_weight = hf_hub_download(args.hf_repo, loaders.MOSHI_NAME, token=hf_token)
+        args.moshi_weight = hf_hub_download(
+            args.hf_repo,
+            loaders.MOSHI_NAME,
+            token=hf_token,
+            revision=args.hf_revision,
+        )
     t = time.monotonic()
     lm = loaders.get_moshi_lm(args.moshi_weight, device=args.device, cpu_offload=args.cpu_offload)
     lm.eval()
@@ -5831,7 +6063,10 @@ def main():
     )
     logger.info("warming up the model")
     t = time.monotonic()
-    state.warmup()
+    # Warm the same persistent host thread that will submit every live CUDA
+    # operation; warming the main thread does not initialize worker-local
+    # cuBLAS/CUDA state.
+    state._infer_executor.submit(state.warmup).result()
     logger.info("warmup complete in %.1f s", time.monotonic() - t)
     logger.info(
         "vision: %s",
@@ -5934,9 +6169,25 @@ def main():
     app.on_startup.append(_install_aioice_noise_filter)
 
     async def _close_http_session(_app):
-        """Close the lazily-created Gemini HTTP client on shutdown so
-        aiohttp doesn't emit ResourceWarning at process exit. Also stops the
-        ASR worker pool when the optional recognizer is loaded."""
+        """Drain live sessions before shutting down shared worker resources."""
+        sessions = set(state._candidate_sessions.values())
+        if state._active_session is not None:
+            sessions.add(state._active_session)
+        if sessions:
+            await asyncio.gather(
+                *(session.close() for session in sessions),
+                return_exceptions=True,
+            )
+        session_tasks = tuple(state._session_tasks)
+        if session_tasks:
+            # Each runner owns and releases the single-session lock in its
+            # finally block. Let those blocks finish before the executor they
+            # use for snapshots, model drains, and teardown disappears.
+            await asyncio.gather(*session_tasks, return_exceptions=True)
+
+        # Close the lazily-created Gemini HTTP client so aiohttp does not emit
+        # ResourceWarning at process exit. The session runners have already
+        # cancelled/drained their vision calls above.
         sess = getattr(state, "_http_session", None)
         if sess is not None and not sess.closed:
             try:
@@ -5949,6 +6200,7 @@ def main():
                 )
         if state.asr is not None:
             state.asr.shutdown()
+        await asyncio.to_thread(state._infer_executor.shutdown, True)
     app.on_cleanup.append(_close_http_session)
 
     web.run_app(app, host=args.host, port=args.port, ssl_context=ssl_context)

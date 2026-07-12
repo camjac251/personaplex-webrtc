@@ -8,12 +8,15 @@ RunPod single-template deployment of NVIDIA PersonaPlex (a Moshi finetune) over 
 
 - `uv sync --frozen` - install deps.
 - `uv run moshi-server --host 127.0.0.1 --port 8998 --static none --voice-prompt-dir voices` - run locally.
-- `ruff check moshi/server.py moshi/rtc_session.py moshi/models/lm.py` - lint after Python edits.
+- `uvx ruff check moshi/moshi/server.py moshi/moshi/rtc_session.py moshi/moshi/models/lm.py` - lint after Python edits.
 - `bun run frontend:build` - build the dashboard from `frontend/` into `moshi/moshi/web_client` (the lefthook pre-commit hook runs this and stages `web_client` on every commit).
 - `bunx biome check frontend/src` - lint the dashboard after JS edits.
 - `uv run python moshi/tests/test_rtc_resampler.py` - resampler smoke test.
 - `uv run python moshi/tests/test_session_config.py` - SessionConfig clamp tests.
 - `uv run python moshi/tests/test_vision_chunk.py` - vision chunk reassembly tests.
+- `uv run python moshi/tests/test_rtc_pipeline.py` - control ordering, teardown, and audio pipeline tests.
+- `uv run python moshi/tests/test_lm_controls.py` - sampling and anti-collapse tests.
+- `uv run python moshi/tests/test_cuda_dynamic_topk.py` - optional CUDA graph/top-k smoke test.
 
 ## Key files
 
@@ -26,10 +29,11 @@ RunPod single-template deployment of NVIDIA PersonaPlex (a Moshi finetune) over 
 ## Architecture invariants
 
 - `ServerState.lock` (asyncio.Lock) gates the single live session. Second connect returns HTTP 409.
-- `ServerState._infer_lock` (threading.Lock) guards `lm_gen` state. Event-loop mutations dispatch to executor first; never sync-acquire from a coroutine.
-- Inference and warmup run via `loop.run_in_executor`. Inline GPU work starves aiortc keepalives.
+- `ServerState._infer_lock` (threading.Lock) guards `lm_gen` state. Event-loop mutations dispatch to `ServerState._infer_executor` first; never sync-acquire from a coroutine.
+- All model work, including startup warmup, stays on the one persistent `_infer_executor` worker. Arbitrary default-pool CUDA workers pay multi-second cold-context costs; inline GPU work starves aiortc keepalives.
 - Vision inject drips one token per outer frame, only when `_vision_pad_streak >= LIVE_PROMPT_BOUNDARY_STREAK`. Outbound PCM zeroed during inject. Cap at `LIVE_PROMPT_MAX_STEPS`.
-- Auto-rewind: `_pad_force_remaining` tripping `COLLAPSE_TRIGGER_THRESHOLD` times in `COLLAPSE_WINDOW_SEC` restores the latest snapshot via `set_streaming_state_inplace`. Always pass `dict(state_dict)` so subsequent rewinds still find the keys. It only accepts snapshots younger than `AUTO_REWIND_SNAPSHOT_MAX_AGE_SEC` (90 s), so it depends on periodic snapshots (60 s cadence, ~3 ms capture, on by default; `--no-periodic-snapshots` disables and leaves only the session-start baseline).
+- Auto-rewind: `_pad_force_remaining` tripping `COLLAPSE_TRIGGER_THRESHOLD` times in `COLLAPSE_WINDOW_SEC` restores the latest snapshot via `set_streaming_state_inplace`. Always pass `dict(state_dict)` so subsequent rewinds still find the keys. It only accepts snapshots younger than `AUTO_REWIND_SNAPSHOT_MAX_AGE_SEC` (90 s), so it depends on periodic snapshots (60 s cadence, on by default; `--no-periodic-snapshots` disables and leaves only the session-start baseline). Snapshot capture defers while a context drip is active.
+- Audio top-k is a scalar CUDA tensor consumed by a fixed-cardinality masked sampler. Live tuning must never reset or recapture the depformer CUDA graph.
 - Anti-collapse slider defaults: `padding_bonus=0.0` (off; the PAD boost competes with EPAD at response onset and truncates turns), `max_turn_text_tokens=120`, `repetition_penalty=1.15`. The repetition ring is turn-scoped: it clears after `REPETITION_TURN_BREAK_FRAMES` (12) natural PAD/EPAD frames so the penalty acts within a turn only. Max-turn-cap forced PADs freeze that streak instead of advancing it — counting them would wipe the ring right after every cap trip. Verify `buildConfigPayload()` is sending the expected values before debugging "model rambling" symptoms.
 - `torch.cuda.empty_cache()` in `_run_rtc_session.finally`. Model weights and KV cache buffer stay resident across sessions.
 - Transport recovery is fresh-pc resume, not ICE restart (aiortc can't restart a live transport): unexpected transport death records a 25 s `_resume_grant`; a new offer with `resume_session_id` skips reset/warmup and continues from resident state. Server-initiated ends (`send_end`) and client `goodbye` must NOT record a grant.

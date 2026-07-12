@@ -84,6 +84,34 @@ def sample_top_k(probs: torch.Tensor, k: int) -> torch.Tensor:
     return next_token
 
 
+def sample_top_k_dynamic(
+    probs: torch.Tensor, k: torch.Tensor
+) -> torch.Tensor:
+    """Top-k sampling whose tensor shapes do not change with ``k``.
+
+    ``torch.topk`` captures its Python ``k`` in a CUDA graph because that
+    value controls output shape. Sorting the fixed-size vocabulary and
+    masking ranks at runtime lets one captured graph safely serve live top-k
+    updates. A non-positive k means the full vocabulary.
+    """
+    card = probs.shape[-1]
+    sorted_probs, indices = torch.topk(probs, card, dim=-1)
+    bounded_k = k.to(device=probs.device, dtype=torch.long).clamp(0, card)
+    bounded_k = torch.where(
+        bounded_k > 0,
+        bounded_k,
+        torch.full_like(bounded_k, card),
+    )
+    bounded_k = bounded_k.reshape(*bounded_k.shape, 1)
+    ranks = torch.arange(
+        card, device=probs.device, dtype=torch.long
+    ).reshape(*([1] * (probs.ndim - 1)), card)
+    keep = ranks < bounded_k
+    sorted_probs = sorted_probs * keep.to(dtype=sorted_probs.dtype)
+    next_token = multinomial(sorted_probs, num_samples=1)
+    return indices.gather(-1, next_token)
+
+
 def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
     """Sample next token from top P probabilities along the last dimension of the input probs tensor.
 

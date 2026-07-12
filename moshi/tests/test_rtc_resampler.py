@@ -21,6 +21,7 @@ from moshi.rtc_session import (  # noqa: E402
     MIMI_SAMPLE_RATE,
     OUTBOUND_DRAIN_BACKLOG_SAMPLES,
     OUTBOUND_FRAME_SAMPLES,
+    OUTBOUND_STANDING_BACKLOG_MIN_SAMPLES,
     WEBRTC_SAMPLE_RATE,
     MimiOutputTrack,
     _f32_to_s16,
@@ -176,12 +177,12 @@ def test_output_track_rebases_after_scheduler_stall() -> None:
     ), f"RTP timestamp spacing changed after pacing rebase: {pts}"
 
 
-def test_output_track_drains_backlog_after_stall() -> None:
-    """Audio stranded in the buffer by a stall must drain faster than 1x.
+def test_output_track_drops_stale_backlog_after_stall() -> None:
+    """Audio stranded by a stall is dropped at a stable RTP cadence.
 
-    Production and pacing both advance at real time, so without a drain
-    path a stall's backlog becomes permanent added speech latency until
-    the buffer cap silently chops the oldest samples.
+    Sending packets faster does not speed up receiver playout because RTP
+    timestamps still advance at 20 ms. The sender must discard stale PCM and
+    then resume ordinary pacing.
     """
     track = MimiOutputTrack()
     # 480 ms of audio resamples to ~24 outbound frames: three times the
@@ -189,6 +190,10 @@ def test_output_track_drains_backlog_after_stall() -> None:
     sine_24k = _sine_wave_f32(1000.0, 0.48, MIMI_SAMPLE_RATE)
 
     async def run() -> tuple[float, list[int], int]:
+        # Establish the sender clock, then simulate a scheduler/network stall
+        # while decoded speech accumulates.
+        await track.recv()
+        await asyncio.sleep(0.25)
         await track.push_24k_f32(sine_24k)
         started_at = time.perf_counter()
         pts: list[int] = []
@@ -206,15 +211,12 @@ def test_output_track_drains_backlog_after_stall() -> None:
         f"  twenty frames with 480 ms backlog: {elapsed * 1000:.1f} ms, "
         f"{remaining} samples still queued"
     )
-    # Plain 1x pacing takes ~400 ms for 20 frames. Draining the above-
-    # threshold portion at 2x lands the run near 230 ms; a burst would
-    # finish in well under 100 ms.
-    assert elapsed <= 0.33, (
-        f"backlog did not drain faster than real time: {elapsed * 1000:.1f} ms"
+    # First frame after the rebase is immediate, then 19 frames keep 20 ms
+    # pacing. Most stale content was discarded, not burst into a jitter buffer.
+    assert 0.33 <= elapsed <= 0.48, (
+        f"sender did not resume stable pacing: {elapsed * 1000:.1f} ms"
     )
-    assert elapsed >= 0.15, (
-        f"backlog drained as an unpaced burst: {elapsed * 1000:.1f} ms"
-    )
+    assert remaining < OUTBOUND_FRAME_SAMPLES, remaining
     assert all(
         later - earlier == OUTBOUND_FRAME_SAMPLES
         for earlier, later in zip(pts, pts[1:])
@@ -273,7 +275,7 @@ def test_output_track_sheds_standing_subthreshold_backlog() -> None:
         f"  standing 60 ms residue: early floor {early_floor}, "
         f"early peak {early_peak}, final floor {final_floor} samples"
     )
-    assert early_floor >= OUTBOUND_FRAME_SAMPLES, (
+    assert early_floor >= OUTBOUND_STANDING_BACKLOG_MIN_SAMPLES, (
         "test setup failed to create a standing backlog: "
         f"early floor {early_floor}"
     )
@@ -300,8 +302,8 @@ if __name__ == "__main__":
     print("test_output_track_rebases_after_scheduler_stall ...")
     test_output_track_rebases_after_scheduler_stall()
     print("  ok")
-    print("test_output_track_drains_backlog_after_stall ...")
-    test_output_track_drains_backlog_after_stall()
+    print("test_output_track_drops_stale_backlog_after_stall ...")
+    test_output_track_drops_stale_backlog_after_stall()
     print("  ok")
     print("test_output_track_sheds_standing_subthreshold_backlog ...")
     test_output_track_sheds_standing_subthreshold_backlog()
