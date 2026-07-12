@@ -623,17 +623,17 @@ class SessionConfig:
     # for the session like the rest of the persona block.
     reinforce_in_silences: bool = False
     seed: Optional[int] = None
-    audio_temperature: float = 0.7
+    audio_temperature: float = 0.8
     text_temperature: float = 0.7
     text_topk: int = 25
     audio_topk: int = 250
-    repetition_penalty: float = 1.15
+    repetition_penalty: float = 1.0
     repetition_penalty_context: int = 64
     # Keep these aligned with the embedded client's advanced slider defaults.
     # Padding bonus defaults off: it taxes response onset every frame (PAD
     # competes directly with EPAD at the moment the model would start
-    # speaking) and truncates turns mid-thought. The turn-scoped repetition
-    # penalty plus the max-turn cap carry the anti-collapse duty.
+    # speaking) and truncates turns mid-thought. The max-turn cap remains a
+    # circuit breaker; repetition penalty is available as an opt-in fallback.
     padding_bonus: float = 0.0
     max_turn_text_tokens: int = 120
     # Session length cap in seconds; 0 disables the watchdog (no time bound).

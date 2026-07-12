@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-RunPod single-template deployment of NVIDIA PersonaPlex (a Moshi finetune) over WebRTC, with an optional vision side and a snapshot/rewind safety net. Single-session by design.
+RunPod single-template deployment of PersonaPlex over WebRTC, defaulting to Kyutai's interactivity-aligned RL checkpoint with an NVIDIA-base rollback, optional vision, and snapshot/rewind safety. Single-session by design.
 
 ## Commands
 
@@ -34,7 +34,8 @@ RunPod single-template deployment of NVIDIA PersonaPlex (a Moshi finetune) over 
 - Vision inject drips one token per outer frame, only when `_vision_pad_streak >= LIVE_PROMPT_BOUNDARY_STREAK`. Outbound PCM zeroed during inject. Cap at `LIVE_PROMPT_MAX_STEPS`.
 - Auto-rewind: `_pad_force_remaining` tripping `COLLAPSE_TRIGGER_THRESHOLD` times in `COLLAPSE_WINDOW_SEC` restores the latest snapshot via `set_streaming_state_inplace`. Always pass `dict(state_dict)` so subsequent rewinds still find the keys. It only accepts snapshots younger than `AUTO_REWIND_SNAPSHOT_MAX_AGE_SEC` (90 s), so it depends on periodic snapshots (60 s cadence, on by default; `--no-periodic-snapshots` disables and leaves only the session-start baseline). Snapshot capture defers while a context drip is active.
 - Audio top-k is a scalar CUDA tensor consumed by a fixed-cardinality masked sampler. Live tuning must never reset or recapture the depformer CUDA graph.
-- Anti-collapse slider defaults: `padding_bonus=0.0` (off; the PAD boost competes with EPAD at response onset and truncates turns), `max_turn_text_tokens=120`, `repetition_penalty=1.15`. The repetition ring is turn-scoped: it clears after `REPETITION_TURN_BREAK_FRAMES` (12) natural PAD/EPAD frames so the penalty acts within a turn only. Max-turn-cap forced PADs freeze that streak instead of advancing it — counting them would wipe the ring right after every cap trip. Verify `buildConfigPayload()` is sending the expected values before debugging "model rambling" symptoms.
+- The default checkpoint is `kyutai/personaplex-rl-seamless` at its pinned revision; `PERSONAPLEX_MODEL=base` selects the pinned NVIDIA rollback. Repository and revision are one startup-time identity and voice markers include both.
+- Native-duplex defaults: `audio_temperature=0.8`, `padding_bonus=0.0`, `repetition_penalty=1.0`, `max_turn_text_tokens=120`. Native mode never turns client-detected overlap into an automatic interrupt; Assisted mode does. The max-turn cap and auto-rewind remain circuit breakers. The repetition ring is turn-scoped and clears after `REPETITION_TURN_BREAK_FRAMES` natural PAD/EPAD frames.
 - `torch.cuda.empty_cache()` in `_run_rtc_session.finally`. Model weights and KV cache buffer stay resident across sessions.
 - Transport recovery is fresh-pc resume, not ICE restart (aiortc can't restart a live transport): unexpected transport death records a 25 s `_resume_grant`; a new offer with `resume_session_id` skips reset/warmup and continues from resident state. Server-initiated ends (`send_end`) and client `goodbye` must NOT record a grant.
 - Oversized vision frames travel as `vision_frame_chunk` sequences (48 KB chunks under the 64 KB SCTP message cap) reassembled server-side into the normal `vision_frame` path.

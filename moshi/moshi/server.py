@@ -36,7 +36,6 @@ import random
 import re
 import os
 from pathlib import Path
-import tarfile
 import secrets
 import sys
 import threading
@@ -74,12 +73,52 @@ from .rtc_session import (
     clamp_vision_cost_limit_usd,
     reassemble_vision_chunk,
 )
+from .utils.assets import safe_extract_tar
 from .utils.connection import create_ssl_context, get_lan_ip
 from .utils.logging import setup_logger, ColorizedLog
 
 
 logger = setup_logger(__name__)
 DeviceString = Literal["cuda"] | Literal["cpu"] #| Literal["mps"]
+
+RL_HF_REPO = loaders.DEFAULT_REPO
+RL_HF_REVISION = loaders.DEFAULT_REVISION
+BASE_HF_REPO = loaders.BASE_REPO
+BASE_HF_REVISION = loaders.BASE_REVISION
+
+
+def _model_identity(repo: str, revision: Optional[str]) -> dict[str, object]:
+    """Stable checkpoint metadata exposed to the dashboard."""
+    revision_label = revision or "main"
+    if repo == RL_HF_REPO:
+        label = "PersonaPlex RL · Seamless"
+        variant = "rl-seamless"
+        license_name = "CC BY-NC 4.0 + NVIDIA OML"
+        native_duplex = True
+    elif repo == BASE_HF_REPO:
+        label = "PersonaPlex 7B · Base"
+        variant = "base"
+        license_name = "NVIDIA OML"
+        native_duplex = False
+    else:
+        label = repo.rsplit("/", 1)[-1] or repo
+        variant = "custom"
+        license_name = "See model card"
+        native_duplex = False
+    if repo.startswith("local:"):
+        label = f"Local · {repo.removeprefix('local:')}"
+        variant = "local"
+        license_name = "See checkpoint documentation"
+        native_duplex = False
+        revision_label = "local file"
+    return {
+        "model_repo": repo,
+        "model_revision": revision_label,
+        "model_label": label,
+        "model_variant": variant,
+        "model_license": license_name,
+        "native_duplex_recommended": native_duplex,
+    }
 
 def torch_auto_device(requested: Optional[DeviceString] = None) -> torch.device:
     """Return a torch.device based on the requested string or availability."""
@@ -908,6 +947,8 @@ class ServerState:
                  preview_cache_dir: str | None = None,
                  asr: "Optional[_AsrEngine]" = None,
                  periodic_snapshots: bool = True,
+                 model_repo: str = RL_HF_REPO,
+                 model_revision: str | None = RL_HF_REVISION,
                  save_voice_prompt_embeddings: bool = False):
         self.mimi = mimi
         self.lm_gen = lm_gen
@@ -924,6 +965,7 @@ class ServerState:
         self.record_sessions = record_sessions
         self.recordings_dir = recordings_dir
         self.periodic_snapshots = periodic_snapshots
+        self.model_identity = _model_identity(model_repo, model_revision)
         # Optional user-speech recognizer (second model). None unless the
         # operator passed --enable-asr and faster-whisper imported. When
         # None the server transcribes nothing on the user side and the
@@ -3571,6 +3613,18 @@ class ServerState:
         catalog = await loop.run_in_executor(None, self._read_voice_catalog)
         return web.json_response({"voices": catalog})
 
+    async def handle_server_info(self, _request):
+        """Report immutable process identity before a session connects."""
+        return web.json_response(
+            {
+                **self.model_identity,
+                "gpu_name": self.gpu_name,
+                "vram_total": self.vram_total,
+                "server_build": self.server_build,
+                "vision_available": bool(self._gemini_api_key),
+            }
+        )
+
     async def _fetch_ice_servers(self) -> tuple[list[dict], bool]:
         """Return ``(iceServers, turn_failed)`` for the current session.
 
@@ -5345,6 +5399,7 @@ class ServerState:
                         )
 
             identity = {
+                **self.model_identity,
                 "gpu_name": self.gpu_name,
                 "vram_total": self.vram_total,
                 "server_build": self.server_build,
@@ -5714,14 +5769,12 @@ def _get_voice_prompt_dir(
 
         if not voices_dir.exists():
             logger.info(f"extracting {voices_tgz} to {voices_tgz.parent}")
-            with tarfile.open(voices_tgz, "r:gz") as tar:
-                tar.extractall(path=voices_tgz.parent)
+            safe_extract_tar(voices_tgz, voices_tgz.parent)
 
         resolved_dir = _resolve_voice_dir(voices_dir)
         if resolved_dir is None:
             logger.info("voices directory exists but no .pt files found; re-extracting")
-            with tarfile.open(voices_tgz, "r:gz") as tar:
-                tar.extractall(path=voices_tgz.parent)
+            safe_extract_tar(voices_tgz, voices_tgz.parent)
             resolved_dir = _resolve_voice_dir(voices_dir)
 
         if resolved_dir is None:
@@ -5795,16 +5848,23 @@ def main():
     parser.add_argument("--tokenizer", type=str, help="Path to a local tokenizer file.")
     parser.add_argument("--moshi-weight", type=str, help="Path to a local checkpoint file for Moshi.")
     parser.add_argument("--mimi-weight", type=str, help="Path to a local checkpoint file for Mimi.")
-    parser.add_argument("--hf-repo", type=str, default=loaders.DEFAULT_REPO,
-                        help="HF repo to look into, defaults PersonaPlex. "
-                             "Use this to select a different pre-trained model.")
+    parser.add_argument(
+        "--hf-repo",
+        type=str,
+        default=RL_HF_REPO,
+        help=(
+            "Hugging Face model repository. Defaults to the interactivity-"
+            "aligned PersonaPlex RL checkpoint."
+        ),
+    )
     parser.add_argument(
         "--hf-revision",
         type=str,
         default=None,
         help=(
-            "Optional immutable Hugging Face revision for model, tokenizer, "
-            "and voice assets. The RunPod launcher pins the tested revision."
+            "Immutable Hugging Face revision for model, tokenizer, and voice "
+            "assets. Known PersonaPlex repos are pinned automatically; custom "
+            "repositories require this option."
         ),
     )
     parser.add_argument("--device", type=str, default="cuda", help="Device on which to run, defaults to 'cuda'.")
@@ -5883,8 +5943,20 @@ def main():
     )
 
     args = parser.parse_args()
+    local_moshi_weight = args.moshi_weight
+    if args.hf_revision is None:
+        if args.hf_repo == RL_HF_REPO:
+            args.hf_revision = RL_HF_REVISION
+        elif args.hf_repo == BASE_HF_REPO:
+            args.hf_revision = BASE_HF_REVISION
+        else:
+            parser.error("custom --hf-repo requires --hf-revision")
     if args.hf_revision:
-        logger.info("Hugging Face revision pinned to %s", args.hf_revision)
+        logger.info(
+            "Hugging Face model pinned to %s@%s",
+            args.hf_repo,
+            args.hf_revision,
+        )
     args.voice_prompt_dir = _get_voice_prompt_dir(
         args.voice_prompt_dir,
         args.hf_repo,
@@ -6059,6 +6131,12 @@ def main():
         preview_cache_dir=preview_cache_dir,
         asr=asr_engine,
         periodic_snapshots=args.periodic_snapshots,
+        model_repo=(
+            f"local:{Path(local_moshi_weight).name}"
+            if local_moshi_weight is not None
+            else args.hf_repo
+        ),
+        model_revision=None if local_moshi_weight is not None else args.hf_revision,
         save_voice_prompt_embeddings=False
     )
     logger.info("warming up the model")
@@ -6102,6 +6180,7 @@ def main():
     app.router.add_post("/api/voice-upload", state.handle_voice_upload)
     app.router.add_post("/api/voice-preview", state.handle_voice_preview)
     app.router.add_get("/api/recording/{session_id}", state.handle_recording_download)
+    app.router.add_get("/api/info", state.handle_server_info)
     app.router.add_get("/voices", state.handle_voices)
 
     async def handle_favicon(_):

@@ -68,49 +68,29 @@ fi
 
 cd "$REPO_DIR"
 
+# shellcheck source=docker/model-env.sh
+source "$REPO_DIR/docker/model-env.sh"
+personaplex_resolve_model
+HF_REPO="$PERSONAPLEX_SELECTED_HF_REPO"
+HF_REVISION="$PERSONAPLEX_SELECTED_HF_REVISION"
+
 log "resolving venv at $UV_PROJECT_ENVIRONMENT"
 uv sync --frozen
 
-if [ ! -d "$REPO_DIR/voices" ]; then
-    log "fetching voice prompts from Hugging Face (one-time, ~16 GB)"
-    uv run --frozen python - <<'PY'
-import os
-import tarfile
-from pathlib import Path
-
-from huggingface_hub import hf_hub_download
-
-archive = hf_hub_download(
-    "nvidia/personaplex-7b-v1",
-    "voices.tgz",
-    token=os.environ.get("HF_TOKEN"),
+asset_args=(
+    --voice-dir "$REPO_DIR/voices"
+    --repo "$HF_REPO"
+    --revision "$HF_REVISION"
 )
-target = Path.cwd() / "voices"
-target.mkdir(exist_ok=True)
-with tarfile.open(archive, "r:gz") as tf:
-    tf.extractall(path=target)
-print(f"voices ready at {target}")
-PY
+if [ "${PERSONAPLEX_FETCH_VOICES:-1}" = "0" ]; then
+    asset_args+=(--skip-voices)
 fi
-
-if [ "${PERSONAPLEX_PREFETCH_MODEL:-1}" != "0" ]; then
-    # Pre-fetch the PersonaPlex model weights so the first connection is instant.
-    # voices.tgz is handled above, so keep it out of the model snapshot cache.
-    log "pre-fetching personaplex model weights (~7GB)..."
-    HF_HUB_DISABLE_PROGRESS_BARS=1 uv run --frozen python - <<'PY'
-import os
-
-from huggingface_hub import snapshot_download
-
-snapshot_download(
-    "nvidia/personaplex-7b-v1",
-    token=os.environ.get("HF_TOKEN"),
-    ignore_patterns=["voices.tgz"],
-)
-PY
-else
-    log "skipping model prefetch because PERSONAPLEX_PREFETCH_MODEL=0"
+if [ "${PERSONAPLEX_PREFETCH_MODEL:-1}" = "0" ]; then
+    asset_args+=(--skip-model)
 fi
+log "model: $HF_REPO@$HF_REVISION"
+HF_HUB_DISABLE_PROGRESS_BARS=1 uv run --frozen python \
+    docker/prefetch_assets.py "${asset_args[@]}"
 
 if [ -z "${GEMINI_API_KEY:-}" ]; then
     log "WARN: GEMINI_API_KEY is not set. Vision features will be disabled."
@@ -120,4 +100,6 @@ log "starting moshi-server on :8998"
 exec uv run --frozen moshi-server \
     --host 0.0.0.0 \
     --port 8998 \
+    --hf-repo "$HF_REPO" \
+    --hf-revision "$HF_REVISION" \
     --voice-prompt-dir voices

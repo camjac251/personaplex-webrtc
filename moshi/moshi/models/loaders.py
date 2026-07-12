@@ -29,12 +29,12 @@ import logging
 from safetensors.torch import load_model, load_file
 import torch
 
-logger = logging.getLogger(__name__)
-
 from .compression import MimiModel
 from .lm import LMModel
 from ..modules import SEANetEncoder, SEANetDecoder, transformer
 from ..quantization import SplitResidualVectorQuantizer
+
+logger = logging.getLogger(__name__)
 
 SAMPLE_RATE = 24000
 FRAME_RATE = 12.5
@@ -42,7 +42,10 @@ FRAME_RATE = 12.5
 TEXT_TOKENIZER_NAME = 'tokenizer_spm_32k_3.model'
 MOSHI_NAME = 'model.safetensors'
 MIMI_NAME = 'tokenizer-e351c8d8-checkpoint125.safetensors'
-DEFAULT_REPO = 'nvidia/personaplex-7b-v1'
+DEFAULT_REPO = 'kyutai/personaplex-rl-seamless'
+DEFAULT_REVISION = '3fa800309a4b743a8a6d764253eb45def0334afc'
+BASE_REPO = 'nvidia/personaplex-7b-v1'
+BASE_REVISION = 'fdaf4090a61cb315c138a1faee287ffd6c716309f'
 
 
 _seanet_kwargs = {

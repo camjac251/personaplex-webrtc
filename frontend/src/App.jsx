@@ -52,6 +52,22 @@ function parseStoredObject(value) {
   }
 }
 
+function hasStoredValue(key) {
+  try {
+    return localStorage.getItem(key) !== null;
+  } catch {
+    return false;
+  }
+}
+
+function readStoredValue(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
 function storedProfileId() {
   return `user_${globalThis.crypto?.randomUUID?.() || Date.now().toString(36)}`;
 }
@@ -100,7 +116,24 @@ const DEFAULT_PERSONA_PRESET =
   PERSONA_PRESETS.find((preset) => preset.id === "assistant") || PERSONA_PRESETS[0];
 
 const PROMPT_DEFAULTS_VERSION = "2026-07-12-restored-persona-default";
-const TUNING_DEFAULTS_VERSION = "2026-07-11-turn-scoped-repetition";
+const TUNING_DEFAULTS_VERSION = "2026-07-12-rl-native-duplex";
+const BASE_MODEL_DEFAULTS = {
+  ...DEFAULTS,
+  audioTemp: 0.7,
+  repPenalty: 1.15,
+  turnHandling: "assisted",
+};
+const ASSISTED_MODEL_DEFAULTS = {
+  ...DEFAULTS,
+  turnHandling: "assisted",
+};
+
+function defaultsForModel(variant, nativeDuplexRecommended = null) {
+  if (variant === "base") return BASE_MODEL_DEFAULTS;
+  if (variant === "rl-seamless" || nativeDuplexRecommended === true) return DEFAULTS;
+  if (variant) return ASSISTED_MODEL_DEFAULTS;
+  return DEFAULTS;
+}
 // Prior shipped default sets. Stored tuning that exactly matches one of
 // these follows the defaults forward; hand-tuned values are left alone.
 const PREVIOUS_TUNING_DEFAULTS = [
@@ -110,6 +143,16 @@ const PREVIOUS_TUNING_DEFAULTS = [
     audioTemp: 0.8,
     audioTopk: 250,
     repPenalty: 1.0,
+    repContext: 64,
+    padBonus: 0.0,
+    maxTurn: 120,
+  },
+  {
+    textTemp: 0.7,
+    textTopk: 25,
+    audioTemp: 0.7,
+    audioTopk: 250,
+    repPenalty: 1.15,
     repContext: 64,
     padBonus: 0.0,
     maxTurn: 120,
@@ -147,13 +190,26 @@ function matchesReplacedDefault(value, defaults) {
 }
 
 const VISION_REACTION_MODES = [
-  { id: "passive", label: "Passive" },
-  { id: "manual", label: "Manual" },
+  { id: "passive", label: "Captions only" },
   { id: "after_speech", label: "After speech" },
-  { id: "continuous", label: "Continuous" },
+  { id: "continuous", label: "Continuous · experimental" },
+];
+
+const TURN_HANDLING_MODES = [
+  {
+    id: "native",
+    label: "Native duplex",
+    desc: "Let the aligned model handle overlap and backchannels.",
+  },
+  {
+    id: "assisted",
+    label: "Assisted",
+    desc: "Force-stop the assistant after sustained overlap.",
+  },
 ];
 
 function normalizeVisionReactionMode(value, fallback = "passive") {
+  if (value === "manual") return "passive";
   return VISION_REACTION_MODES.some((mode) => mode.id === value) ? value : fallback;
 }
 
@@ -196,6 +252,23 @@ function clampInferenceValue(key, value, fallback, rangeSet = "expert") {
       : range.min;
   const bounded = Math.min(range.max, Math.max(range.min, finite));
   return range.integer ? Math.round(bounded) : bounded;
+}
+
+function mergeServerInfo(info, message) {
+  return {
+    gpuName: typeof message.gpu_name === "string" ? message.gpu_name : info.gpuName,
+    vramTotal: Number.isFinite(message.vram_total) ? message.vram_total : info.vramTotal,
+    serverBuild: typeof message.server_build === "string" ? message.server_build : info.serverBuild,
+    modelRepo: typeof message.model_repo === "string" ? message.model_repo : info.modelRepo,
+    modelRevision: typeof message.model_revision === "string" ? message.model_revision : info.modelRevision,
+    modelLabel: typeof message.model_label === "string" ? message.model_label : info.modelLabel,
+    modelVariant: typeof message.model_variant === "string" ? message.model_variant : info.modelVariant,
+    modelLicense: typeof message.model_license === "string" ? message.model_license : info.modelLicense,
+    nativeDuplexRecommended:
+      typeof message.native_duplex_recommended === "boolean"
+        ? message.native_duplex_recommended
+        : info.nativeDuplexRecommended,
+  };
 }
 
 function inferenceValuesOutsideRange(values, rangeSet) {
@@ -260,6 +333,23 @@ const GLYPH_BARS = Array.from({ length: 11 }, (_, i) => `glyph-${i}`);
 
 function App() {
   const toast = useToast();
+  const turnHandlingWasStoredRef = useRef(null);
+  const tuningWasStoredRef = useRef(null);
+  if (turnHandlingWasStoredRef.current === null) {
+    turnHandlingWasStoredRef.current = hasStoredValue("pp_turnHandling");
+  }
+  if (tuningWasStoredRef.current === null) {
+    tuningWasStoredRef.current = [
+      "pp_textTempSlider",
+      "pp_textTopkSlider",
+      "pp_audioTempSlider",
+      "pp_audioTopkSlider",
+      "pp_repPenaltySlider",
+      "pp_repContextSlider",
+      "pp_padBonusSlider",
+      "pp_maxTurnSlider",
+    ].some(hasStoredValue);
+  }
   const [phase, setPhase] = useState("idle");
   // User toggle to peek at the frozen config column while a session runs.
   const [sideExpanded, setSideExpanded] = useState(false);
@@ -333,6 +423,11 @@ function App() {
   const [previewing, setPreviewing] = useState(null);
   const [adherenceMode, setAdherenceMode] = useStoredState("pp_adherenceMode", "none");
   const [expressionMode, setExpressionMode] = useStoredState("pp_expressionMode", "none");
+  const [turnHandling, setTurnHandling] = useStoredState(
+    "pp_turnHandling",
+    DEFAULTS.turnHandling,
+    (value) => (value === "assisted" ? "assisted" : "native"),
+  );
   const [uploadedVoiceFilename, setUploadedVoiceFilename] = useState("");
   const [uploadedVoiceLabel, setUploadedVoiceLabel] = useState("");
   const [uploadedVoiceMeta, setUploadedVoiceMeta] = useState(null);
@@ -388,8 +483,39 @@ function App() {
   const [seedRandom, setSeedRandom] = useStoredState("pp_seedRandom", true, (v) => v === "1", (v) => (v ? "1" : "0"));
   const [seed, setSeed] = useStoredState("pp_seedValue", DEFAULTS.seed, Number);
   const [idleTimeout, setIdleTimeout] = useStoredState("pp_idleTimeout", 0, Number); // minutes; 0 = off
+  const initialModelPreferencesRef = useRef(null);
+  if (initialModelPreferencesRef.current === null) {
+    initialModelPreferencesRef.current = {
+      modelIdentity: readStoredValue("pp_modelIdentity"),
+      turnHandling,
+      tuning: {
+        textTemp,
+        textTopk,
+        audioTemp,
+        audioTopk,
+        repPenalty,
+        repContext,
+        padBonus,
+        maxTurn,
+      },
+    };
+  }
 
-  const [serverInfo, setServerInfo] = useState({ gpuName: "", vramTotal: 0, serverBuild: "" });
+  const [serverInfo, setServerInfo] = useState({
+    gpuName: "",
+    vramTotal: 0,
+    serverBuild: "",
+    modelRepo: "",
+    modelRevision: "",
+    modelLabel: "",
+    modelVariant: "",
+    modelLicense: "",
+    nativeDuplexRecommended: null,
+  });
+  const modelDefaults = defaultsForModel(
+    serverInfo.modelVariant,
+    serverInfo.nativeDuplexRecommended,
+  );
   const [gpuStat, setGpuStat] = useState({ vramUsed: 0, gpuUtil: null });
   // Server-measured real-time factor: compute time per audio frame divided
   // by that frame's audio duration. Below 1 means inference keeps up; at or
@@ -679,6 +805,69 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
+    fetch("/api/info")
+      .then((response) => {
+        if (!response.ok) throw new Error(`server info ${response.status}`);
+        return response.json();
+      })
+      .then((info) => {
+        if (cancelled) return;
+        const initial = initialModelPreferencesRef.current;
+        const variant = typeof info.model_variant === "string" ? info.model_variant : "custom";
+        const revision = typeof info.model_revision === "string" ? info.model_revision : "main";
+        const nextIdentity = `${variant}@${revision}`;
+        const nextDefaults = defaultsForModel(
+          variant,
+          info.native_duplex_recommended,
+        );
+        const previousIdentity = initial?.modelIdentity || "";
+        const previousVariant = previousIdentity.split("@", 1)[0];
+        const previousDefaults = defaultsForModel(
+          previousVariant,
+          previousVariant === "rl-seamless",
+        );
+        const modelChanged = !!previousIdentity && previousIdentity !== nextIdentity;
+        const tuningMatchesPreviousModel = initial
+          ? inferenceValuesMatch(previousDefaults, initial.tuning)
+          : false;
+
+        setServerInfo((current) => mergeServerInfo(current, info));
+        if (
+          !turnHandlingWasStoredRef.current
+          || (
+            modelChanged
+            && initial?.turnHandling === previousDefaults.turnHandling
+          )
+        ) {
+          setTurnHandling(nextDefaults.turnHandling);
+        }
+        if (!tuningWasStoredRef.current || (modelChanged && tuningMatchesPreviousModel)) {
+          setTextTemp(nextDefaults.textTemp);
+          setTextTopk(nextDefaults.textTopk);
+          setAudioTemp(nextDefaults.audioTemp);
+          setAudioTopk(nextDefaults.audioTopk);
+          setRepPenalty(nextDefaults.repPenalty);
+          setRepContext(nextDefaults.repContext);
+          setPadBonus(nextDefaults.padBonus);
+          setMaxTurn(nextDefaults.maxTurn);
+        }
+        try {
+          localStorage.setItem("pp_modelIdentity", nextIdentity);
+        } catch {
+          // Storage can be unavailable in private or locked-down contexts.
+        }
+      })
+      .catch(() => {
+        // Older servers do not expose /api/info; ready still supplies the
+        // legacy GPU/build fields while model identity remains unknown.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [setTurnHandling]);
+
+  useEffect(() => {
+    let cancelled = false;
     fetchVoiceList().then((ids) => {
       if (!cancelled && ids) setVoiceList(ids);
     });
@@ -727,7 +916,11 @@ function App() {
   const visionCostLimitActive = Number(visionCostLimitUsd) > 0;
   const visionCostRemaining = Math.max(0, Number(visionCostLimitUsd || 0) - visionCostUsd);
   const visionFeedStatus = formatVisionFeed(currentVisionFeed, visionFeedModel, visionInjecting);
-  const visionTurnStatus = visionGroundTurns ? "auto after speech" : "manual only";
+  const visionTurnStatus = visionGroundTurns
+    ? "auto after speech"
+    : visionFeedModel
+      ? "continuous react"
+      : "captions only";
   const contextStatusLabel = contextStatus.status === "injecting"
     ? "injecting"
     : contextStatus.status === "queued"
@@ -799,6 +992,7 @@ function App() {
       voice,
       adherenceMode,
       expressionMode,
+      turnHandling,
       textTemp: Number(textTemp),
       textTopk: Number(textTopk),
       audioTemp: Number(audioTemp),
@@ -843,6 +1037,7 @@ function App() {
     textPrompt,
     textTemp,
     textTopk,
+    turnHandling,
     uploadedVoiceFilename,
     visionFeedModel,
     visionGroundTurns,
@@ -899,6 +1094,9 @@ function App() {
     clearUploadedVoice();
     setAdherenceMode(profile.adherenceMode || "none");
     setExpressionMode(profile.expressionMode || "none");
+    if (profile.turnHandling === "assisted" || profile.turnHandling === "native") {
+      setTurnHandling(profile.turnHandling);
+    }
     setTextTemp(clampInferenceValue("textTemp", profile.textTemp, DEFAULTS.textTemp));
     setTextTopk(clampInferenceValue("textTopk", profile.textTopk, DEFAULTS.textTopk));
     setAudioTemp(clampInferenceValue("audioTemp", profile.audioTemp, DEFAULTS.audioTemp));
@@ -945,6 +1143,7 @@ function App() {
     setTextPrompt,
     setTextTemp,
     setTextTopk,
+    setTurnHandling,
     setVisionInTranscript,
     setVisionReactionMode,
     setReinforceInSilences,
@@ -1085,6 +1284,9 @@ function App() {
       auto_gain: !!autoGain,
       output_device_id: outputDeviceId,
     },
+    interaction: {
+      turn_handling: turnHandling,
+    },
     vision: {
       interval_ms: Number(visionIntervalMs),
       cost_limit_usd: Number(visionCostLimitUsd),
@@ -1107,6 +1309,7 @@ function App() {
     noiseSupp,
     autoGain,
     outputDeviceId,
+    turnHandling,
     visionIntervalMs,
     visionCostLimitUsd,
     visionReactionMode,
@@ -1226,10 +1429,14 @@ function App() {
     if (typeof mic.noise_suppression === "boolean") setNoiseSupp(mic.noise_suppression);
     if (typeof mic.auto_gain === "boolean") setAutoGain(mic.auto_gain);
     if (typeof mic.output_device_id === "string") setOutputDeviceId(mic.output_device_id || "default");
+    const interaction = profile?.interaction || {};
+    if (interaction.turn_handling === "assisted" || interaction.turn_handling === "native") {
+      setTurnHandling(interaction.turn_handling);
+    }
     const interval = readNumber(profile?.vision?.interval_ms, visionIntervalMs);
     if (interval >= 1000 && interval <= 30000) setVisionIntervalMs(interval);
     setVisionCostLimitUsd(Math.max(0, readNumber(profile?.vision?.cost_limit_usd, visionCostLimitUsd)));
-  }, [addNotice, allSessionProfiles, clearUploadedVoice, cloneStrength, textPrompt, visionCostLimitUsd, visionIntervalMs, voiceList, setAdherenceMode, setExpressionMode, setAudioTemp, setTextTemp, setTextTopk, setAudioTopk, setRepPenalty, setRepContext, setPadBonus, setMaxTurn, setInjectSilenceRms, setInjectSilenceStreak, setSeedRandom, setSeed, setIdleTimeout, setTextPrompt, setVisionPrompt, setVisionInTranscript, setVisionReactionMode, setReinforceInSilences, setVoice, setVoiceBlend, setVoiceB, setBlendMix, setCloneStrength, setEchoCancel, setNoiseSupp, setAutoGain, setOutputDeviceId, setVisionIntervalMs, setVisionCostLimitUsd]);
+  }, [addNotice, allSessionProfiles, clearUploadedVoice, cloneStrength, textPrompt, visionCostLimitUsd, visionIntervalMs, voiceList, setAdherenceMode, setExpressionMode, setAudioTemp, setTextTemp, setTextTopk, setAudioTopk, setRepPenalty, setRepContext, setPadBonus, setMaxTurn, setInjectSilenceRms, setInjectSilenceStreak, setSeedRandom, setSeed, setIdleTimeout, setTextPrompt, setVisionPrompt, setVisionInTranscript, setVisionReactionMode, setReinforceInSilences, setVoice, setVoiceBlend, setVoiceB, setBlendMix, setCloneStrength, setEchoCancel, setNoiseSupp, setAutoGain, setOutputDeviceId, setTurnHandling, setVisionIntervalMs, setVisionCostLimitUsd]);
 
   const exportConfig = useCallback(() => {
     const profile = JSON.stringify(buildConfigProfile(), null, 2);
@@ -1388,6 +1595,7 @@ function App() {
       ["Voice", currentProfileSnapshot.voice, pinned.voice],
       ["Adherence", currentProfileSnapshot.adherenceMode, pinned.adherenceMode],
       ["Expression", currentProfileSnapshot.expressionMode, pinned.expressionMode],
+      ["Turn handling", currentProfileSnapshot.turnHandling, pinned.turnHandling],
       ["Text t", currentProfileSnapshot.textTemp, pinned.textTemp],
       ["Text k", currentProfileSnapshot.textTopk, pinned.textTopk],
       ["Audio t", currentProfileSnapshot.audioTemp, pinned.audioTemp],
@@ -1714,11 +1922,7 @@ function App() {
         setPhase("live");
         setStageMessage(resumed ? "Live" : "Connected");
         setConnectionIssue(null);
-        setServerInfo((info) => ({
-          gpuName: typeof message.gpu_name === "string" ? message.gpu_name : info.gpuName,
-          vramTotal: Number.isFinite(message.vram_total) ? message.vram_total : info.vramTotal,
-          serverBuild: typeof message.server_build === "string" ? message.server_build : info.serverBuild,
-        }));
+        setServerInfo((info) => mergeServerInfo(info, message));
         if (resumed) {
           addNotice("ok", "Reconnected, session and model state preserved");
           toast("Reconnected");
@@ -2978,30 +3182,32 @@ function App() {
     textTopk,
   ]);
 
-  const resetTuningDefaults = useCallback((notify = true) => {
-    setTextTemp(DEFAULTS.textTemp);
-    setTextTopk(DEFAULTS.textTopk);
-    setAudioTemp(DEFAULTS.audioTemp);
-    setAudioTopk(DEFAULTS.audioTopk);
-    setRepPenalty(DEFAULTS.repPenalty);
-    setRepContext(DEFAULTS.repContext);
-    setPadBonus(DEFAULTS.padBonus);
-    setMaxTurn(DEFAULTS.maxTurn);
+  const resetTuningDefaults = useCallback((notify = true, resetTurn = true) => {
+    setTextTemp(modelDefaults.textTemp);
+    setTextTopk(modelDefaults.textTopk);
+    setAudioTemp(modelDefaults.audioTemp);
+    setAudioTopk(modelDefaults.audioTopk);
+    setRepPenalty(modelDefaults.repPenalty);
+    setRepContext(modelDefaults.repContext);
+    setPadBonus(modelDefaults.padBonus);
+    setMaxTurn(modelDefaults.maxTurn);
+    if (resetTurn) setTurnHandling(modelDefaults.turnHandling);
     setTuningRangeMode("safe");
     setSessionProfileId("custom");
     sendLiveConfig({
-      text_temperature: DEFAULTS.textTemp,
-      text_topk: DEFAULTS.textTopk,
-      audio_temperature: DEFAULTS.audioTemp,
-      audio_topk: DEFAULTS.audioTopk,
-      repetition_penalty: DEFAULTS.repPenalty,
-      repetition_penalty_context: DEFAULTS.repContext,
-      padding_bonus: DEFAULTS.padBonus,
-      max_turn_text_tokens: DEFAULTS.maxTurn,
+      text_temperature: modelDefaults.textTemp,
+      text_topk: modelDefaults.textTopk,
+      audio_temperature: modelDefaults.audioTemp,
+      audio_topk: modelDefaults.audioTopk,
+      repetition_penalty: modelDefaults.repPenalty,
+      repetition_penalty_context: modelDefaults.repContext,
+      padding_bonus: modelDefaults.padBonus,
+      max_turn_text_tokens: modelDefaults.maxTurn,
     });
     if (notify) addNotice("ok", "Inference tuning reset to stable defaults");
   }, [
     addNotice,
+    modelDefaults,
     sendLiveConfig,
     setAudioTemp,
     setAudioTopk,
@@ -3011,19 +3217,25 @@ function App() {
     setRepPenalty,
     setTextTemp,
     setTextTopk,
+    setTurnHandling,
     setTuningRangeMode,
   ]);
 
   useEffect(() => {
     if (tuningDefaultsVersion === TUNING_DEFAULTS_VERSION) return;
-    if (tuningOutsideSafeRange || previousTuningDefaultsActive) {
-      resetTuningDefaults(false);
+    if (!serverInfo.modelVariant) return;
+    if (
+      tuningWasStoredRef.current
+      && (tuningOutsideSafeRange || previousTuningDefaultsActive)
+    ) {
+      resetTuningDefaults(false, false);
       addNotice("warn", "Stored tuning was reset to the current stable defaults");
     }
     setTuningDefaultsVersion(TUNING_DEFAULTS_VERSION);
   }, [
     addNotice,
     resetTuningDefaults,
+    serverInfo.modelVariant,
     setTuningDefaultsVersion,
     previousTuningDefaultsActive,
     tuningDefaultsVersion,
@@ -3259,7 +3471,11 @@ function App() {
       if (micBars > 2 && aiBars > 2) {
         overlapTicks += 1;
         setSpeaking("both");
-        if (overlapTicks === 3 && !bargeActiveRef.current) {
+        if (
+          turnHandling === "assisted"
+          && overlapTicks === 3
+          && !bargeActiveRef.current
+        ) {
           bargeActiveRef.current = true;
           interruptResponse("barge_in");
         }
@@ -3272,7 +3488,7 @@ function App() {
       }
     }, 100);
     return () => clearInterval(id);
-  }, [interruptResponse, phase, visionInjecting]);
+  }, [interruptResponse, phase, turnHandling, visionInjecting]);
 
   // Record a user turn from the local speaking transition: the mic channel
   // registered speech, then the assistant resumed. This is the only honest
@@ -3483,6 +3699,11 @@ function App() {
     : null;
 
   const gpuLabel = serverInfo.gpuName ? `GPU · ${serverInfo.gpuName}` : "GPU";
+  const modelShortLabel = serverInfo.modelVariant === "rl-seamless"
+    ? "RL Seamless"
+    : serverInfo.modelVariant === "base"
+      ? "Base"
+      : serverInfo.modelLabel || "Detecting";
   const gpuValue = (() => {
     if (!isLive) return "idle";
     const parts = [];
@@ -3522,6 +3743,10 @@ function App() {
           ))}
         </div>
         <div className="pills">
+          <div className="pill model-pill" title={serverInfo.modelLabel || "Detecting active checkpoint"}>
+            <span className="l">Model</span>
+            <span className="v live">{modelShortLabel || "·"}</span>
+          </div>
           <div className="pill">
             <span className="l">GPU</span>
             <span className="v">{serverInfo.gpuName || "·"}</span>
@@ -3603,6 +3828,15 @@ function App() {
                     if (value !== "custom") applySessionProfile(value);
                   }}
                 />
+                <div className="model-runtime-card">
+                  <span className="model-runtime-k">ACTIVE MODEL</span>
+                  <span className="model-runtime-v">{serverInfo.modelLabel || "Detecting checkpoint…"}</span>
+                  <span className="model-runtime-d">
+                    {serverInfo.modelVariant
+                      ? `Selected when the pod starts · ${serverInfo.modelVariant === "rl-seamless" ? "interactivity aligned" : serverInfo.modelVariant}`
+                      : "Reading server identity"}
+                  </span>
+                </div>
                 <div className="profile-tools">
                   <input
                     type="text"
@@ -3726,8 +3960,8 @@ function App() {
                   }}
                 />
                 <Listbox
-                  label="Expression"
-                  caption="Expression"
+                  label="Prompted style"
+                  caption="Prompted style"
                   info="expression"
                   value={expressionMode}
                   options={EXPRESSION_MODES.map((mode) => ({
@@ -4322,7 +4556,10 @@ function App() {
                 )}
                 {speaking === "both" && !visionInjecting && !interrupting && (
                   <div className="viz-inject barge">
-                    <span className="d" /> Barge-in <span className="gate">user took the turn</span>
+                    <span className="d" /> {turnHandling === "native" ? "Native overlap" : "Barge-in"}{" "}
+                    <span className="gate">
+                      {turnHandling === "native" ? "model handling duplex" : "user took the turn"}
+                    </span>
                   </div>
                 )}
                 {(isBusy || isTurnFailed || reconnecting || phase === "idle" || phase === "connecting" || phase === "warmup") && (
@@ -4574,6 +4811,11 @@ function App() {
                           </button>
                         ))}
                       </div>
+                      <span className={cls("vision-reaction-note", visionReactionMode !== "passive" && "warn")}>
+                        {visionReactionMode === "passive"
+                          ? "Descriptions stay outside the voice model unless you choose Use latest scene."
+                          : "Experimental context injection can change the model's learned turn timing."}
+                      </span>
                     </div>
                     <div className="vision-actions">
                       <button
@@ -4625,7 +4867,7 @@ function App() {
               aria-controls="tuning-rail"
               onClick={() => setRailOpen((open) => !open)}
             >
-              <span className="rack-t">Tuning · sampling &amp; behavior</span>
+              <span className="rack-t">Advanced · sampling &amp; safety</span>
               <span className="rack-meta mono">
                 {railOpen
                   ? "Hide"
@@ -4664,6 +4906,28 @@ function App() {
                   >
                     Reset defaults
                   </button>
+                  <span className="rail-turn-label" style={{ display: "inline-flex", alignItems: "center" }}>
+                    Turn handling
+                    <Info k="turnHandling" />
+                  </span>
+                  {/* biome-ignore lint/a11y/useSemanticElements: compact segmented behavior control matching the range selector */}
+                  <div className="seg-mini" role="group" aria-label="Turn handling">
+                    {TURN_HANDLING_MODES.map((mode) => (
+                      <button
+                        key={mode.id}
+                        type="button"
+                        className={cls(turnHandling === mode.id && "on")}
+                        aria-pressed={turnHandling === mode.id}
+                        title={mode.desc}
+                        onClick={() => {
+                          setTurnHandling(mode.id);
+                          setSessionProfileId("custom");
+                        }}
+                      >
+                        {mode.label}
+                      </button>
+                    ))}
+                  </div>
                 </div>
                 <div className="rail">
                   <RailColumn title="TEXT" aggregate={`t ${fmt(textTemp, 2)} · k ${textTopk}`}>
@@ -4682,7 +4946,7 @@ function App() {
                     <MiniSlider label="Padding bonus" info="padBonus" value={padBonus} onChange={(value) => { setPadBonus(value); setSessionProfileId("custom"); sendLiveConfig({ padding_bonus: Number(value) }); }} min={tuningRanges.padBonus.min} max={tuningRanges.padBonus.max} step={tuningRanges.padBonus.step} format={(v) => fmt(v, 1)} />
                     <MiniSlider label="Max length" info="maxTurn" value={maxTurn} onChange={(value) => { setMaxTurn(value); setSessionProfileId("custom"); sendLiveConfig({ max_turn_text_tokens: Number.parseInt(value, 10) }); }} min={tuningRanges.maxTurn.min} max={tuningRanges.maxTurn.max} step={tuningRanges.maxTurn.step} format={(v) => (v ? `${v}` : "off")} />
                   </RailColumn>
-                  <RailColumn title="INJECT" aggregate={injectStat.idleRms != null ? `live ${fmt(injectStat.idleRms, 3)} · ${injectStat.streak ?? 0}f` : `${fmt(injectSilenceRms, 3)} · ${injectSilenceStreak}f`}>
+                  <RailColumn title="CONTEXT" aggregate={visionOn || reinforceInSilences ? (injectStat.idleRms != null ? `live ${fmt(injectStat.idleRms, 3)} · ${injectStat.streak ?? 0}f` : `${fmt(injectSilenceRms, 3)} · ${injectSilenceStreak}f`) : "inactive"}>
                     <MiniSlider label="Silence floor" info="injRms" value={injectSilenceRms} onChange={(value) => { setInjectSilenceRms(value); setSessionProfileId("custom"); sendLiveConfig({ inject_silence_rms: Number(value) }); }} min={INFERENCE_RANGES.expert.injectSilenceRms.min} max={INFERENCE_RANGES.expert.injectSilenceRms.max} step={INFERENCE_RANGES.expert.injectSilenceRms.step} format={(v) => fmt(v, 3)} />
                     <MiniSlider label="Silence hold" info="injStreak" value={injectSilenceStreak} onChange={(value) => { setInjectSilenceStreak(value); setSessionProfileId("custom"); sendLiveConfig({ inject_silence_streak: Number.parseInt(value, 10) }); }} min={INFERENCE_RANGES.expert.injectSilenceStreak.min} max={INFERENCE_RANGES.expert.injectSilenceStreak.max} step={INFERENCE_RANGES.expert.injectSilenceStreak.step} format={(v) => fmt(v, 0)} />
                   </RailColumn>
@@ -4810,7 +5074,7 @@ function App() {
             <div className="flow">
               <Flow label="Peer connection" value={isLive ? "connected · turn" : phase === "connecting" ? "gathering ICE" : "idle"} active={isLive || phase === "connecting"} warn={phase === "connecting"} />
               <Flow label="Mimi codec" value={isLive || phase === "warmup" ? "24 kHz · 12.5 fps" : "idle"} active={isLive || phase === "warmup"} />
-              <Flow label="LM · personaplex-7b" value={isLive ? `t ${fmt(textTemp, 2)} · k ${textTopk}${visionInjecting ? " · gated" : ""}` : phase === "warmup" ? "warming" : "idle"} active={isLive || phase === "warmup"} warn={visionInjecting} />
+              <Flow label={`LM · ${modelShortLabel}`} value={isLive ? `t ${fmt(textTemp, 2)} · k ${textTopk}${visionInjecting ? " · gated" : ""}` : phase === "warmup" ? "warming" : "idle"} active={isLive || phase === "warmup"} warn={visionInjecting} />
               {visionOn && <Flow label="Gemini vision" value={visionPaused ? "paused" : `frames active · ${visionFeedStatus} · ${visionTurnStatus}`} active={!visionPaused} warn={visionPaused || visionInjecting} branch />}
               <Flow label="Audio graph" value={isLive ? "recording · analysers" : "idle"} active={isLive} />
               <Flow label={gpuLabel} value={gpuValue} active={isLive} />
@@ -4872,10 +5136,12 @@ function App() {
 
           <div className="cons-sect">
             <div className="cons-h">F · Build</div>
-            <Row label="Model" value="personaplex-7b v1" />
+            <Row label="Model" value={serverInfo.modelLabel || "·"} />
+            <Row label="Repository" value={serverInfo.modelRepo || "·"} />
+            <Row label="Revision" value={serverInfo.modelRevision ? serverInfo.modelRevision.slice(0, 12) : "·"} />
             <Row label="Server" value={serverInfo.serverBuild || "·"} />
             <Row label="Client" value="React · Bun" />
-            <Row label="License" value="NVIDIA OML" />
+            <Row label="License" value={serverInfo.modelLicense || "·"} />
           </div>
         </aside>
       </div>

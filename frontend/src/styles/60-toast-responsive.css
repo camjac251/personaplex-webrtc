@@ -34,6 +34,9 @@
       overflow-y: auto;
     }
   }
+  @media (max-width: 1080px) {
+    .model-pill { display: none; }
+  }
   @media (max-width: 760px) {
     .topbar {
       grid-template-columns: 1fr auto;

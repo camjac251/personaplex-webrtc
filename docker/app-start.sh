@@ -8,7 +8,11 @@ if [ -d "/workspace/Personaplex-oneclicker/voices" ]; then
     DEFAULT_VOICE_DIR="/workspace/Personaplex-oneclicker/voices"
 fi
 VOICE_DIR="${PERSONAPLEX_VOICE_DIR:-$DEFAULT_VOICE_DIR}"
-HF_REVISION="${PERSONAPLEX_HF_REVISION:-fdaf4090a61cb315c138a1faee287ffd6c716309f}"
+# shellcheck source=docker/model-env.sh
+source "$APP_DIR/docker/model-env.sh"
+personaplex_resolve_model
+HF_REPO="$PERSONAPLEX_SELECTED_HF_REPO"
+HF_REVISION="$PERSONAPLEX_SELECTED_HF_REVISION"
 
 export HF_TOKEN="${HF_TOKEN:-}"
 export HF_HOME="${HF_HOME:-/workspace/huggingface_cache}"
@@ -39,7 +43,7 @@ if [ -z "${GEMINI_API_KEY:-}" ]; then
     log "WARN: GEMINI_API_KEY is not set. Vision features will be disabled."
 fi
 
-asset_args=(--voice-dir "$VOICE_DIR" --revision "$HF_REVISION")
+asset_args=(--voice-dir "$VOICE_DIR" --repo "$HF_REPO" --revision "$HF_REVISION")
 
 if [ "${PERSONAPLEX_FETCH_VOICES:-1}" = "0" ]; then
     asset_args+=(--skip-voices)
@@ -49,6 +53,7 @@ if [ "${PERSONAPLEX_PREFETCH_MODEL:-1}" = "0" ]; then
     asset_args+=(--skip-model)
 fi
 
+log "model: $HF_REPO@$HF_REVISION"
 log "checking model assets under $HF_HOME and voices under $VOICE_DIR"
 "$APP_DIR/.venv/bin/python" "$APP_DIR/docker/prefetch_assets.py" "${asset_args[@]}"
 
@@ -56,5 +61,6 @@ log "starting moshi-server on :$PORT"
 exec "$APP_DIR/.venv/bin/python" -m moshi.server \
     --host 0.0.0.0 \
     --port "$PORT" \
+    --hf-repo "$HF_REPO" \
     --hf-revision "$HF_REVISION" \
     --voice-prompt-dir "$VOICE_DIR"

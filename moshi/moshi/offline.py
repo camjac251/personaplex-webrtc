@@ -41,7 +41,6 @@ keep parity with voice-prompt feeding logic in the server.
 
 import argparse
 import os
-import tarfile
 from pathlib import Path
 import json
 from typing import Optional, List
@@ -53,6 +52,7 @@ import sphn
 from huggingface_hub import hf_hub_download
 
 from .client_utils import make_log
+from .utils.assets import safe_extract_tar
 from .models import loaders, LMGen, MimiModel
 from .models.lm import load_audio as lm_load_audio
 from .models.lm import _iterate_audio as lm_iterate_audio
@@ -122,7 +122,11 @@ def decode_tokens_to_pcm(mimi: MimiModel, other_mimi: MimiModel, lm_gen: LMGen, 
     return pcm
 
 
-def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Optional[str]:
+def _get_voice_prompt_dir(
+    voice_prompt_dir: Optional[str],
+    hf_repo: str,
+    hf_revision: Optional[str],
+) -> Optional[str]:
     """
     If voice_prompt_dir is None:
       - download voices.tgz from HF
@@ -135,14 +139,18 @@ def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Opti
         return voice_prompt_dir
 
     log("info", "retrieving voice prompts")
-    voices_tgz = hf_hub_download(hf_repo, "voices.tgz")
+    voices_tgz = hf_hub_download(
+        hf_repo,
+        "voices.tgz",
+        token=os.environ.get("HF_TOKEN") or None,
+        revision=hf_revision,
+    )
     voices_tgz = Path(voices_tgz)
     voices_dir = voices_tgz.parent / "voices"
 
     if not voices_dir.exists():
         log("info", f"extracting {voices_tgz} to {voices_dir}")
-        with tarfile.open(voices_tgz, "r:gz") as tar:
-            tar.extractall(path=voices_tgz.parent)
+        safe_extract_tar(voices_tgz, voices_tgz.parent)
 
     if not voices_dir.exists():
         raise RuntimeError("voices.tgz did not contain a 'voices/' directory")
@@ -160,6 +168,7 @@ def run_inference(
     moshi_weight: Optional[str],
     mimi_weight: Optional[str],
     hf_repo: str,
+    hf_revision: Optional[str],
     device: str,
     seed: Optional[int],
     temp_audio: float,
@@ -185,20 +194,35 @@ def run_inference(
     # 1) Load Mimi encoders/decoders (same as server.py)
     log("info", "loading mimi")
     if mimi_weight is None:
-        mimi_weight = hf_hub_download(hf_repo, loaders.MIMI_NAME)  # type: ignore
+        mimi_weight = hf_hub_download(
+            hf_repo,
+            loaders.MIMI_NAME,
+            token=os.environ.get("HF_TOKEN") or None,
+            revision=hf_revision,
+        )  # type: ignore
     mimi = loaders.get_mimi(mimi_weight, device)
     other_mimi = loaders.get_mimi(mimi_weight, device)
     log("info", "mimi loaded")
 
     # 2) Load tokenizer
     if tokenizer_path is None:
-        tokenizer_path = hf_hub_download(hf_repo, loaders.TEXT_TOKENIZER_NAME)  # type: ignore
+        tokenizer_path = hf_hub_download(
+            hf_repo,
+            loaders.TEXT_TOKENIZER_NAME,
+            token=os.environ.get("HF_TOKEN") or None,
+            revision=hf_revision,
+        )  # type: ignore
     text_tokenizer = sentencepiece.SentencePieceProcessor(tokenizer_path)  # type: ignore
 
     # 3) Load Moshi LM and eval mode
     log("info", "loading moshi")
     if moshi_weight is None:
-        moshi_weight = hf_hub_download(hf_repo, loaders.MOSHI_NAME)  # type: ignore
+        moshi_weight = hf_hub_download(
+            hf_repo,
+            loaders.MOSHI_NAME,
+            token=os.environ.get("HF_TOKEN") or None,
+            revision=hf_revision,
+        )  # type: ignore
     lm = loaders.get_moshi_lm(moshi_weight, device=device, cpu_offload=cpu_offload)
     lm.eval()
     log("info", "moshi loaded")
@@ -353,6 +377,15 @@ def main():
         default=loaders.DEFAULT_REPO,
         help="HF repo to look into (defaults to pre-trained model repo)",
     )
+    parser.add_argument(
+        "--hf-revision",
+        type=str,
+        default=None,
+        help=(
+            "Immutable Hugging Face revision (known PersonaPlex repos are "
+            "pinned automatically; required for custom repositories)"
+        ),
+    )
 
     # Runtime / sampling controls (mirror UI semantics)
     parser.add_argument(
@@ -379,11 +412,19 @@ def main():
     parser.add_argument("--seed", type=int, default=-1, help="Seed for reproducibility (-1 disables)")
 
     args = parser.parse_args()
+    if args.hf_revision is None:
+        if args.hf_repo == loaders.DEFAULT_REPO:
+            args.hf_revision = loaders.DEFAULT_REVISION
+        elif args.hf_repo == loaders.BASE_REPO:
+            args.hf_revision = loaders.BASE_REVISION
+        else:
+            parser.error("custom --hf-repo requires --hf-revision")
 
     # If --voice-prompt-dir is omitted, voices.tgz is downloaded from HF and extracted.
     voice_prompt_dir = _get_voice_prompt_dir(
         args.voice_prompt_dir,
         args.hf_repo,
+        args.hf_revision,
     )
     if not os.path.exists(voice_prompt_dir):
         raise FileNotFoundError(f"voice_prompt_dir does not exist: {voice_prompt_dir}")
@@ -411,6 +452,7 @@ def main():
             moshi_weight=args.moshi_weight,
             mimi_weight=args.mimi_weight,
             hf_repo=args.hf_repo,
+            hf_revision=args.hf_revision,
             device=args.device,
             seed=args.seed,
             temp_audio=args.temp_audio,

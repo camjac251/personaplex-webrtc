@@ -17,7 +17,13 @@ import numpy as np
 
 sys.path.insert(0, "moshi")
 
-from moshi.server import ServerState, SnapshotDeferred  # noqa: E402
+from moshi.server import (  # noqa: E402
+    BASE_HF_REPO,
+    RL_HF_REPO,
+    ServerState,
+    SnapshotDeferred,
+    _model_identity,
+)
 
 
 def _bare_diagnostics_state() -> ServerState:
@@ -48,6 +54,27 @@ def test_periodic_snapshots_default_on() -> None:
     )
     assert parameter is not None
     assert parameter.default is True
+
+
+def test_model_identity_distinguishes_rl_base_and_custom() -> None:
+    rl = _model_identity(RL_HF_REPO, "a" * 40)
+    assert rl["model_variant"] == "rl-seamless"
+    assert rl["native_duplex_recommended"] is True
+    assert "CC BY-NC" in rl["model_license"]
+
+    base = _model_identity(BASE_HF_REPO, "b" * 40)
+    assert base["model_variant"] == "base"
+    assert base["native_duplex_recommended"] is False
+    assert base["model_license"] == "NVIDIA OML"
+
+    custom = _model_identity("example/custom", None)
+    assert custom["model_label"] == "custom"
+    assert custom["model_revision"] == "main"
+
+    local = _model_identity("local:checkpoint.safetensors", None)
+    assert local["model_label"] == "Local · checkpoint.safetensors"
+    assert local["model_variant"] == "local"
+    assert local["model_revision"] == "local file"
 
 
 def test_stale_baseline_is_not_an_auto_rewind_target() -> None:
@@ -225,6 +252,7 @@ def test_clearing_resume_grant_cancels_snapshot_retaining_timer() -> None:
 if __name__ == "__main__":
     tests = [
         test_periodic_snapshots_default_on,
+        test_model_identity_distinguishes_rl_base_and_custom,
         test_stale_baseline_is_not_an_auto_rewind_target,
         test_backpressure_status_names_active_inference_phase,
         test_tracked_inference_lock_clears_phase_after_error,

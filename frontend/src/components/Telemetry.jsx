@@ -234,7 +234,7 @@ export function Row({ label, value, dot }) {
   return (
     <div className="row">
       <span className="k"><span className={cls("d", dot)} />{label}</span>
-      <span className="v">{value}</span>
+      <span className="v" title={typeof value === "string" ? value : undefined}>{value}</span>
     </div>
   );
 }

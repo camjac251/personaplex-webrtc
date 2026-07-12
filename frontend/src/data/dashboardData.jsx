@@ -164,12 +164,13 @@ export const EXPRESSION_MODES = [
 export const DEFAULTS = {
   textTemp: 0.7,
   textTopk: 25,
-  audioTemp: 0.7,
+  audioTemp: 0.8,
   audioTopk: 250,
-  repPenalty: 1.15,
+  repPenalty: 1.0,
   repContext: 64,
   padBonus: 0,
   maxTurn: 120,
+  turnHandling: "native",
   injectSilenceRms: 0.01,
   injectSilenceStreak: 6,
   echoCancel: true,
@@ -213,13 +214,14 @@ export const SESSION_PROFILES = [
     voice: "NATF1",
     adherenceMode: "strict",
     expressionMode: "concise",
+    turnHandling: "assisted",
     textTemp: 0.55,
     textTopk: 18,
     audioTemp: 0.65,
     audioTopk: 220,
-    repPenalty: 1.2,
+    repPenalty: 1.1,
     repContext: 80,
-    padBonus: 1.15,
+    padBonus: 0,
     maxTurn: 80,
     echoCancel: true,
     noiseSupp: true,
@@ -238,13 +240,14 @@ export const SESSION_PROFILES = [
     voice: "VARF4",
     adherenceMode: "balanced",
     expressionMode: "expressive",
+    turnHandling: "native",
     textTemp: 0.82,
     textTopk: 40,
     audioTemp: 0.9,
     audioTopk: 320,
-    repPenalty: 1.12,
+    repPenalty: 1.0,
     repContext: 64,
-    padBonus: 1.0,
+    padBonus: 0,
     maxTurn: 120,
     echoCancel: true,
     noiseSupp: true,
@@ -263,13 +266,14 @@ export const SESSION_PROFILES = [
     voice: "NATF2",
     adherenceMode: "strict",
     expressionMode: "concise",
+    turnHandling: "assisted",
     textTemp: 0.45,
     textTopk: 12,
     audioTemp: 0.55,
     audioTopk: 180,
-    repPenalty: 1.2,
+    repPenalty: 1.1,
     repContext: 96,
-    padBonus: 1.2,
+    padBonus: 0,
     maxTurn: 90,
     echoCancel: true,
     noiseSupp: true,
@@ -283,6 +287,17 @@ export const SESSION_PROFILES = [
 ];
 
 export const PARAM_INFO = {
+  turnHandling: {
+    title: "Turn handling",
+    body: (
+      <>
+        <b>Native duplex</b> lets the interactivity-aligned model decide when
+        to yield, overlap, and backchannel. <b>Assisted</b> force-stops output
+        after sustained overlap and is intended as a fallback for base models
+        or difficult acoustic setups. Manual Stop always remains available.
+      </>
+    ),
+  },
   injRms: {
     title: "Inject silence floor",
     body: (
@@ -331,7 +346,8 @@ export const PARAM_INFO = {
     body: (
       <>
         Sampling temperature for acoustic tokens. Higher values allow more
-        expressive prosody and timbre variation. Default <b>0.7</b>.
+        expressive prosody and timbre variation. The RL checkpoint's published
+        setting, and this dashboard's default, is <b>0.8</b>.
       </>
     ),
   },
@@ -349,7 +365,8 @@ export const PARAM_INFO = {
     body: (
       <>
         Lowers the score of recently emitted text tokens. <b>1.0</b> disables
-        it. <b>1.15</b> is the safe default for reducing loops.
+        it and preserves the RL model's learned text policy. Raise toward
+        <b>1.15</b> only as an anti-loop fallback.
       </>
     ),
   },
@@ -415,12 +432,12 @@ export const PARAM_INFO = {
     ),
   },
   visionFeed: {
-    title: "Let voice react",
+    title: "Vision reaction mode",
     body: (
       <>
-        Drips factual Gemini scene notes into Moshi during silence windows so
-        the voice can react to the captured scene. Keep this experimental path
-        off for passive captions.
+        <b>Captions only</b> keeps scene notes outside the speech model unless
+        you inject one on demand. <b>After speech</b> queues a note after a user
+        turn. <b>Continuous</b> is an experimental ambient feed.
       </>
     ),
   },
@@ -513,10 +530,11 @@ export const PARAM_INFO = {
     ),
   },
   expression: {
-    title: "Expression",
+    title: "Prompted speaking style",
     body: (
       <>
-        The speaking style added to the prompt. <b>Natural</b> is warm and
+        A style instruction added to the system prompt; it does not change the
+        selected voice or audio sampler by itself. <b>Natural</b> is warm and
         brief, <b>Concise</b> uses the fewest words with fast turn-taking,{" "}
         <b>Expressive</b> adds more prosody and color.
       </>
@@ -567,8 +585,8 @@ export const PARAM_INFO = {
     body: (
       <>
         The instruction sent to Gemini with each captured frame. It shapes the
-        scene note shown in the vision panel; manual, after-speech, and
-        continuous modes can queue a compact factual note into the voice's
+        scene note shown in the vision panel; on-demand, after-speech, and
+        continuous actions can queue a compact factual note into the voice's
         text context.
       </>
     ),

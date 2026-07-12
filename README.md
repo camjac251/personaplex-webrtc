@@ -1,20 +1,22 @@
 # PersonaPlex on RunPod
 
-[![Weights](https://img.shields.io/badge/🤗-Weights-yellow)](https://huggingface.co/nvidia/personaplex-7b-v1)
+[![Weights](https://img.shields.io/badge/🤗-Weights-yellow)](https://huggingface.co/kyutai/personaplex-rl-seamless)
 [![Paper](https://img.shields.io/badge/📄-Paper-blue)](https://research.nvidia.com/labs/adlr/files/personaplex/personaplex_preprint.pdf)
+[![Interactivity](https://img.shields.io/badge/📄-RL%20Interactivity-violet)](https://arxiv.org/abs/2606.11167)
 
-PersonaPlex is a real-time, full-duplex speech-to-speech model with persona control via text prompts and voice conditioning. This fork packages it as a single-template RunPod deployment with a WebRTC browser client and a one-shot bootstrap script.
+PersonaPlex is a real-time, full-duplex speech-to-speech model with persona control via text prompts and voice conditioning. This fork defaults to Kyutai's interactivity-aligned PersonaPlex checkpoint and packages it as a single-template RunPod deployment with a WebRTC browser client and a one-shot bootstrap script.
 
 ## Credits
 
 - **Model and research**: NVIDIA PersonaPlex team. All credit for the core AI belongs to the original authors. See [NVIDIA/personaplex](https://github.com/NVIDIA/personaplex).
+- **Interactivity post-training**: Kyutai and Gradium. The default checkpoint is [kyutai/personaplex-rl-seamless](https://huggingface.co/kyutai/personaplex-rl-seamless), trained for pause handling, turn-taking, backchanneling, and interruption behavior.
 - **Windows-installer fork this repo branched from**: [Suresh Pydikondala (SurAiverse)](https://www.youtube.com/@suraiverse).
 
 ## Deploy on RunPod
 
 ### 1. HuggingFace token
 
-Create a **Read** token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) and accept the model license at [nvidia/personaplex-7b-v1](https://huggingface.co/nvidia/personaplex-7b-v1).
+Create a **Read** token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) and accept the gated license at [kyutai/personaplex-rl-seamless](https://huggingface.co/kyutai/personaplex-rl-seamless). The RL checkpoint combines CC BY-NC 4.0 with the NVIDIA Open Model License and is non-commercial. To use the base-model rollback, also accept [nvidia/personaplex-7b-v1](https://huggingface.co/nvidia/personaplex-7b-v1).
 
 ### 2. Cloudflare TURN credentials
 
@@ -85,12 +87,17 @@ console requires a value, use:
 | `TURN_KEY_ID` | `{{ RUNPOD_SECRET_TURN_KEY_ID }}` |
 | `TURN_KEY_API_TOKEN` | `{{ RUNPOD_SECRET_TURN_KEY_API_TOKEN }}` |
 | `GEMINI_API_KEY` | `{{ RUNPOD_SECRET_GEMINI_API_KEY }}` (optional) |
+| `PERSONAPLEX_MODEL` | `rl-seamless` (default) or `base` |
+| `PERSONAPLEX_HF_REPO` | Custom model repository override (optional) |
 | `PERSONAPLEX_HF_REVISION` | Override the pinned tested model revision (optional) |
 
-The image launcher pins the PersonaPlex Hugging Face snapshot used by this
-build, so restarting an unchanged image cannot silently pick up different
-weights or voice assets. Set `PERSONAPLEX_HF_REVISION=main` only when
-deliberately testing new upstream assets.
+The launcher defaults to the pinned Seamless RL checkpoint. Set
+`PERSONAPLEX_MODEL=base` to roll back to the pinned NVIDIA base checkpoint.
+Both aliases select a matching immutable revision automatically, so restarting
+an unchanged image cannot silently pick up different assets. A custom
+`PERSONAPLEX_HF_REPO` must be paired with `PERSONAPLEX_HF_REVISION`. Launchers
+ignore the old NVIDIA revision pin when it is the only model variable left in
+an existing pod; set `PERSONAPLEX_MODEL=base` when that rollback is intended.
 
 Use **Stop** / **Start** on the same Pod to keep `/workspace`. Terminating a
 regular Pod deletes its volume disk; use a network volume if you need the cache
@@ -124,6 +131,7 @@ bash -c "curl -sL https://raw.githubusercontent.com/camjac251/Personaplex-runpod
 | `TURN_KEY_ID` | `{{ RUNPOD_SECRET_TURN_KEY_ID }}` |
 | `TURN_KEY_API_TOKEN` | `{{ RUNPOD_SECRET_TURN_KEY_API_TOKEN }}` |
 | `GEMINI_API_KEY` | `{{ RUNPOD_SECRET_GEMINI_API_KEY }}` (optional) |
+| `PERSONAPLEX_MODEL` | `rl-seamless` (default) or `base` |
 
 ### 6. Launch and connect
 
@@ -131,7 +139,14 @@ Use a GPU with at least 24 GB VRAM for the default resident model plus rewind
 snapshot (RTX 4090 / A6000 / L40S all work). Lower-memory cards require CPU
 offload and have substantially higher latency.
 
-First boot downloads ~14 GB of weights and voice prompts. Expect 30-60 minutes depending on the data centre. The volume disk caches them, so subsequent boots reach "ready" in under a minute.
+First boot downloads the 16.7 GB model plus tokenizer and voice assets. Expect 30-60 minutes depending on the data centre. The volume disk caches them, so subsequent boots reach "ready" in under a minute. Keeping both RL and base checkpoints requires space for both model weight files.
+
+The dashboard reports the active repository, revision, and license. Checkpoint
+selection stays at pod startup because hot-swapping an 8B model would discard
+CUDA graphs, snapshots, and the live conversation. Use separate templates or
+restart with `PERSONAPLEX_MODEL=base` for A/B comparisons. On a fresh browser,
+the base selection also restores Assisted overlap handling, audio temperature
+`0.7`, and repetition penalty `1.15`; saved user tuning remains untouched.
 
 When the server log prints `serving static content from`, open the proxy URL from the pod (looks like `https://<pod-id>-8998.proxy.runpod.net/`). Click **Start**, allow microphone access, and speak.
 
@@ -161,11 +176,17 @@ Controls:
 - **Capture Now**: force a high-detail frame send immediately (bypasses motion gate and pause).
 - **Rewind**: restore the last KV-cache snapshot if the model gets stuck. Auto-rewind also fires when the safety net trips 3+ times in 30 s.
 
+The reaction selector has three explicit levels: **Captions only** keeps scene
+descriptions outside the speech model, **After speech** queues one scene fact
+after a user turn, and **Continuous** is an experimental ambient feed. The last
+two inject text mid-stream and can alter the checkpoint's learned turn timing;
+Captions only is the cleanest mode for evaluating native duplex behavior.
+
 The **Vision Prompt** textarea in the config panel customizes the system prompt sent to Gemini at the start of each session. Frames are motion-gated client-side so static scenes don't waste calls. A live cost meter and a rolling caption history sit below the preview. The fallback frame interval is configurable; most frames are server-requested when the model just went silent, so the timer rarely fires in practice.
 
 ## Hardware
 
-Tested on RTX 4090 (24 GB) with the default RunPod driver. Any modern NVIDIA card with 12 GB+ VRAM should work. Smaller cards can run with CPU offload at the cost of latency.
+Use at least 24 GB VRAM for the resident model and rewind snapshot. Smaller cards require CPU offload or disabling periodic snapshots and will have higher latency.
 
 ## Architecture notes
 
@@ -192,10 +213,11 @@ Vision path (when `GEMINI_API_KEY` is set and the user enables it):
 
 These come from the upstream model, not the RunPod packaging:
 
-- **Response looping**: under certain prompts the model can repeat itself. The repetition penalty, padding bonus, and max-turn-length sliders in the Advanced panel ship with sane defaults that mitigate this; auto-rewind also catches rare cases where the safety net fires repeatedly.
+- **Response looping**: under certain prompts the model can repeat itself. Native RL defaults leave repetition and PAD bias off so they do not distort learned turn timing; max-turn and auto-rewind remain circuit breakers, and the Advanced panel exposes anti-loop overrides.
+- **Research checkpoint**: the default RL model is non-commercial and its published evaluation is automated. Conversation-data style can affect safety behavior; review the model card before deploying it beyond research or personal evaluation.
 - **Pipeline efficiency**: GPU utilisation is occasionally spiky; some kernels are not yet optimised.
 
-Core model issues belong upstream at [NVIDIA/personaplex](https://github.com/NVIDIA/personaplex/issues). Bugs in the RunPod packaging or WebRTC client belong here.
+Base-model issues belong upstream at [NVIDIA/personaplex](https://github.com/NVIDIA/personaplex/issues); RL-checkpoint behavior belongs with [Kyutai's model](https://huggingface.co/kyutai/personaplex-rl-seamless). Bugs in the RunPod packaging or WebRTC client belong here.
 
 ## Local dev
 

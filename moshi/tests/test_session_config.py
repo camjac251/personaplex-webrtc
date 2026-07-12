@@ -102,9 +102,9 @@ def test_defaults_match_stable_conversation_tuning() -> None:
     defaults = SessionConfig()
     assert defaults.text_temperature == 0.7
     assert defaults.text_topk == 25
-    assert defaults.audio_temperature == 0.7
+    assert defaults.audio_temperature == 0.8
     assert defaults.audio_topk == 250
-    assert defaults.repetition_penalty == 1.15
+    assert defaults.repetition_penalty == 1.0
     assert defaults.repetition_penalty_context == 64
     assert defaults.padding_bonus == 0.0
     assert defaults.max_turn_text_tokens == 120

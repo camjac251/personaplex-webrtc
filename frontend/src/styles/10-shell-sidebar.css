@@ -113,6 +113,12 @@
     line-height: 1;
     font-feature-settings: 'tnum';
   }
+  .model-pill .v {
+    max-width: 96px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .pill .v.live { color: var(--accent); }
   .pill .v.warn { color: var(--amber); animation: pulse 1.2s ease-in-out infinite; }
 
@@ -388,6 +394,31 @@
   .session-profile .lb-trigger {
     background: var(--surface);
     border-color: var(--line-2);
+  }
+  .model-runtime-card {
+    margin-top: 7px;
+    padding: 8px 9px;
+    display: grid;
+    gap: 2px;
+    border: 1px solid var(--line);
+    border-radius: var(--r-ctrl);
+    background: var(--sunk);
+  }
+  .model-runtime-k {
+    color: var(--ink-4);
+    font-family: 'Geist Mono', monospace;
+    font-size: 8px;
+    letter-spacing: 0.16em;
+  }
+  .model-runtime-v {
+    color: var(--accent);
+    font-size: 11px;
+    overflow-wrap: anywhere;
+  }
+  .model-runtime-d {
+    color: var(--ink-4);
+    font-size: 9px;
+    overflow-wrap: anywhere;
   }
   .profile-tools {
     margin-top: 7px;
