@@ -4,7 +4,7 @@
 [![Paper](https://img.shields.io/badge/📄-Paper-blue)](https://research.nvidia.com/labs/adlr/files/personaplex/personaplex_preprint.pdf)
 [![Interactivity](https://img.shields.io/badge/📄-RL%20Interactivity-violet)](https://arxiv.org/abs/2606.11167)
 
-PersonaPlex is a real-time, full-duplex speech-to-speech model with persona control via text prompts and voice conditioning. This fork defaults to Kyutai's interactivity-aligned PersonaPlex checkpoint and packages it as a single-template RunPod deployment with a WebRTC browser client and a one-shot bootstrap script.
+PersonaPlex is a real-time, full-duplex speech-to-speech model with persona control via text prompts and voice conditioning. This fork defaults to Kyutai's interactivity-aligned PersonaPlex checkpoint and deploys on RunPod's maintained CUDA base image with a WebRTC browser client and a one-shot bootstrap script.
 
 ## Credits
 
@@ -37,47 +37,46 @@ In the RunPod console, go to **Secrets** -> **Create secret** and add the follow
 | `TURN_KEY_API_TOKEN` | Cloudflare API Token |
 | `GEMINI_API_KEY` | Google AI Studio key (optional; enables Vision) |
 
-### 4. Build the custom image
-
-The one-shot bootstrap path below still works, but a fresh Pod has to
-recreate the Python environment and download large Torch/CUDA wheels. For
-repeated launches, use the GitHub Actions workflow in this repo to build and
-publish the image to GitHub Container Registry:
-
-- Push to `main`, push a `v*.*.*` tag, or run **Docker image** manually from
-  the Actions tab.
-- The workflow publishes `ghcr.io/camjac251/personaplex-runpod:latest` on
-  `main`, branch/tag names for matching refs, and `sha-<commit>` tags for every
-  non-PR build.
-
-The image bakes the repo and Python dependencies. It does **not** bake
-HuggingFace model weights, voice prompts, or secrets. Those download on first
-start into `/workspace` and are reused when the same Pod is stopped/started, or
-when you attach a network volume that already has the cache. If the GHCR
-package is private, either make it public or add registry authentication in the
-RunPod template.
-
-### 5. Pod template
+### 4. Pod template
 
 Create a Pod template (Templates -> New Template). Settings:
 
+- **Template name**: `PersonaPlex`
 - **Type**: Pod
 - **Compute**: NVIDIA GPU
-- **Container image**: `ghcr.io/camjac251/personaplex-runpod:latest`
-- **Container disk**: 60 GB
+- **Public template**: Off (recommended unless you intend to publish it)
+- **Container image**: `runpod/base:1.0.7-cuda1281-ubuntu2404@sha256:abd8ebde05b7027fb95913aefbcb9a236381633a481962877f658c2ed721fc37`
+- **Registry authentication**: None
+- **Container disk**: 20 GB
 - **Volume disk**: 60 GB minimum, 80 GB comfortable
 - **Volume mount path**: `/workspace`
 
-**Container start command**: leave blank so the image `CMD` runs. If the
-console requires a value, use:
+This pins RunPod's maintained CUDA 12.8.1 base rather than publishing a second
+application image. The project, exact locked Python environment, HuggingFace
+assets, and voice prompts live under `/workspace`; the first boot creates them
+and subsequent starts reuse them. No registry authentication is required.
+
+**Container start command**:
 
 ```bash
-/opt/personaplex-runpod/docker/runpod-start.sh
+bash -lc set${IFS}-e;curl${IFS}-fsSL${IFS}https://raw.githubusercontent.com/camjac251/Personaplex-runpod/main/start.sh${IFS}-o${IFS}/workspace/start.sh;chmod${IFS}+x${IFS}/workspace/start.sh;/start.sh&exec${IFS}/workspace/start.sh
 ```
 
-**HTTP ports**: `8998` (PersonaPlex). `8888` (JupyterLab) is optional.
+**Networking configuration**:
 
-**TCP ports**: none.
+| Label | Protocol | Port | Requirement |
+|---|---|---:|---|
+| `PersonaPlex` | HTTP | `8998` | Required |
+| `JupyterLab` | HTTP | `8888` | Optional; also set `JUPYTER_PASSWORD` |
+
+Leave TCP ports empty for RunPod's basic proxied SSH. Add your full public key
+under RunPod account settings -> **SSH Public Keys**; RunPod injects it as
+`PUBLIC_KEY`, and the base image's `/start.sh` starts `sshd`. Connect with the
+`ssh <pod>-<suffix>@ssh.runpod.io -i <private-key>` command shown by RunPod.
+
+Only add an `SSH` TCP port on `22` if you need direct public-IP SSH, SCP/SFTP,
+rsync, or VS Code/Cursor Remote-SSH. Direct TCP also requires a host with a
+public IP.
 
 **Environment variables**:
 
@@ -87,6 +86,7 @@ console requires a value, use:
 | `TURN_KEY_ID` | `{{ RUNPOD_SECRET_TURN_KEY_ID }}` |
 | `TURN_KEY_API_TOKEN` | `{{ RUNPOD_SECRET_TURN_KEY_API_TOKEN }}` |
 | `GEMINI_API_KEY` | `{{ RUNPOD_SECRET_GEMINI_API_KEY }}` (optional) |
+| `JUPYTER_PASSWORD` | A strong RunPod secret (optional; enables JupyterLab) |
 | `PERSONAPLEX_MODEL` | `rl-seamless` (default) or `base` |
 | `PERSONAPLEX_HF_REPO` | Custom model repository override (optional) |
 | `PERSONAPLEX_HF_REVISION` | Override the pinned tested model revision (optional) |
@@ -103,37 +103,7 @@ Use **Stop** / **Start** on the same Pod to keep `/workspace`. Terminating a
 regular Pod deletes its volume disk; use a network volume if you need the cache
 to survive Pod deletion or move between Pods.
 
-#### Bootstrap fallback
-
-If you do not want to build an image yet, use the base image and bootstrap
-script. This path is slower on any fresh `/workspace` volume.
-
-- **Container image**: `runpod/base:1.0.7-cuda1281-ubuntu2404`
-- **Container disk**: 20 GB
-- **Volume disk**: 60 GB minimum
-- **Volume mount path**: `/workspace`
-
-**Container start command**:
-
-```bash
-bash -c "curl -sL https://raw.githubusercontent.com/camjac251/Personaplex-runpod/main/start.sh -o /workspace/start.sh && chmod +x /workspace/start.sh && /workspace/start.sh & /start.sh"
-```
-
-**HTTP ports**: `8998` (PersonaPlex). `8888` (JupyterLab) is optional.
-
-**TCP ports**: none.
-
-**Environment variables**:
-
-| Name | Value |
-|---|---|
-| `HF_TOKEN` | `{{ RUNPOD_SECRET_HF_TOKEN }}` |
-| `TURN_KEY_ID` | `{{ RUNPOD_SECRET_TURN_KEY_ID }}` |
-| `TURN_KEY_API_TOKEN` | `{{ RUNPOD_SECRET_TURN_KEY_API_TOKEN }}` |
-| `GEMINI_API_KEY` | `{{ RUNPOD_SECRET_GEMINI_API_KEY }}` (optional) |
-| `PERSONAPLEX_MODEL` | `rl-seamless` (default) or `base` |
-
-### 6. Launch and connect
+### 5. Launch and connect
 
 Use a GPU with at least 24 GB VRAM for the default resident model plus rewind
 snapshot (RTX 4090 / A6000 / L40S all work). Lower-memory cards require CPU
