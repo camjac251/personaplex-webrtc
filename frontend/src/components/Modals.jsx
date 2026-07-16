@@ -6,7 +6,7 @@ export function PreflightModal({ preflight, done, onRun, onClose }) {
   const rows = [
     { key: "mic", label: "Microphone", hint: "getUserMedia · echo cancellation follows your setting" },
     { key: "out", label: "Audio output", hint: "Short 440 Hz tone" },
-    { key: "turn", label: "TURN reachable", hint: "GET /api/rtc/ice-servers" },
+    { key: "turn", label: "Server reachable", hint: "GET /api/rtc/ice-servers" },
   ];
   return (
     // biome-ignore lint/a11y: backdrop click-to-dismiss is a supplementary affordance; ESC via trapDialogKeydown and the Close button provide the keyboard path

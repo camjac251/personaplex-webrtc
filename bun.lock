@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "personaplex-runpod-workspace",
+      "name": "personaplex-webrtc-workspace",
       "devDependencies": {
         "lefthook": "^2.1.8",
       },

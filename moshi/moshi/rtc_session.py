@@ -62,14 +62,6 @@ OUTBOUND_STANDING_BACKLOG_WINDOW = 25
 OUTBOUND_STANDING_BACKLOG_MIN_SAMPLES = OUTBOUND_FRAME_SAMPLES // 2
 CONTROL_TASK_MAX = 128
 
-# STUN-only fallback used when no TURN credentials are configured. Works
-# only when both peers can reach each other directly over UDP, which is
-# not the case behind RunPod's HTTPS-only proxy. Production deployments
-# should provide TURN credentials via the env vars consumed in server.py.
-DEFAULT_STUN_FALLBACK: tuple[dict, ...] = (
-    {"urls": ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"]},
-)
-
 
 ProcessFrameFn = Callable[[np.ndarray], list[tuple[np.ndarray, Optional[str]]]]
 LogFn = Callable[[str, str], None]
@@ -786,10 +778,12 @@ class RTCSession:
     ) -> None:
         """Create a peer-connection session.
 
-        ``ice_servers`` is a Cloudflare-shaped iceServers list (entries of
+        ``ice_servers`` is a browser-shaped iceServers list (entries of
         ``{"urls": [...], "username": "...", "credential": "..."}``).
-        ``None`` falls back to STUN-only, which won't traverse the RunPod
-        HTTPS proxy and is intended for local LAN dev.
+        Empty or ``None`` means direct connectivity with no STUN/TURN:
+        the peer connection offers only host candidates, so the server
+        must run where those candidates carry a public IP (on the host,
+        or a container with host networking).
         """
         self._frame_size = frame_size
         self._process_fn = process_fn
@@ -797,7 +791,7 @@ class RTCSession:
         self._backpressure_status = backpressure_status
         self._process_executor = process_executor
 
-        configured = ice_servers if ice_servers else list(DEFAULT_STUN_FALLBACK)
+        configured = list(ice_servers) if ice_servers else []
         self._pc = RTCPeerConnection(
             configuration=RTCConfiguration(
                 iceServers=ice_servers_to_aiortc(configured)

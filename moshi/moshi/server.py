@@ -29,7 +29,6 @@ import asyncio
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-import datetime
 from functools import wraps
 import json
 import random
@@ -55,7 +54,6 @@ from aiortc import RTCSessionDescription
 from .models import loaders, MimiModel, LMGen
 from .models.lm import MAX_REPETITION_CONTEXT
 from .rtc_session import (
-    DEFAULT_STUN_FALLBACK,
     INJECT_SILENCE_RMS_DEFAULT,
     INJECT_SILENCE_STREAK_DEFAULT,
     MAX_TURN_TEXT_TOKENS_MIN,
@@ -1105,14 +1103,20 @@ class ServerState:
         # set, the runner task that owns the lock can be garbage-collected
         # mid-session, leaving the lock permanently held.
         self._session_tasks: set[asyncio.Task] = set()
-        # Cloudflare TURN credentials (optional). When both are set we mint
-        # ephemeral creds via their API per session; otherwise STUN-only.
-        # Read from env so the values never enter the repo.
-        self._turn_key_id = os.environ.get("TURN_KEY_ID", "").strip() or None
-        self._turn_api_token = os.environ.get("TURN_KEY_API_TOKEN", "").strip() or None
-        self._ice_cache: Optional[list[dict]] = None
-        self._ice_cache_expires_at: float = 0.0
-        self._ice_cache_lock = asyncio.Lock()
+        # WebRTC uses direct connectivity: the server advertises its own
+        # host candidates (the public IP when run on the host or in a
+        # container with host networking), so no TURN relay is needed.
+        # WEBRTC_STUN_URLS is an optional comma-separated escape hatch for
+        # deployments behind NAT; empty by default keeps the path fully
+        # direct with no external dependency.
+        _stun_urls = [
+            u.strip()
+            for u in os.environ.get("WEBRTC_STUN_URLS", "").split(",")
+            if u.strip()
+        ]
+        self._ice_servers_config: list[dict] = (
+            [{"urls": _stun_urls}] if _stun_urls else []
+        )
         # Gemini state. Caption requests are stateless; _vision_in_flight
         # prevents duplicate dispatch for one active source generation.
         self._gemini_api_key = os.environ.get("GEMINI_API_KEY", "").strip() or None
@@ -3879,105 +3883,10 @@ class ServerState:
             }
         )
 
-    async def _fetch_ice_servers(self) -> tuple[list[dict], bool]:
-        """Return ``(iceServers, turn_failed)`` for the current session.
-
-        With ``TURN_KEY_ID`` and ``TURN_KEY_API_TOKEN`` set, mints a fresh
-        24-hour credential pack from Cloudflare Realtime and caches it for
-        12 hours. Otherwise returns the STUN-only fallback, which only
-        works when both peers can reach each other directly over UDP
-        (i.e. on LAN; not through RunPod's HTTPS proxy).
-
-        ``turn_failed`` is ``True`` only when TURN was configured but
-        provisioning failed (4xx, non-JSON, network error, empty list).
-        Callers facing the network use it to fail the session fast with
-        503 instead of silently handing the client a STUN-only config
-        that cannot traverse RunPod NAT. ``False`` for both healthy
-        TURN and the no-TURN-configured LAN dev case.
-        """
-        if not (self._turn_key_id and self._turn_api_token):
-            return [dict(s) for s in DEFAULT_STUN_FALLBACK], False
-
-        async with self._ice_cache_lock:
-            now = time.monotonic()
-            if self._ice_cache is not None and now < self._ice_cache_expires_at:
-                return self._ice_cache, False
-
-            ttl_seconds = 86400  # Cloudflare's documented max.
-            url = (
-                "https://rtc.live.cloudflare.com/v1/turn/keys/"
-                f"{self._turn_key_id}/credentials/generate"
-            )
-            stun_fallback = [dict(s) for s in DEFAULT_STUN_FALLBACK]
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        url,
-                        headers={
-                            "Authorization": f"Bearer {self._turn_api_token}",
-                            "Content-Type": "application/json",
-                        },
-                        json={"ttl": ttl_seconds},
-                        timeout=aiohttp.ClientTimeout(total=10),
-                    ) as resp:
-                        body_text = await resp.text()
-                        if resp.status >= 400:
-                            logger.warning(
-                                "Cloudflare TURN creds fetch failed: "
-                                f"{resp.status} {body_text[:200]}"
-                            )
-                            return stun_fallback, True
-                        try:
-                            data = json.loads(body_text)
-                        except ValueError as exc:
-                            logger.warning(
-                                f"Cloudflare TURN creds fetch returned non-JSON: {exc}"
-                            )
-                            return stun_fallback, True
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                logger.warning(f"Cloudflare TURN creds fetch error: {exc}")
-                return stun_fallback, True
-
-            servers = data.get("iceServers")
-            if isinstance(servers, dict):
-                # Cloudflare currently returns a single object; spec also
-                # allows an array. Accept both.
-                servers = [servers]
-            if not isinstance(servers, list) or not servers:
-                logger.warning(
-                    "Cloudflare returned no iceServers; falling back to STUN"
-                )
-                return stun_fallback, True
-
-            self._ice_cache = servers
-            # Refresh halfway through the TTL so we never serve creds that
-            # are about to expire mid-session.
-            self._ice_cache_expires_at = now + ttl_seconds / 2
-            refresh_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=ttl_seconds // 2)
-            logger.info(
-                "Cloudflare TURN creds minted (ttl=%ds, refresh at %s)",
-                ttl_seconds,
-                refresh_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            )
-            return servers, False
-
     async def handle_ice_servers(self, _request):
-        servers, turn_failed = await self._fetch_ice_servers()
-        if turn_failed:
-            return web.json_response(
-                {
-                    "error": "turn_unavailable",
-                    "detail": (
-                        "TURN provisioning failed; the server cannot mint "
-                        "Cloudflare credentials. Connections behind NAT "
-                        "(including RunPod's HTTPS proxy) will not work. "
-                        "Check TURN_KEY_ID / TURN_KEY_API_TOKEN and the "
-                        "Cloudflare Realtime dashboard."
-                    ),
-                },
-                status=503,
-            )
-        return web.json_response({"iceServers": servers})
+        # Direct connectivity: return the optional STUN escape hatch, or an
+        # empty list for host-candidate-only WebRTC. No TURN relay.
+        return web.json_response({"iceServers": self._ice_servers_config})
 
     async def handle_rtc_candidate(self, request):
         """Accept a peer-trickled ICE candidate.
@@ -4028,8 +3937,8 @@ class ServerState:
                 "Content-Type": "text/event-stream",
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
-                # Disable nginx-style proxy buffering so the
-                # Cloudflare/RunPod edge actually streams.
+                # Disable nginx-style proxy buffering so a reverse proxy
+                # in front of the server streams SSE without buffering.
                 "X-Accel-Buffering": "no",
             },
         )
@@ -4231,30 +4140,11 @@ class ServerState:
                 config_holder["cfg"] = cfg
                 config_event.set()
 
-            t_ice = time.monotonic()
-            ice_servers, turn_failed = await self._fetch_ice_servers()
-            clog.log(
-                "info",
-                f"timing: ice_servers fetched in {(time.monotonic() - t_ice) * 1000:.0f} ms",
-            )
-            if turn_failed:
-                # Refuse the session rather than hand the client a
-                # STUN-only config that will fail to traverse NAT 30 s
-                # later with no actionable signal.
-                clog.log(
-                    "error",
-                    "TURN unavailable; refusing offer to avoid silent NAT failure",
-                )
-                self.lock.release()
-                owns_lock = False
-                return web.json_response(
-                    {"error": "turn_unavailable"}, status=503
-                )
             session = RTCSession(
                 frame_size=self.frame_size,
                 process_fn=self._process_audio_frame,
                 log=clog.log,
-                ice_servers=ice_servers,
+                ice_servers=self._ice_servers_config,
                 backpressure_status=self._backpressure_status,
                 process_executor=self._infer_executor,
             )
@@ -5972,7 +5862,7 @@ class ServerState:
                 await session.close()
             finally:
                 # Return cached-but-freed GPU blocks to the allocator so
-                # external observers (nvidia-smi, RunPod metrics) see VRAM
+                # external observers (nvidia-smi) see VRAM
                 # drop back to baseline between sessions. The model
                 # weights and KV cache buffer stay resident; only the
                 # snapshot clones and transient allocations are released.
@@ -6423,26 +6313,6 @@ def main():
         GEMINI_VISION_MODEL,
     )
 
-    # Pre-warm Cloudflare TURN credentials so the very first session
-    # after boot does not pay the credential mint round-trip. The
-    # creds are cached in-process for 12 h after this call. No-op
-    # when TURN_KEY_ID / TURN_KEY_API_TOKEN are unset.
-    if state._turn_key_id and state._turn_api_token:
-        try:
-            t0 = time.monotonic()
-            _, turn_failed = asyncio.run(state._fetch_ice_servers())
-            if turn_failed:
-                logger.warning(
-                    "TURN pre-warm failed; sessions will be refused with 503 "
-                    "until creds mint successfully on demand"
-                )
-            else:
-                logger.info(
-                    f"TURN creds pre-warmed in {(time.monotonic() - t0) * 1000:.0f} ms"
-                )
-        except Exception as exc:  # never block startup on a TURN hiccup
-            logger.warning(f"TURN pre-warm failed (will mint on demand): {exc}")
-
     app = web.Application(client_max_size=UPLOAD_MAX_BYTES + 1024 * 1024)
     app.router.add_post("/api/rtc/offer", state.handle_rtc_offer)
     app.router.add_post("/api/rtc/candidate", state.handle_rtc_candidate)
@@ -6489,35 +6359,6 @@ def main():
     if setup_tunnel is not None:
         tunnel = setup_tunnel('localhost', args.port, tunnel_token, None)
         logger.info(f"Tunnel started, if executing on a remote GPU, you can use {tunnel}.")
-
-    # Cloudflare's TURN returns a bare 401 on CHANNEL_BIND that aioice
-    # cannot retry, leaving "Task exception was never retrieved" stack
-    # traces in the log even though the WebRTC connection succeeds via
-    # plain Send-Indication. Filter THAT specific symptom out at the
-    # asyncio exception handler. Other aioice failures (network outage,
-    # DNS failure, real TURN auth issues, malformed STUN responses)
-    # must keep surfacing or operators have no diagnostic when TURN is
-    # genuinely broken.
-    async def _install_aioice_noise_filter(_app):
-        def _handler(loop, context):
-            exc = context.get("exception")
-            if isinstance(exc, Exception):
-                cls = type(exc)
-                mod = cls.__module__ or ""
-                if (
-                    mod.startswith("aioice.")
-                    and cls.__name__ == "TransactionFailed"
-                ):
-                    msg = str(exc)
-                    if (
-                        "CHANNEL_BIND" in msg
-                        or "401" in msg
-                        or "Unauthorized" in msg
-                    ):
-                        return
-            loop.default_exception_handler(context)
-        asyncio.get_event_loop().set_exception_handler(_handler)
-    app.on_startup.append(_install_aioice_noise_filter)
 
     async def _close_http_session(_app):
         """Drain live sessions before shutting down shared worker resources."""

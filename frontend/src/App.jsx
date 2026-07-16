@@ -752,7 +752,6 @@ function App() {
   // unfreezes the controls.
   const sideCollapsed = cfgLocked && !sideExpanded;
   const isBusy = connectionIssue === "busy";
-  const isTurnFailed = connectionIssue === "turn";
 
   useEffect(() => {
     if (promptDefaultsVersion === PROMPT_DEFAULTS_VERSION) return;
@@ -2531,7 +2530,7 @@ function App() {
   // server to continue the previous session's resident model state.
   const openPeerSession = useCallback(
     async ({ resumeSessionId = null } = {}) => {
-      setStageMessage("Fetching TURN credentials");
+      setStageMessage("Preparing connection");
       const iceServers = await fetchIceServers();
       addNotice("info", "Creating peer connection");
       // Candidates gathered by this peer connection buffer until the answer
@@ -2609,7 +2608,7 @@ function App() {
             if (state === "checking") setStageMessage("Connecting peers");
             if (state === "connected" || state === "completed") setStageMessage("Opening control channel");
             if (state === "failed") {
-              addNotice("err", "ICE failed, TURN may be unreachable");
+              addNotice("err", "ICE failed, could not establish a direct connection");
               cleanup({ keepPhase: true });
               setPhase("idle");
             }
@@ -2690,7 +2689,7 @@ function App() {
         });
 
         if (res.status === 409) {
-          const error = new Error("Pod busy. Another client is already connected.");
+          const error = new Error("Session busy. Another client is already connected.");
           error.code = "session_busy";
           throw error;
         }
@@ -2880,9 +2879,6 @@ function App() {
       if (error.code === "session_busy") {
         setConnectionIssue("busy");
         addNotice("err", "Connect denied, session busy");
-      } else if (error.code === "turn_unavailable") {
-        setConnectionIssue("turn");
-        addNotice("err", "TURN provisioning failed");
       } else if (error.name === "NotAllowedError") {
         addNotice("err", "Microphone access denied");
       } else {
@@ -4066,7 +4062,7 @@ function App() {
             <div className="brand-name">
               PersonaPlex<span>Studio</span>
             </div>
-            <div className="brand-tag">runpod</div>
+            <div className="brand-tag">personaplex</div>
           </div>
         </div>
         <div className="phaseline" style={{ "--progress": `${phaseProgress}%` }}>
@@ -4802,23 +4798,20 @@ function App() {
                 <div className="h1">Conversation</div>
                 <div className="sub">
                   {isBusy
-                    ? "Pod busy, another client connected"
-                    : isTurnFailed
-                      ? "TURN provisioning failed"
-                      : isLive
-                        ? `Voice: ${voiceDisplay}${interrupting ? " · stopping response" : visionInjecting ? " · injecting context" : ""}`
-                        : stageMessage}
+                    ? "Session busy, another client connected"
+                    : isLive
+                      ? `Voice: ${voiceDisplay}${interrupting ? " · stopping response" : visionInjecting ? " · injecting context" : ""}`
+                      : stageMessage}
                 </div>
               </div>
             </div>
             <div className="r">
               {isBusy && <Badge kind="warn" label="Busy" />}
-              {isTurnFailed && <Badge kind="warn" label="TURN failed" />}
-              {!isBusy && !isTurnFailed && isLive && <Badge kind="live" label={`Live · ${elapsedStr}`} />}
-              {!isBusy && !isTurnFailed && phase === "connecting" && <Badge kind="warn" label="Connecting" />}
-              {!isBusy && !isTurnFailed && phase === "warmup" && <Badge kind="warn" label="Warmup" />}
-              {!isBusy && !isTurnFailed && phase === "idle" && <Badge label="Ready" />}
-              {!isBusy && !isTurnFailed && phase === "ended" && <Badge label={`Ended · ${elapsedStr}`} />}
+              {!isBusy && isLive && <Badge kind="live" label={`Live · ${elapsedStr}`} />}
+              {!isBusy && phase === "connecting" && <Badge kind="warn" label="Connecting" />}
+              {!isBusy && phase === "warmup" && <Badge kind="warn" label="Warmup" />}
+              {!isBusy && phase === "idle" && <Badge label="Ready" />}
+              {!isBusy && phase === "ended" && <Badge label={`Ended · ${elapsedStr}`} />}
             </div>
           </div>
 
@@ -4898,26 +4891,22 @@ function App() {
                     </span>
                   </div>
                 )}
-                {(isBusy || isTurnFailed || reconnecting || phase === "idle" || phase === "connecting" || phase === "warmup") && (
-                  <div className={cls("viz-overlay", (reconnecting || phase === "connecting" || phase === "warmup") && "connecting", (isBusy || isTurnFailed) && "error")}>
+                {(isBusy || reconnecting || phase === "idle" || phase === "connecting" || phase === "warmup") && (
+                  <div className={cls("viz-overlay", (reconnecting || phase === "connecting" || phase === "warmup") && "connecting", isBusy && "error")}>
                     <div className="stack">
                       <span className="label">
                         <span className="d" />
                         {isBusy
-                          ? "Pod busy"
-                          : isTurnFailed
-                            ? "TURN provisioning failed"
-                            : reconnecting
-                              ? "Rebuilding connection, resuming session"
-                              : phase === "idle"
-                                ? "Standby. Connect to begin."
-                                : stageMessage}
+                          ? "Session busy"
+                          : reconnecting
+                            ? "Rebuilding connection, resuming session"
+                            : phase === "idle"
+                              ? "Standby. Connect to begin."
+                              : stageMessage}
                       </span>
-                      {(isBusy || isTurnFailed) && (
+                      {isBusy && (
                         <span className="sub">
-                          {isBusy
-                            ? "Server enforces one live session. Try again when the current client disconnects."
-                            : "Cloudflare TURN credentials could not be minted. Check TURN_KEY_ID and TURN_KEY_API_TOKEN."}
+                          Server enforces one live session. Try again when the current client disconnects.
                         </span>
                       )}
                     </div>
@@ -5416,7 +5405,7 @@ function App() {
           <div className="cons-sect">
             <div className="cons-h">C · Pipeline</div>
             <div className="flow">
-              <Flow label="Peer connection" value={isLive ? "connected · turn" : phase === "connecting" ? "gathering ICE" : "idle"} active={isLive || phase === "connecting"} warn={phase === "connecting"} />
+              <Flow label="Peer connection" value={isLive ? "connected" : phase === "connecting" ? "gathering ICE" : "idle"} active={isLive || phase === "connecting"} warn={phase === "connecting"} />
               <Flow label="Mimi codec" value={isLive || phase === "warmup" ? "24 kHz · 12.5 fps" : "idle"} active={isLive || phase === "warmup"} />
               <Flow label={`LM · ${modelShortLabel}`} value={isLive ? `t ${fmt(textTemp, 2)} · k ${textTopk}${visionInjecting ? " · gated" : ""}` : phase === "warmup" ? "warming" : "idle"} active={isLive || phase === "warmup"} warn={visionInjecting} />
               {visionOn && <Flow label="Gemini vision" value={visionPaused ? "paused" : `frames active · ${visionFeedStatus} · ${visionTurnStatus}`} active={!visionPaused} warn={visionPaused || visionInjecting} branch />}

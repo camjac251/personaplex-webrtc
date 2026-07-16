@@ -218,7 +218,7 @@ def test_stat_envelope_only_forwards_numeric_diagnostics() -> None:
         diagnostics={
             "pcm_queue_depth": 4,
             "pcm_dropped_ms": 80.04,
-            "private_path": "/workspace/secret",
+            "private_path": "/private/secret",
             "outbound_drop_events": "not numeric",
         },
     )

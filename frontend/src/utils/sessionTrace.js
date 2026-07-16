@@ -384,7 +384,7 @@ const BEARER_PATTERN = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi;
 const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g;
 const ASSIGNMENT_SECRET_PATTERN = /\b(api[_-]?key|token|secret|password|credential)\s*[:=]\s*[^\s,;]+/gi;
 const SECRET_TOKEN_PATTERN = /\b(?:sk-[A-Za-z0-9_-]{8,}|AIza[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|hf_[A-Za-z0-9]{16,})\b/g;
-const UNIX_PATH_PATTERN = /(^|[\s(])\/(?:home|root|runpod-volume|tmp|var|workspace)(?:\/[^\s),;:]*)?/g;
+const UNIX_PATH_PATTERN = /(^|[\s(])\/(?:home|root|tmp|var|workspace)(?:\/[^\s),;:]*)?/g;
 const WINDOWS_PATH_PATTERN = /\b[A-Za-z]:\\(?:[^\\\s]+\\)*[^\s,;:]*/g;
 
 const textEncoder = new TextEncoder();

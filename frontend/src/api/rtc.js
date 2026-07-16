@@ -1,32 +1,15 @@
-const ICE_SERVERS_FALLBACK = [
-  { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] },
-];
-
+// Returns the server's ICE server list, or an empty array when the route
+// fails or returns malformed JSON. An empty list means direct host
+// candidates only (no STUN/TURN), which is the default here.
 export async function fetchIceServers() {
   const res = await fetch("/api/rtc/ice-servers", { method: "GET" });
-  if (res.status === 503) {
-    let detail =
-      "TURN unavailable on the server. Connections behind NAT will fail.";
-    try {
-      const data = await res.json();
-      if (data?.detail) detail = data.detail;
-    } catch {
-      // Keep the default detail.
-    }
-    const error = new Error(detail);
-    error.code = "turn_unavailable";
-    throw error;
-  }
-  if (!res.ok) return ICE_SERVERS_FALLBACK;
+  if (!res.ok) return [];
   try {
     const data = await res.json();
-    if (Array.isArray(data.iceServers) && data.iceServers.length > 0) {
-      return data.iceServers;
-    }
+    return Array.isArray(data.iceServers) ? data.iceServers : [];
   } catch {
-    // Fall through to LAN-only STUN fallback.
+    return [];
   }
-  return ICE_SERVERS_FALLBACK;
 }
 
 // Returns voice ids from the server, or null when the route is absent or

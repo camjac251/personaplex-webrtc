@@ -1,5 +1,5 @@
 {
-  "name": "personaplex-runpod-workspace",
+  "name": "personaplex-webrtc-workspace",
   "private": true,
   "workspaces": [
     "frontend"
