@@ -1,99 +1,62 @@
-"""Checks for startup-time PersonaPlex checkpoint selection."""
+"""Native PersonaPlex checkpoint resolution (``moshi.models.loaders``).
 
-from __future__ import annotations
-
-import os
-from pathlib import Path
-import subprocess
-
-
-ROOT = Path(__file__).parents[2]
-RESOLVER = ROOT / "docker" / "model-env.sh"
-RL_REPO = "kyutai/personaplex-rl-seamless"
-RL_REVISION = "3fa800309a4b743a8a6d764253eb45def0334afc"
-BASE_REPO = "nvidia/personaplex-7b-v1"
-BASE_REVISION = "fdaf4090a61cb315c138a1faee287ffd6c716309f"
+Replaces the former ``docker/model-env.sh`` shell resolver: the server and the
+prefetch script both call ``resolve_model_selection``, so rl-seamless vs base
+is selectable from ``PERSONAPLEX_MODEL`` without a shell wrapper.
+"""
+from moshi.models.loaders import (
+    BASE_REPO,
+    BASE_REVISION,
+    DEFAULT_REPO,
+    DEFAULT_REVISION,
+    resolve_model_selection,
+)
 
 
-def _resolve(**values: str) -> subprocess.CompletedProcess[str]:
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if key not in {
-            "PERSONAPLEX_MODEL",
-            "PERSONAPLEX_HF_REPO",
-            "PERSONAPLEX_HF_REVISION",
-        }
-    }
-    env.update(values)
-    return subprocess.run(
-        [
-            "bash",
-            "-c",
-            (
-                f'source "{RESOLVER}"; '
-                "personaplex_resolve_model || exit $?; "
-                'printf "%s\\n%s\\n" "$PERSONAPLEX_SELECTED_HF_REPO" '
-                '"$PERSONAPLEX_SELECTED_HF_REVISION"'
-            ),
-        ],
-        check=False,
-        capture_output=True,
-        env=env,
-        text=True,
-    )
+def test_default_is_pinned_rl_seamless() -> None:
+    assert resolve_model_selection() == (DEFAULT_REPO, DEFAULT_REVISION)
 
 
-def test_default_model_is_pinned_rl_seamless() -> None:
-    result = _resolve()
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == [RL_REPO, RL_REVISION]
+def test_rl_seamless_flavor_is_pinned() -> None:
+    assert resolve_model_selection("rl-seamless") == (DEFAULT_REPO, DEFAULT_REVISION)
 
 
 def test_base_alias_selects_pinned_nvidia_model() -> None:
-    result = _resolve(PERSONAPLEX_MODEL="base")
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == [BASE_REPO, BASE_REVISION]
+    assert resolve_model_selection("base") == (BASE_REPO, BASE_REVISION)
 
 
 def test_known_repo_override_gets_its_matching_pin() -> None:
-    result = _resolve(PERSONAPLEX_HF_REPO=BASE_REPO)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == [BASE_REPO, BASE_REVISION]
-
-
-def test_legacy_base_revision_does_not_override_new_default() -> None:
-    result = _resolve(PERSONAPLEX_HF_REVISION=BASE_REVISION)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == [RL_REPO, RL_REVISION]
-    assert "ignoring legacy NVIDIA revision override" in result.stderr
-
-
-def test_known_revision_cannot_be_crossed_with_explicit_model() -> None:
-    rl_with_base_revision = _resolve(
-        PERSONAPLEX_MODEL="rl-seamless",
-        PERSONAPLEX_HF_REVISION=BASE_REVISION,
-    )
-    assert rl_with_base_revision.returncode == 64
-
-    base_with_rl_revision = _resolve(
-        PERSONAPLEX_MODEL="base",
-        PERSONAPLEX_HF_REVISION=RL_REVISION,
-    )
-    assert base_with_rl_revision.returncode == 64
-
-
-def test_custom_repo_requires_explicit_revision() -> None:
-    result = _resolve(PERSONAPLEX_HF_REPO="example/custom")
-    assert result.returncode == 64
-    assert "requires PERSONAPLEX_HF_REVISION" in result.stderr
+    assert resolve_model_selection(repo=BASE_REPO) == (BASE_REPO, BASE_REVISION)
+    assert resolve_model_selection(repo=DEFAULT_REPO) == (DEFAULT_REPO, DEFAULT_REVISION)
 
 
 def test_custom_repo_and_revision_are_forwarded() -> None:
-    revision = "e" * 40
-    result = _resolve(
-        PERSONAPLEX_HF_REPO="example/custom",
-        PERSONAPLEX_HF_REVISION=revision,
+    assert resolve_model_selection(repo="acme/model", revision="d" * 40) == (
+        "acme/model",
+        "d" * 40,
     )
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["example/custom", revision]
+
+
+def test_custom_repo_requires_explicit_revision() -> None:
+    try:
+        resolve_model_selection(repo="acme/model")
+    except ValueError:
+        return
+    raise AssertionError("a custom repo without a revision should raise")
+
+
+def test_unknown_flavor_raises() -> None:
+    try:
+        resolve_model_selection("nope")
+    except ValueError:
+        return
+    raise AssertionError("an unknown model flavor should raise")
+
+
+if __name__ == "__main__":
+    for _name, _fn in sorted(globals().items()):
+        if _name.startswith("test_") and callable(_fn):
+            print(_name, "...")
+            _fn()
+            print("  ok")
+    print("all model env tests passed")

@@ -37,29 +37,22 @@ bun run frontend:build           # builds the dashboard into moshi/moshi/web_cli
 
 ### 3. Prefetch model and voice assets (optional)
 
-The server downloads the checkpoint on first launch, but prefetching makes the first session instant. `docker/model-env.sh` resolves the repository and pinned revision from `PERSONAPLEX_MODEL` (`rl-seamless` default, or `base`):
+The server downloads the checkpoint on first launch, but prefetching makes the first session instant. The prefetch script resolves the repository and pinned revision from `PERSONAPLEX_MODEL` (`rl-seamless` default, or `base`):
 
 ```bash
-source docker/model-env.sh
-personaplex_resolve_model
-uv run python docker/prefetch_assets.py \
-  --voice-dir voices \
-  --repo "$PERSONAPLEX_SELECTED_HF_REPO" \
-  --revision "$PERSONAPLEX_SELECTED_HF_REVISION"
+uv run python scripts/prefetch_assets.py --voice-dir voices
 ```
 
 ### 4. Run
 
 ```bash
-source docker/model-env.sh        # honors PERSONAPLEX_MODEL
-personaplex_resolve_model
 uv run moshi-server \
   --host 0.0.0.0 \
   --port 8998 \
-  --hf-repo "$PERSONAPLEX_SELECTED_HF_REPO" \
-  --hf-revision "$PERSONAPLEX_SELECTED_HF_REVISION" \
   --voice-prompt-dir voices
 ```
+
+`moshi-server` reads `PERSONAPLEX_MODEL` (and the optional `PERSONAPLEX_HF_REPO` / `PERSONAPLEX_HF_REVISION` overrides) directly, so no wrapper script is needed to pick the checkpoint.
 
 First boot downloads the 16.7 GB model plus tokenizer and voice assets; expect 30-60 minutes depending on the host's bandwidth. Subsequent boots reach "ready" in under a minute once the HuggingFace cache is warm. Keeping both RL and base checkpoints requires disk for both weight files.
 
@@ -188,7 +181,7 @@ bun run frontend:build
 uv run moshi-server --host 127.0.0.1 --port 8998 --voice-prompt-dir voices
 ```
 
-Voice prompts download automatically on first launch, or prefetch them with `docker/prefetch_assets.py` (see step 3).
+Voice prompts download automatically on first launch, or prefetch them with `scripts/prefetch_assets.py` (see step 3).
 
 Run the focused CPU regression checks:
 

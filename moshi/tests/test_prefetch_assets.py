@@ -9,7 +9,7 @@ from pathlib import Path
 import tarfile
 
 
-_MODULE_PATH = Path(__file__).parents[2] / "docker" / "prefetch_assets.py"
+_MODULE_PATH = Path(__file__).parents[2] / "scripts" / "prefetch_assets.py"
 _SPEC = importlib.util.spec_from_file_location("prefetch_assets", _MODULE_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
 prefetch_assets = importlib.util.module_from_spec(_SPEC)

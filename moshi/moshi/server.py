@@ -6012,10 +6012,10 @@ def main():
     parser.add_argument(
         "--hf-repo",
         type=str,
-        default=RL_HF_REPO,
+        default=None,
         help=(
-            "Hugging Face model repository. Defaults to the interactivity-"
-            "aligned PersonaPlex RL checkpoint."
+            "Hugging Face model repository. Overrides PERSONAPLEX_MODEL; "
+            "defaults to the interactivity-aligned PersonaPlex RL checkpoint."
         ),
     )
     parser.add_argument(
@@ -6105,13 +6105,21 @@ def main():
 
     args = parser.parse_args()
     local_moshi_weight = args.moshi_weight
-    if args.hf_revision is None:
-        if args.hf_repo == RL_HF_REPO:
-            args.hf_revision = RL_HF_REVISION
-        elif args.hf_repo == BASE_HF_REPO:
-            args.hf_revision = BASE_HF_REVISION
-        else:
-            parser.error("custom --hf-repo requires --hf-revision")
+    # Resolve the checkpoint from CLI flags, else the PERSONAPLEX_MODEL /
+    # PERSONAPLEX_HF_REPO / PERSONAPLEX_HF_REVISION env vars, so selecting
+    # rl-seamless vs base needs no shell wrapper.
+    try:
+        args.hf_repo, args.hf_revision = loaders.resolve_model_selection(
+            flavor=os.environ.get("PERSONAPLEX_MODEL") or None,
+            repo=args.hf_repo or os.environ.get("PERSONAPLEX_HF_REPO") or None,
+            revision=(
+                args.hf_revision
+                or os.environ.get("PERSONAPLEX_HF_REVISION")
+                or None
+            ),
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.hf_revision:
         logger.info(
             "Hugging Face model pinned to %s@%s",

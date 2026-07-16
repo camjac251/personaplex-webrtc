@@ -48,6 +48,39 @@ BASE_REPO = 'nvidia/personaplex-7b-v1'
 BASE_REVISION = 'fdaf4090a61cb315c138a1faee287ffd6c716309f'
 
 
+def resolve_model_selection(
+    flavor: str | None = None,
+    repo: str | None = None,
+    revision: str | None = None,
+) -> tuple[str, str]:
+    """Resolve ``(hf_repo, hf_revision)`` for the requested checkpoint.
+
+    ``flavor`` picks a built-in alias (``rl-seamless`` default, or ``base``).
+    ``repo`` overrides it with a custom repository, which then requires an
+    explicit ``revision``; known aliases resolve to a pinned immutable
+    revision automatically. Callers pass the ``PERSONAPLEX_MODEL`` /
+    ``PERSONAPLEX_HF_REPO`` / ``PERSONAPLEX_HF_REVISION`` values here so the
+    checkpoint can be selected without any shell wrapper.
+    """
+    flavor = flavor or "rl-seamless"
+    if flavor == "rl-seamless":
+        default_repo = DEFAULT_REPO
+    elif flavor == "base":
+        default_repo = BASE_REPO
+    else:
+        raise ValueError(f"unknown model {flavor!r}; use 'rl-seamless' or 'base'")
+    selected_repo = repo or default_repo
+    if revision:
+        selected_revision = revision
+    elif selected_repo == DEFAULT_REPO:
+        selected_revision = DEFAULT_REVISION
+    elif selected_repo == BASE_REPO:
+        selected_revision = BASE_REVISION
+    else:
+        raise ValueError("a custom model repository requires an explicit revision")
+    return selected_repo, selected_revision
+
+
 _seanet_kwargs = {
     "channels": 1,
     "dimension": 512,

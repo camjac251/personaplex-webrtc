@@ -11,9 +11,9 @@ from pathlib import Path
 
 from huggingface_hub import hf_hub_download, snapshot_download
 
+from moshi.models.loaders import resolve_model_selection
 
-HF_REPO = "kyutai/personaplex-rl-seamless"
-HF_REVISION = "3fa800309a4b743a8a6d764253eb45def0334afc"
+
 VOICE_REVISION_MARKER = ".personaplex-hf-revision"
 
 
@@ -179,17 +179,25 @@ def main() -> None:
     parser.add_argument("--voice-dir", required=True, type=Path)
     parser.add_argument("--skip-model", action="store_true")
     parser.add_argument("--skip-voices", action="store_true")
-    parser.add_argument("--repo", default=HF_REPO)
-    parser.add_argument("--revision", default=HF_REVISION)
+    parser.add_argument("--repo", default=None)
+    parser.add_argument("--revision", default=None)
     args = parser.parse_args()
+
+    # Resolve the checkpoint from CLI flags, else PERSONAPLEX_MODEL /
+    # PERSONAPLEX_HF_REPO / PERSONAPLEX_HF_REVISION, matching the server.
+    repo, revision = resolve_model_selection(
+        flavor=os.environ.get("PERSONAPLEX_MODEL") or None,
+        repo=args.repo or os.environ.get("PERSONAPLEX_HF_REPO") or None,
+        revision=args.revision or os.environ.get("PERSONAPLEX_HF_REVISION") or None,
+    )
 
     token = os.environ.get("HF_TOKEN") or None
 
     if not args.skip_voices:
-        ensure_voices(args.voice_dir, token, args.repo, args.revision)
+        ensure_voices(args.voice_dir, token, repo, revision)
 
     if not args.skip_model:
-        ensure_model(token, args.repo, args.revision)
+        ensure_model(token, repo, revision)
 
 
 if __name__ == "__main__":
