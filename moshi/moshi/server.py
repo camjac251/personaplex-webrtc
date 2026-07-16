@@ -176,6 +176,17 @@ def _resolve_server_build() -> str:
     return "dev"
 
 
+def _is_fatal_cuda_error(exc: BaseException) -> bool:
+    """True for a CUDA/accelerator error that poisons the process context.
+
+    Once one fires (an illegal-instruction kernel fault, for example), every
+    later kernel launch and even ``torch.cuda.empty_cache()`` keeps failing,
+    so the only recovery is a fresh process. Matched by class name and message
+    so it does not depend on a specific torch exception attribute.
+    """
+    return type(exc).__name__ == "AcceleratorError" or "CUDA error" in str(exc)
+
+
 def _sample_device_stats(device: torch.device) -> tuple[Optional[int], Optional[int]]:
     """Return (vram_used_bytes, gpu_util_percent), each None when unavailable.
 
@@ -5875,6 +5886,17 @@ class ServerState:
                             type(exc).__name__,
                             exc,
                         )
+                        if _is_fatal_cuda_error(exc):
+                            # A failed empty_cache means the CUDA context is
+                            # poisoned (e.g. after an illegal-instruction
+                            # kernel fault); limping on would fail every later
+                            # session with the same error. Exit hard so the
+                            # supervisor relaunches with a fresh context.
+                            logger.error(
+                                "CUDA context poisoned; exiting for a "
+                                "supervised restart"
+                            )
+                            os._exit(70)
                 self.lock.release()
                 clog.log("info", "session closed, lock released")
 
