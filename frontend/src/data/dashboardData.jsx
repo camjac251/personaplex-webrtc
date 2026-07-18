@@ -393,9 +393,11 @@ export const PARAM_INFO = {
     title: "Audio temperature",
     body: (
       <>
-        Sampling temperature for acoustic tokens. Higher values allow more
-        expressive prosody and timbre variation. The RL checkpoint's published
-        setting, and this dashboard's default, is <b>0.8</b>.
+        Sampling temperature for the acoustic residual codebooks, which carry
+        prosody and timbre. The first, semantic codebook is limited separately
+        by <b>Semantic cap</b>, so raising this adds expressiveness without
+        destabilizing what is said. The RL checkpoint's published setting, and
+        this dashboard's default, is <b>0.8</b>.
       </>
     ),
   },
@@ -424,9 +426,11 @@ export const PARAM_INFO = {
     title: "Repetition penalty",
     body: (
       <>
-        Lowers the score of recently emitted text tokens. <b>1.0</b> disables
-        it and preserves the RL model's learned text policy. Raise toward
-        <b>1.15</b> only as an anti-loop fallback.
+        Lowers the score of text tokens already used in the current turn; the
+        history clears at each natural turn boundary, so it never punishes the
+        next turn's opening words. <b>1.0</b> disables it and preserves the RL
+        model's learned text policy. Raise toward <b>1.15</b> only as an
+        anti-loop fallback.
       </>
     ),
   },
@@ -436,6 +440,7 @@ export const PARAM_INFO = {
       <>
         How many recent text tokens are checked by the repetition penalty. Wider
         catches longer loops but can over-penalize names and repeated anchors.
+        <b> 0</b> turns the penalty off entirely.
       </>
     ),
   },
@@ -454,9 +459,10 @@ export const PARAM_INFO = {
     body: (
       <>
         Hard cap for consecutive non-silence text tokens. Default <b>120</b> is
-        about ten seconds of sustained talk. Caps of <b>120</b> or more double
-        as the auto-rewind collapse signal; lower caps only truncate the turn.
-        The floor is <b>40</b> even in Expert mode.
+        about ten seconds of sustained talk. Caps of <b>120</b> or more also
+        feed collapse detection (auto-rewind, when periodic snapshots are
+        enabled); lower caps only truncate the turn. The floor is <b>40</b>
+        even in Expert mode.
       </>
     ),
   },
@@ -504,7 +510,9 @@ export const PARAM_INFO = {
     body: (
       <>
         <b>Captions only</b> keeps scene notes outside the speech model. Ambient
-        react is an unsafe experiment that may speak without a user prompt.
+        react is an unsafe experiment that may speak without a user prompt: it
+        injects at most once per <b>8 s</b>, only into silence, and never in
+        the ~2 s after you finish speaking, so it cannot displace a reply.
       </>
     ),
   },
@@ -581,9 +589,10 @@ export const PARAM_INFO = {
     body: (
       <>
         How tightly the model holds to the persona and task. <b>Balanced</b>{" "}
-        stays in role without sounding rigid, <b>Strict</b> prefers short
-        literal task completion, <b>Adaptive</b> follows you when you redirect.
-        Added to the prompt on connect.
+        (the default) stays in role without sounding rigid, <b>Strict</b>{" "}
+        prefers short literal task completion, <b>Adaptive</b> follows you when
+        you redirect, <b>Off</b> sends the bare persona, which drifts and
+        monologues more. Added to the prompt on connect.
       </>
     ),
   },
@@ -592,9 +601,9 @@ export const PARAM_INFO = {
     body: (
       <>
         A style instruction added to the system prompt; it does not change the
-        selected voice or audio sampler by itself. <b>Natural</b> is warm and
-        brief, <b>Concise</b> uses the fewest words with fast turn-taking,{" "}
-        <b>Expressive</b> adds more prosody and color.
+        selected voice or audio sampler by itself. <b>Natural</b> (the
+        default) is warm and brief, <b>Concise</b> uses the fewest words with
+        fast turn-taking, <b>Expressive</b> adds more prosody and color.
       </>
     ),
   },
