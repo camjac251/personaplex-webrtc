@@ -496,6 +496,18 @@ LIVE_PROMPT_MAX_STEPS = VISION_QUEUE_MAX
 # the user's words. An already-active drip is allowed to finish.
 POST_USER_TURN_INJECT_HOLDOFF_FRAMES = 25
 
+# Ramp length for the outbound audio gate, ~10 ms at Mimi's 24 kHz
+# output rate. Replacing a live waveform with zeros mid-sample is a step
+# discontinuity the listener hears as a click, so the first gated frame
+# fades out and the first ungated frame fades back in.
+OUTBOUND_GATE_FADE_SAMPLES = 240
+_OUTBOUND_GATE_FADE_OUT = np.linspace(
+    1.0, 0.0, OUTBOUND_GATE_FADE_SAMPLES, dtype=np.float32
+)
+_OUTBOUND_GATE_FADE_IN = np.linspace(
+    0.0, 1.0, OUTBOUND_GATE_FADE_SAMPLES, dtype=np.float32
+)
+
 # Minimum wall-clock gap between persona re-assertions. Reinforcement is a
 # slow correction against long-session drift, not a per-pause event;
 # re-asserting on every silence would dominate the text channel and starve
@@ -1281,6 +1293,9 @@ class ServerState:
         # Frames left before context injection may resume after a completed
         # user turn; see POST_USER_TURN_INJECT_HOLDOFF_FRAMES.
         self._post_turn_inject_holdoff: int = 0
+        # Whether the previous inner step's outbound PCM was gated; drives
+        # the fade at each gate boundary in _gate_outbound_pcm.
+        self._outbound_muted_prev: bool = False
         # Flag set by _process_audio_frame (executor thread) when the
         # model just entered a natural pad streak; a cadence task on the
         # event loop drains it and asks the client for a fresh vision
@@ -2437,8 +2452,9 @@ class ServerState:
 
                 # Audio gate: silence outbound PCM while we're injecting
                 # or while a user interrupt is forcing the model to yield.
-                if forced_text is not None or interrupt_gate:
-                    pcm_np = np.zeros_like(pcm_np)
+                pcm_np = self._gate_outbound_pcm(
+                    pcm_np, forced_text is not None or interrupt_gate
+                )
 
                 self._set_inflight_phase("text_sync")
                 text_token = tokens[0, 0, 0].item()
@@ -2982,6 +2998,7 @@ class ServerState:
         self._collapse_triggers.clear()
         self._prev_pad_force_remaining = 0
         self._post_turn_inject_holdoff = 0
+        self._outbound_muted_prev = False
         self._interrupt_gate_remaining = 0
         self._stop_response_latched = False
         self._reset_stop_latch_user_turn_activity()
@@ -3755,6 +3772,29 @@ class ServerState:
     def _clear_reinforce_pending(self) -> None:
         self._reinforce_pending.clear()
         self._reinforce_pending_meta = {}
+
+    def _gate_outbound_pcm(self, pcm_np: np.ndarray, muted: bool) -> np.ndarray:
+        """Silence gated outbound audio with a short ramp at each boundary.
+
+        The first gated frame fades the model audio out and the first
+        ungated frame fades it back in over OUTBOUND_GATE_FADE_SAMPLES, so
+        the gate never introduces an audible step. Steady gated frames stay
+        exact zeros.
+        """
+        was_muted = self._outbound_muted_prev
+        self._outbound_muted_prev = muted
+        if pcm_np.size == 0 or (not muted and not was_muted):
+            return pcm_np
+        if muted and was_muted:
+            return np.zeros_like(pcm_np)
+        fade = min(OUTBOUND_GATE_FADE_SAMPLES, pcm_np.size)
+        shaped = pcm_np.copy()
+        if muted:
+            shaped[:fade] *= _OUTBOUND_GATE_FADE_OUT[:fade]
+            shaped[fade:] = 0.0
+        else:
+            shaped[:fade] *= _OUTBOUND_GATE_FADE_IN[:fade]
+        return shaped
 
     def _note_pad_force_edge(
         self, pad_force: int, now: Optional[float] = None
@@ -4561,6 +4601,7 @@ class ServerState:
                 self._collapse_triggers.clear()
                 self._prev_pad_force_remaining = 0
                 self._post_turn_inject_holdoff = 0
+                self._outbound_muted_prev = False
                 self._vision_request_pending = False
                 self._vision_request_force = False
                 self._vision_request_reason = "cadence"

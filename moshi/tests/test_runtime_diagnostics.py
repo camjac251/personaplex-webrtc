@@ -350,6 +350,33 @@ def test_live_turn_cap_change_resets_tracking_but_preserves_interrupt() -> None:
     assert state._prev_pad_force_remaining == 5
 
 
+def test_outbound_gate_fades_at_mute_boundaries() -> None:
+    state = ServerState.__new__(ServerState)
+    state._outbound_muted_prev = False
+    ones = np.ones(1920, dtype=np.float32)
+
+    passthrough = state._gate_outbound_pcm(ones.copy(), False)
+    assert np.array_equal(passthrough, ones)
+
+    entering = state._gate_outbound_pcm(ones.copy(), True)
+    assert entering[0] == 1.0
+    assert entering[239] == 0.0
+    assert np.all(entering[240:] == 0.0)
+    assert np.all(np.diff(entering[:240]) <= 0.0)
+
+    steady = state._gate_outbound_pcm(ones.copy(), True)
+    assert np.all(steady == 0.0)
+
+    leaving = state._gate_outbound_pcm(ones.copy(), False)
+    assert leaving[0] == 0.0
+    assert leaving[239] == 1.0
+    assert np.all(leaving[240:] == 1.0)
+    assert np.all(np.diff(leaving[:240]) >= 0.0)
+
+    settled = state._gate_outbound_pcm(ones.copy(), False)
+    assert np.array_equal(settled, ones)
+
+
 def test_cap_trips_below_default_do_not_feed_auto_rewind() -> None:
     class _Lm:
         max_turn_text_tokens = 40
@@ -534,6 +561,7 @@ if __name__ == "__main__":
         test_single_frame_noise_does_not_release_stop_latch,
         test_barge_in_carries_pre_interrupt_speech_into_stop_release,
         test_live_turn_cap_change_resets_tracking_but_preserves_interrupt,
+        test_outbound_gate_fades_at_mute_boundaries,
         test_cap_trips_below_default_do_not_feed_auto_rewind,
         test_three_spaced_cap_trips_at_default_schedule_auto_rewind,
         test_turn_cap_event_reports_applied_limit,
