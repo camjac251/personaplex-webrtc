@@ -173,8 +173,11 @@ export const DEFAULTS = {
   turnHandling: "native",
   injectSilenceRms: 0.01,
   injectSilenceStreak: 6,
-  echoCancel: true,
-  noiseSupp: true,
+  // Browser mic processing defaults off: an isolated capture chain
+  // (headphones or a virtual mixer) needs no browser DSP, and the
+  // processing can distort the input the model hears.
+  echoCancel: false,
+  noiseSupp: false,
   autoGain: false,
   seed: 42,
   visionIntervalMs: 5000,
@@ -221,8 +224,8 @@ export const SESSION_PROFILES = [
     turnHandling: "recommended",
     // Sampling fields intentionally inherit the active checkpoint defaults.
     // Base and the aligned checkpoint do not share the same safe values.
-    echoCancel: true,
-    noiseSupp: true,
+    echoCancel: false,
+    noiseSupp: false,
     autoGain: false,
     visionInTranscript: false,
     visionFeedModel: false,
@@ -247,8 +250,8 @@ export const SESSION_PROFILES = [
     repContext: 80,
     padBonus: 0,
     maxTurn: 80,
-    echoCancel: true,
-    noiseSupp: true,
+    echoCancel: false,
+    noiseSupp: false,
     autoGain: false,
     visionInTranscript: false,
     visionFeedModel: false,
@@ -276,8 +279,8 @@ export const SESSION_PROFILES = [
     repContext: 64,
     padBonus: 0,
     maxTurn: 120,
-    echoCancel: true,
-    noiseSupp: true,
+    echoCancel: false,
+    noiseSupp: false,
     autoGain: false,
     visionInTranscript: false,
     visionFeedModel: false,
@@ -302,8 +305,8 @@ export const SESSION_PROFILES = [
     repContext: 96,
     padBonus: 0,
     maxTurn: 90,
-    echoCancel: true,
-    noiseSupp: true,
+    echoCancel: false,
+    noiseSupp: false,
     autoGain: false,
     visionInTranscript: false,
     visionFeedModel: false,
@@ -431,14 +434,21 @@ export const PARAM_INFO = {
     title: "Echo cancellation",
     body: (
       <>
-        Browser-side echo cancellation. Keep it on unless you use isolated
-        headphones; speaker bleed can make the model hear itself.
+        Browser-side echo cancellation. Off by default: an isolated capture
+        chain (headphones or a virtual mixer) needs no browser DSP, and the
+        processing can distort the input. Turn it on when the mic can
+        physically hear the speakers.
       </>
     ),
   },
   noise: {
     title: "Noise suppression",
-    body: <>Browser-side suppression for keyboard, fan, and room noise.</>,
+    body: (
+      <>
+        Browser-side suppression for keyboard, fan, and room noise. Off by
+        default; enable for untreated rooms.
+      </>
+    ),
   },
   agc: {
     title: "Auto gain",

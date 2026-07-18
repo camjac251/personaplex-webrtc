@@ -191,7 +191,7 @@ function completedTransportLeg(base, leg) {
 const DEFAULT_PERSONA_PRESET =
   PERSONA_PRESETS.find((preset) => preset.id === "assistant") || PERSONA_PRESETS[0];
 
-const PROMPT_DEFAULTS_VERSION = "2026-07-18-adherence-guardrails-default";
+const PROMPT_DEFAULTS_VERSION = "2026-07-18-mic-processing-off-default";
 const TUNING_DEFAULTS_VERSION = "2026-07-18-text-topk-safe-floor";
 const BASE_MODEL_DEFAULTS = {
   ...DEFAULTS,
@@ -807,13 +807,21 @@ function App() {
     // sticks because the stored version then matches.
     if (adherenceMode === "none") setAdherenceMode("balanced");
     if (expressionMode === "none") setExpressionMode("natural");
+    // Mic processing defaults off: an isolated capture chain needs no
+    // browser DSP. One-time flip; re-enabling afterwards sticks.
+    if (echoCancel) setEchoCancel(false);
+    if (noiseSupp) setNoiseSupp(false);
     setPromptDefaultsVersion(PROMPT_DEFAULTS_VERSION);
   }, [
     adherenceMode,
+    echoCancel,
     expressionMode,
+    noiseSupp,
     promptDefaultsVersion,
     setAdherenceMode,
+    setEchoCancel,
     setExpressionMode,
+    setNoiseSupp,
     setPromptDefaultsVersion,
     setTextPrompt,
     setVisionPrompt,
