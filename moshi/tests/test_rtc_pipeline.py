@@ -15,6 +15,7 @@ import numpy as np
 sys.path.insert(0, "moshi")
 
 from moshi.rtc_session import (  # noqa: E402
+    OUTBOUND_FRAME_SAMPLES,
     OUTBOUND_SHED_CROSSFADE_SAMPLES,
     OUTBOUND_SHED_WINDOW_SAMPLES,
     MimiOutputTrack,
@@ -186,6 +187,49 @@ async def test_transport_diagnostics_expose_counts_without_audio() -> None:
         "outbound_buffer_ms": 20.0,
         "outbound_drop_events": 2,
     }
+
+
+def test_outbound_underrun_fades_and_reprimes() -> None:
+    async def scenario() -> None:
+        track = MimiOutputTrack()
+        # Below the prebuffer floor nothing is emitted yet.
+        track._buffer = np.full(OUTBOUND_FRAME_SAMPLES, 0.5, dtype=np.float32)
+        assert np.all(await track._pop_chunk() == 0.0)
+        assert track._underrun_events == 0
+
+        # Floor filled: emission resumes with a fade-in from silence.
+        track._buffer = np.full(
+            OUTBOUND_FRAME_SAMPLES * 3, 0.5, dtype=np.float32
+        )
+        resumed = await track._pop_chunk()
+        assert resumed[0] == 0.0
+        assert resumed[-1] == np.float32(0.5)
+        assert track._primed is True
+
+        # Consuming the last queued frame lands its tail on silence and
+        # reprimes, so a possible underrun next frame cannot click.
+        await track._pop_chunk()
+        emptied = await track._pop_chunk()
+        assert emptied[0] == np.float32(0.5)
+        assert emptied[-1] == 0.0
+        assert track._primed is False
+        assert track._underrun_events == 1
+
+        # While repriming, queued-but-below-floor audio stays held.
+        track._buffer = np.full(OUTBOUND_FRAME_SAMPLES, 0.5, dtype=np.float32)
+        assert np.all(await track._pop_chunk() == 0.0)
+
+        # A stranded partial frame is emitted faded, never hard-truncated.
+        track._primed = True
+        track._buffer = np.full(400, 0.5, dtype=np.float32)
+        partial = await track._pop_chunk()
+        assert partial[0] == np.float32(0.5)
+        assert partial[399] == 0.0
+        assert np.all(partial[400:] == 0.0)
+        assert track._underrun_events == 2
+        assert track._primed is False
+
+    asyncio.run(scenario())
 
 
 def test_outbound_shed_prefers_silence_and_crossfades() -> None:
@@ -396,6 +440,7 @@ if __name__ == "__main__":
         test_stop_processing_freezes_and_drains_in_flight_model_work,
         test_standing_inbound_backlog_is_trimmed_to_one_frame,
         test_transport_diagnostics_expose_counts_without_audio,
+        test_outbound_underrun_fades_and_reprimes,
         test_outbound_shed_prefers_silence_and_crossfades,
         test_outbound_diagnostics_separate_flush_from_backlog_drop,
         test_stat_envelope_only_forwards_numeric_diagnostics,

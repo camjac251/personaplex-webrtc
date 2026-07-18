@@ -56,10 +56,17 @@ OUTBOUND_DRAIN_BACKLOG_SAMPLES = OUTBOUND_FRAME_SAMPLES * 8
 # a frame or more means a stall left residue behind. 25 calls ~= 500 ms
 # spans several 80 ms production lumps plus jitter.
 OUTBOUND_STANDING_BACKLOG_WINDOW = 25
-# Treat a persistent one-frame floor as standing latency; healthy
-# production still reaches zero during each 80 ms sawtooth, while a
-# smaller residue is not worth cutting audio over.
-OUTBOUND_STANDING_BACKLOG_MIN_SAMPLES = OUTBOUND_FRAME_SAMPLES
+# Deliberate outbound floor: after an underrun (or at session start),
+# hold this much audio before emission resumes, so the healthy sawtooth
+# rides above empty and micro-jitter cannot force mid-word silence
+# insertions, which land as clicks.
+OUTBOUND_PREBUFFER_SAMPLES = OUTBOUND_FRAME_SAMPLES * 2
+# Standing latency above the deliberate prebuffer floor is what the drain
+# sheds; the sawtooth legitimately sits at the prebuffer level, so only a
+# persistent floor a full frame above it counts as excess.
+OUTBOUND_STANDING_BACKLOG_MIN_SAMPLES = (
+    OUTBOUND_PREBUFFER_SAMPLES + OUTBOUND_FRAME_SAMPLES
+)
 # Silence-preferring shed: when standing latency must be cut, remove
 # near-silent 10 ms stretches first (inaudible), and crossfade any forced
 # cut of live audio over 5 ms so the splice never lands as a click.
@@ -157,6 +164,12 @@ class MimiOutputTrack(MediaStreamTrack):
         self._dropped_samples = 0
         self._flush_events = 0
         self._flushed_samples = 0
+        self._underrun_events = 0
+        # Emission gate: hold until the prebuffer floor fills, and fade the
+        # first real chunk in after any silent stretch so resume never
+        # steps from zero to full amplitude.
+        self._primed = False
+        self._resume_fade_pending = True
         # Persistent resampler so its internal anti-alias filter state
         # carries between chunks. Recreating per-call breaks continuity.
         self._resampler = AudioResampler(
@@ -203,6 +216,8 @@ class MimiOutputTrack(MediaStreamTrack):
                 self._flush_events += 1
                 self._flushed_samples += self._buffer.size
             self._buffer = np.empty(0, dtype=np.float32)
+            self._primed = False
+            self._resume_fade_pending = True
             # Pre-flush readings would keep the standing-backlog floor high
             # for another window; the flush already shed that latency.
             self._backlog_window.clear()
@@ -259,11 +274,47 @@ class MimiOutputTrack(MediaStreamTrack):
 
     async def _pop_chunk(self) -> np.ndarray:
         async with self._buffer_lock:
+            if not self._primed:
+                if self._buffer.size >= OUTBOUND_PREBUFFER_SAMPLES:
+                    self._primed = True
+                else:
+                    return np.zeros(OUTBOUND_FRAME_SAMPLES, dtype=np.float32)
             if self._buffer.size >= OUTBOUND_FRAME_SAMPLES:
-                chunk = self._buffer[:OUTBOUND_FRAME_SAMPLES]
+                chunk = self._buffer[:OUTBOUND_FRAME_SAMPLES].copy()
                 self._buffer = self._buffer[OUTBOUND_FRAME_SAMPLES:]
+                if self._resume_fade_pending:
+                    fade = OUTBOUND_SHED_CROSSFADE_SAMPLES
+                    chunk[:fade] *= np.linspace(
+                        0.0, 1.0, fade, dtype=np.float32
+                    )
+                    self._resume_fade_pending = False
+                if self._buffer.size == 0:
+                    # The deliberate floor is gone, so the next recv() may
+                    # find nothing. Land this chunk on silence and reprime
+                    # so emission resumes from a refilled floor.
+                    fade = OUTBOUND_SHED_CROSSFADE_SAMPLES
+                    chunk[-fade:] *= np.linspace(
+                        1.0, 0.0, fade, dtype=np.float32
+                    )
+                    self._underrun_events += 1
+                    self._primed = False
+                    self._resume_fade_pending = True
                 return chunk
-            return np.zeros(OUTBOUND_FRAME_SAMPLES, dtype=np.float32)
+            # Partial frame left: emit it faded to silence, zero-padded,
+            # and reprime before emission resumes.
+            out = np.zeros(OUTBOUND_FRAME_SAMPLES, dtype=np.float32)
+            partial = self._buffer
+            self._buffer = np.empty(0, dtype=np.float32)
+            if partial.size:
+                out[: partial.size] = partial
+                fade = min(OUTBOUND_SHED_CROSSFADE_SAMPLES, partial.size)
+                out[partial.size - fade: partial.size] *= np.linspace(
+                    1.0, 0.0, fade, dtype=np.float32
+                )
+                self._underrun_events += 1
+            self._primed = False
+            self._resume_fade_pending = True
+            return out
 
     async def recv(self) -> AudioFrame:
         loop = asyncio.get_event_loop()
@@ -300,14 +351,18 @@ class MimiOutputTrack(MediaStreamTrack):
                 >= OUTBOUND_STANDING_BACKLOG_MIN_SAMPLES
             )
             if (rebased and backlog >= OUTBOUND_DRAIN_BACKLOG_SAMPLES) or (
-                standing and backlog >= OUTBOUND_FRAME_SAMPLES * 2
+                standing and backlog >= OUTBOUND_PREBUFFER_SAMPLES
             ):
-                target = (
-                    OUTBOUND_FRAME_SAMPLES * 4
-                    if backlog >= OUTBOUND_DRAIN_BACKLOG_SAMPLES
-                    else OUTBOUND_FRAME_SAMPLES * 2
-                )
-                drop = max(0, backlog - target)
+                if backlog >= OUTBOUND_DRAIN_BACKLOG_SAMPLES:
+                    drop = backlog - OUTBOUND_FRAME_SAMPLES * 4
+                else:
+                    # Shed only the persistent floor above the deliberate
+                    # prebuffer; the sawtooth above that floor is in-flight
+                    # audio, not latency.
+                    drop = (
+                        min(self._backlog_window)
+                        - OUTBOUND_PREBUFFER_SAMPLES
+                    )
                 if drop > 0:
                     self._drop_events += 1
                     self._shed_buffer_locked(drop)
@@ -343,6 +398,7 @@ class MimiOutputTrack(MediaStreamTrack):
                 "outbound_flushed_ms": round(
                     self._flushed_samples / WEBRTC_SAMPLE_RATE * 1000.0, 1
                 ),
+                "outbound_underrun_events": self._underrun_events,
             }
 
 
@@ -1426,6 +1482,7 @@ class RTCSession:
                 "pcm_drop_events",
                 "outbound_drop_events",
                 "outbound_flush_events",
+                "outbound_underrun_events",
             }
             float_fields = {
                 "pcm_dropped_ms",
