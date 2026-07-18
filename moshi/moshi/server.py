@@ -188,6 +188,19 @@ def _is_fatal_cuda_error(exc: BaseException) -> bool:
     return type(exc).__name__ == "AcceleratorError" or "CUDA error" in str(exc)
 
 
+def _derive_context_seal_token(text_tokenizer) -> Optional[int]:
+    """Vocab id of a plain sentence terminator, or None when absent."""
+    try:
+        unk = text_tokenizer.unk_id()
+        for piece in (".", "▁."):
+            token = text_tokenizer.piece_to_id(piece)
+            if token != unk:
+                return int(token)
+    except Exception:
+        return None
+    return None
+
+
 def _sample_device_stats(device: torch.device) -> tuple[Optional[int], Optional[int]]:
     """Return (vram_used_bytes, gpu_util_percent), each None when unavailable.
 
@@ -550,6 +563,12 @@ AUTO_RECOVERY_CONFIG_KEYS = (
     "padding_bonus",
     "max_turn_text_tokens",
 )
+
+# Fail-safe ceiling on how long the Stop latch may hold the assistant
+# mute. Release normally requires a clean user attack-then-silence
+# pattern; sustained room noise can starve those detectors forever and
+# leave the assistant silent for the rest of the session.
+STOP_LATCH_MAX_HOLD_SEC = 12.0
 
 
 class SnapshotDeferred(RuntimeError):
@@ -1296,6 +1315,16 @@ class ServerState:
         # Whether the previous inner step's outbound PCM was gated; drives
         # the fade at each gate boundary in _gate_outbound_pcm.
         self._outbound_muted_prev: bool = False
+        # Vocab id used to close a partially injected context sentence. A
+        # dangling clause in the model's own history invites it to finish
+        # the fragment aloud later; sealing costs one forced frame. None
+        # when the vocab lacks a period piece.
+        self._context_seal_token: Optional[int] = _derive_context_seal_token(
+            text_tokenizer
+        )
+        # Monotonic timestamp when the Stop latch was last armed; drives
+        # the hold ceiling in _release_stop_latch_if_expired.
+        self._stop_latched_at: float = 0.0
         # Flag set by _process_audio_frame (executor thread) when the
         # model just entered a natural pad streak; a cadence task on the
         # event loop drains it and asks the client for a fresh vision
@@ -2130,6 +2159,7 @@ class ServerState:
         has no such speech guarantee and must keep starting from a clean gate.
         """
         self._stop_response_latched = True
+        self._stop_latched_at = time.monotonic()
         if reason != "barge_in":
             self._reset_stop_latch_user_turn_activity()
             return
@@ -2145,6 +2175,29 @@ class ServerState:
             observed_attack >= STOP_LATCH_USER_TURN_ATTACK_STREAK
         )
         self._stop_user_audio_silence_streak = 0
+
+    def _release_stop_latch_if_expired(
+        self, now: Optional[float] = None
+    ) -> bool:
+        """Fail-safe release when the Stop latch outlives its hold ceiling.
+
+        Release normally requires a clean attack-then-silence user turn;
+        sustained room noise can starve those detectors forever and leave
+        the assistant mute. The ceiling bounds that worst case without
+        weakening the detectors themselves.
+        """
+        if not self._stop_response_latched:
+            return False
+        if now is None:
+            now = time.monotonic()
+        if now - self._stop_latched_at < STOP_LATCH_MAX_HOLD_SEC:
+            return False
+        logger.warning(
+            "stop latch released by %.0f s hold ceiling",
+            STOP_LATCH_MAX_HOLD_SEC,
+        )
+        self._release_stop_response_latch_locked()
+        return True
 
     def _update_stop_latch_user_turn_activity(self, chunk_rms: float) -> bool:
         """Return true once a short post-Stop user turn has completed.
@@ -2259,6 +2312,8 @@ class ServerState:
                 and self._stop_response_latched
             ):
                 self._release_stop_response_latch_locked()
+            else:
+                self._release_stop_latch_if_expired()
             # Mimi and LM state must advance under the same lock so a snapshot
             # cannot capture the codec after frame N and the LM before it.
             codes = self.mimi.encode(chunk)
@@ -2287,6 +2342,15 @@ class ServerState:
                 logger.info("vision inject aborted by user speech")
                 self._active_context_meta = dict(self._vision_active_meta)
                 self._inject_end_status = "interrupted"
+                if (
+                    self._vision_inject_steps > 0
+                    and self._context_seal_token is not None
+                ):
+                    # Close the half-delivered sentence so the model's own
+                    # history doesn't keep a dangling clause it may later
+                    # try to finish aloud.
+                    inject_token = self._context_seal_token
+                    inject_meta = dict(self._vision_active_meta)
                 self._clear_vision_active()
                 self._vision_pad_streak = 0
                 self._audio_silence_streak = 0
@@ -2309,6 +2373,9 @@ class ServerState:
                 else:
                     self._active_context_meta = dict(self._vision_active_meta)
                     self._inject_end_status = "dropped"
+                    if self._context_seal_token is not None:
+                        inject_token = self._context_seal_token
+                        inject_meta = dict(self._vision_active_meta)
                     self._clear_vision_active()
                     self._vision_pad_streak = 0
                     self._audio_silence_streak = 0
@@ -2367,6 +2434,12 @@ class ServerState:
                         # abandon the remainder and re-arm on the next
                         # cooldown. A partial re-assertion is harmless; a
                         # forced burst causes degenerate single-token loops.
+                        if (
+                            self._reinforce_inject_steps > 0
+                            and self._context_seal_token is not None
+                        ):
+                            inject_token = self._context_seal_token
+                            inject_meta = dict(self._reinforce_pending_meta)
                         self._clear_reinforce_pending()
                         self._reinforce_inject_steps = 0
             else:

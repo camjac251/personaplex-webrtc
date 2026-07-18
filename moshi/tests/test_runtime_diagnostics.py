@@ -23,8 +23,10 @@ from moshi.server import (  # noqa: E402
     BASE_HF_REPO,
     GEMINI_VISION_MODEL,
     RL_HF_REPO,
+    STOP_LATCH_MAX_HOLD_SEC,
     ServerState,
     SnapshotDeferred,
+    _derive_context_seal_token,
     _model_identity,
     _resolve_session_seed,
 )
@@ -350,6 +352,52 @@ def test_live_turn_cap_change_resets_tracking_but_preserves_interrupt() -> None:
     assert state._prev_pad_force_remaining == 5
 
 
+def test_context_seal_token_derivation_prefers_plain_period() -> None:
+    class _Tok:
+        def unk_id(self) -> int:
+            return 0
+
+        def piece_to_id(self, piece: str) -> int:
+            return {".": 7, "▁.": 9}.get(piece, 0)
+
+    class _NoPeriod:
+        def unk_id(self) -> int:
+            return 0
+
+        def piece_to_id(self, _piece: str) -> int:
+            return 0
+
+    assert _derive_context_seal_token(_Tok()) == 7
+    assert _derive_context_seal_token(_NoPeriod()) is None
+
+
+def test_stop_latch_hold_ceiling_releases_a_starved_latch() -> None:
+    class _Lm:
+        _pad_force_remaining = 0
+        _non_pad_streak = 0
+
+    state = ServerState.__new__(ServerState)
+    state.lm_gen = _Lm()
+    state._stop_response_latched = True
+    state._stop_latched_at = 100.0
+    state._interrupt_gate_remaining = 0
+    state._prev_pad_force_remaining = 0
+    state._vision_pad_streak = 0
+    state._audio_silence_streak = 0
+    state._stop_user_audio_active = False
+    state._stop_user_audio_attack_streak = 0
+    state._stop_user_audio_silence_streak = 0
+
+    before_ceiling = 100.0 + STOP_LATCH_MAX_HOLD_SEC - 1.0
+    assert state._release_stop_latch_if_expired(now=before_ceiling) is False
+    assert state._stop_response_latched is True
+
+    past_ceiling = 100.0 + STOP_LATCH_MAX_HOLD_SEC + 1.0
+    assert state._release_stop_latch_if_expired(now=past_ceiling) is True
+    assert state._stop_response_latched is False
+    assert state._release_stop_latch_if_expired(now=past_ceiling) is False
+
+
 def test_outbound_gate_fades_at_mute_boundaries() -> None:
     state = ServerState.__new__(ServerState)
     state._outbound_muted_prev = False
@@ -561,6 +609,8 @@ if __name__ == "__main__":
         test_single_frame_noise_does_not_release_stop_latch,
         test_barge_in_carries_pre_interrupt_speech_into_stop_release,
         test_live_turn_cap_change_resets_tracking_but_preserves_interrupt,
+        test_context_seal_token_derivation_prefers_plain_period,
+        test_stop_latch_hold_ceiling_releases_a_starved_latch,
         test_outbound_gate_fades_at_mute_boundaries,
         test_cap_trips_below_default_do_not_feed_auto_rewind,
         test_three_spaced_cap_trips_at_default_schedule_auto_rewind,
