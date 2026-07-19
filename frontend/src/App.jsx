@@ -380,6 +380,43 @@ function encodeJpegWithinBudget(video, initialCanvas, initialQuality) {
 // Stable keys for the fixed-length decorative voice-row waveform bars.
 const GLYPH_BARS = Array.from({ length: 11 }, (_, i) => `glyph-${i}`);
 
+// Live captions that arrive without a completed injection while a voice
+// reaction mode is on. At the ambient cadence this is roughly a minute of
+// the model never hearing the scene, which warrants a warning.
+const VISION_INJECT_DROUGHT_CAPTIONS = 8;
+
+// Server config field -> [notice label, model-defaults key] for the
+// connect-time non-default tuning warning.
+const TUNING_DEVIATION_FIELDS = [
+  ["text_temperature", "text temp", "textTemp"],
+  ["text_topk", "text top-k", "textTopk"],
+  ["text_min_p", "text min-p", "textMinP"],
+  ["audio_temperature", "audio temp", "audioTemp"],
+  ["audio_topk", "audio top-k", "audioTopk"],
+  ["semantic_temp_cap", "semantic cap", "semanticTempCap"],
+  ["repetition_penalty", "rep penalty", "repPenalty"],
+  ["repetition_penalty_context", "rep context", "repContext"],
+  ["padding_bonus", "pad bonus", "padBonus"],
+  ["max_turn_text_tokens", "max turn", "maxTurn"],
+];
+
+function describeTuningDeviations(config, defaults) {
+  const fmt = (value) => (Number.isInteger(value) ? String(value) : String(Math.round(value * 100) / 100));
+  const deviations = [];
+  for (const [field, label, key] of TUNING_DEVIATION_FIELDS) {
+    if (!Object.hasOwn(config, field)) continue;
+    const applied = Number(config[field]);
+    const fallback = Number(defaults[key]);
+    if (!Number.isFinite(applied) || !Number.isFinite(fallback)) continue;
+    // Context width is inert while the penalty is off; reporting it would
+    // only add noise.
+    if (field === "repetition_penalty_context" && Number(config.repetition_penalty) <= 1.001) continue;
+    if (Math.abs(applied - fallback) < 0.001) continue;
+    deviations.push(`${label} ${fmt(applied)} (default ${fmt(fallback)})`);
+  }
+  return deviations;
+}
+
 function App() {
   const toast = useToast();
   const turnHandlingWasStoredRef = useRef(null);
@@ -696,6 +733,13 @@ function App() {
   const aiTurnOpenRef = useRef(null);
   const recordingPlaybackRef = useRef(null);
   const stateRef = useRef({});
+  // One-shot per session: set once the connect-time config snapshot has
+  // been checked against the model defaults.
+  const tuningWarnedRef = useRef(false);
+  // Live captions seen since the last completed context injection while a
+  // voice reaction mode wants captions delivered to the model.
+  const visionInjectDroughtRef = useRef({ captions: 0, warned: false });
+  const modelDefaultsRef = useRef(null);
   const bargeActiveRef = useRef(false);
   // Latches once the microphone channel registers speech, so a user turn is
   // recorded when the assistant next resumes. Cleared after the turn is
@@ -729,7 +773,8 @@ function App() {
     sessionTraceRef.current?.record(kind, data, options);
   }, []);
 
-  stateRef.current = { visionOn, visionPaused, visionInjecting, phase, interrupting, jitterBuffer };
+  stateRef.current = { visionOn, visionPaused, visionInjecting, phase, interrupting, jitterBuffer, visionFeedModel, visionGroundTurns };
+  modelDefaultsRef.current = modelDefaults;
 
   // Latest live-tunable rail values, refreshed every render. The rail
   // sliders stay interactive during connecting/warmup while sendLiveConfig
@@ -1939,6 +1984,7 @@ function App() {
     setCurrentCaption("");
     setCurrentVisionFeed({ mode: "unknown", queued: 0 });
     setContextStatus({ ...EMPTY_CONTEXT_STATUS });
+    visionInjectDroughtRef.current = { captions: 0, warned: false };
     visionLastSentAtRef.current = 0;
     setVisionLastSentAt(0);
   }, [sendVisionReactionFlags]);
@@ -2330,6 +2376,18 @@ function App() {
         if (!historicalDetail) {
           setCurrentCaption(text);
           setCurrentVisionFeed(feed);
+          if (stateRef.current.visionFeedModel || stateRef.current.visionGroundTurns) {
+            const drought = visionInjectDroughtRef.current;
+            drought.captions += 1;
+            if (drought.captions >= VISION_INJECT_DROUGHT_CAPTIONS && !drought.warned) {
+              drought.warned = true;
+              addNotice(
+                "warn",
+                `${drought.captions} captions arrived without any reaching the model. Injection waits for the model and your mic to both go quiet; speaker or game audio on the mic usually blocks it.`,
+                "vision",
+              );
+            }
+          }
         }
         setCaptionEntries((entries) => [{ id: entryId, ts, text, frame, meta, frameId, feed }, ...entries].slice(0, 14));
         const offsetMs = sessionStartedAtRef.current ? Math.max(0, performance.now() - sessionStartedAtRef.current) : 0;
@@ -2445,6 +2503,9 @@ function App() {
           frameId: typeof data.frame_id === "string" ? data.frame_id : "",
           at: new Date().toTimeString().slice(0, 8),
         });
+        if (message.status === "complete" && data.source !== "reinforce") {
+          visionInjectDroughtRef.current = { captions: 0, warned: false };
+        }
       } else if (message.type === "interrupted") {
         setRuntimeCounters((counters) => ({
           ...counters,
@@ -2477,6 +2538,19 @@ function App() {
         reconcileInference("max_turn_text_tokens", "maxTurn", setMaxTurn);
         reconcileInference("inject_silence_rms", "injectSilenceRms", setInjectSilenceRms);
         reconcileInference("inject_silence_streak", "injectSilenceStreak", setInjectSilenceStreak);
+        if (fullSync && !tuningWarnedRef.current) {
+          tuningWarnedRef.current = true;
+          const deviations = describeTuningDeviations(config, modelDefaultsRef.current || DEFAULTS);
+          if (deviations.length > 0) {
+            const shown = deviations.slice(0, 4).join(", ");
+            const extra = deviations.length > 4 ? ` and ${deviations.length - 4} more` : "";
+            addNotice(
+              "warn",
+              `Session started with non-default tuning: ${shown}${extra}. Reset defaults in the tuning rail to compare clean.`,
+              "tuning",
+            );
+          }
+        }
         setServerAppliedConfig({
           source: typeof message.source === "string" ? message.source : "",
           applied: Array.isArray(message.applied) ? message.applied : [],
@@ -2850,6 +2924,8 @@ function App() {
 
   const startConversation = useCallback(async () => {
     if (phase === "connecting" || phase === "warmup" || phase === "live") return;
+    tuningWarnedRef.current = false;
+    visionInjectDroughtRef.current = { captions: 0, warned: false };
     cleanup({ keepPhase: true });
     sessionTraceRef.current = createSessionTrace();
     traceMaximaRef.current = { rtf: 0, gpuUtil: 0, vramUsed: 0 };
