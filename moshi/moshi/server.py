@@ -712,6 +712,11 @@ ASR_MIN_TURN_SECONDS = 0.6
 # cap the turn is finalized early so memory and per-call latency stay bounded.
 ASR_MAX_TURN_SECONDS = 30.0
 
+# Completed turn boundaries waiting behind the active transcription. The queue
+# drops its oldest entry at the cap so recognizer stalls cannot grow memory
+# without bound.
+ASR_MAX_PENDING_TURNS = 3
+
 # RMS floor below which a buffered turn is considered silence and dropped.
 # Keeps the recognizer from hallucinating words out of room tone.
 ASR_SILENCE_RMS = 0.005
@@ -928,6 +933,9 @@ class _AsrEngine:
         self._max_samples = int(ASR_MAX_TURN_SECONDS * self._src_rate)
         self._min_samples = int(ASR_MIN_TURN_SECONDS * self._src_rate)
         self._in_flight = False
+        self._pending_turns: list[
+            tuple[np.ndarray, Callable[[str], None], int]
+        ] = []
         self._generation = 0
 
     @staticmethod
@@ -986,6 +994,7 @@ class _AsrEngine:
             self._generation += 1
             self._buffer = []
             self._buffered_samples = 0
+            self._pending_turns = []
 
     def feed(self, chunk: np.ndarray) -> bool:
         """Append one inbound float chunk to the rolling turn buffer.
@@ -1015,9 +1024,15 @@ class _AsrEngine:
                 self._buffered_samples -= int(dropped.size)
             return full
 
-    def _drain(self) -> Optional[np.ndarray]:
-        """Pop and concatenate the buffered turn audio under the lock."""
+    def _drain(self) -> Optional[tuple[np.ndarray, int]]:
+        """Pop the buffered turn audio and its generation tag atomically.
+
+        The generation must come from the same lock hold that empties the
+        buffer: a reset between drain and tagging would stamp already-drained
+        audio with the fresh generation and publish it as current.
+        """
         with self._lock:
+            generation = self._generation
             if self._buffered_samples < self._min_samples:
                 self._buffer = []
                 self._buffered_samples = 0
@@ -1027,56 +1042,82 @@ class _AsrEngine:
             self._buffered_samples = 0
         if not segments:
             return None
-        return np.concatenate(segments) if len(segments) > 1 else segments[0]
+        audio = (
+            np.concatenate(segments) if len(segments) > 1 else segments[0]
+        )
+        return audio, generation
 
     def finalize_async(self, on_text: Callable[[str], None]) -> None:
-        """Transcribe the buffered turn on the worker thread, then call back.
+        """Snapshot one completed turn and schedule its transcription.
 
         ``on_text`` is invoked with the recognized text only when speech was
         found; it is responsible for marshaling the send back onto the event
-        loop. A turn that is too short, too quiet, or yields no words is
-        dropped silently so the client keeps its audio-only marker rather
-        than receiving fabricated words. At most one transcription runs at a
-        time; further finalize requests while one is in flight are ignored
-        (their audio stays buffered for the next turn).
+        loop. Every detected boundary drains the live accumulator immediately.
+        A bounded FIFO keeps completed turns distinct while the single worker
+        is busy, and the worker drains that queue before becoming idle.
         """
+        drained = self._drain()
+        if drained is None:
+            return
+        audio, generation = drained
+
         with self._lock:
+            turn = (audio, on_text, generation)
             if self._in_flight:
+                if len(self._pending_turns) >= ASR_MAX_PENDING_TURNS:
+                    self._pending_turns.pop(0)
+                    logger.warning(
+                        "ASR pending turn queue full; dropping oldest completed turn"
+                    )
+                self._pending_turns.append(turn)
                 return
             self._in_flight = True
-            generation = self._generation
-        audio = self._drain()
-        if audio is None:
-            with self._lock:
-                self._in_flight = False
-            return
 
-        def _work() -> None:
-            try:
-                rms = float(np.sqrt(np.mean(np.square(audio)))) if audio.size else 0.0
-                if rms < ASR_SILENCE_RMS:
-                    return
-                samples = _resample_linear(audio, self._src_rate, ASR_SAMPLE_RATE)
-                segments, _info = self._model.transcribe(
-                    samples, language=None, beam_size=1, vad_filter=True
-                )
-                text = " ".join(seg.text.strip() for seg in segments).strip()
-                if text:
+        def _work(first_turn) -> None:
+            current_turn = first_turn
+            while current_turn is not None:
+                current_audio, current_callback, generation = current_turn
+                try:
+                    rms = (
+                        float(np.sqrt(np.mean(np.square(current_audio))))
+                        if current_audio.size
+                        else 0.0
+                    )
+                    if rms >= ASR_SILENCE_RMS:
+                        samples = _resample_linear(
+                            current_audio, self._src_rate, ASR_SAMPLE_RATE
+                        )
+                        segments, _info = self._model.transcribe(
+                            samples, language=None, beam_size=1, vad_filter=True
+                        )
+                        text = " ".join(
+                            seg.text.strip() for seg in segments
+                        ).strip()
+                        if text:
+                            # Publish under the same lock hold as the
+                            # generation check: a rewind between check and
+                            # callback would otherwise deliver text from the
+                            # abandoned timeline. The callback only schedules
+                            # onto the event loop (call_soon_threadsafe), so
+                            # holding the lock here cannot deadlock.
+                            with self._lock:
+                                if generation == self._generation:
+                                    current_callback(text)
+                except Exception as exc:
+                    logger.warning(
+                        "ASR transcription failed: %s: %s",
+                        type(exc).__name__,
+                        exc,
+                    )
+                finally:
                     with self._lock:
-                        is_current = generation == self._generation
-                    if is_current:
-                        on_text(text)
-            except Exception as exc:
-                logger.warning(
-                    "ASR transcription failed: %s: %s",
-                    type(exc).__name__,
-                    exc,
-                )
-            finally:
-                with self._lock:
-                    self._in_flight = False
+                        if self._pending_turns:
+                            current_turn = self._pending_turns.pop(0)
+                        else:
+                            current_turn = None
+                            self._in_flight = False
 
-        self._executor.submit(_work)
+        self._executor.submit(_work, turn)
 
     def shutdown(self) -> None:
         """Stop the worker pool at process exit."""
@@ -1313,15 +1354,19 @@ class ServerState:
         # Persona-reinforce state, sharing the vision drip machinery.
         # _reinforce_enabled is the connect-time flag.
         # _reinforce_prompt_tokens is the bare (no <system>) persona body,
-        # tokenized once at connect. _reinforce_pending is the active drip
-        # queue for one re-assertion window; it is refilled from
-        # _reinforce_prompt_tokens when REINFORCE_MIN_INTERVAL_SEC elapses.
+        # tokenized once at connect. _reinforce_pending holds a waiting
+        # packet; promotion makes its active suffix immutable so preemption
+        # can seal that packet before a higher-priority context starts.
         # _last_reinforce_at is the wall-clock start of the last window.
         # Reset on each new session in _run_rtc_session.
         self._reinforce_enabled: bool = False
         self._reinforce_prompt_tokens: list[int] = []
         self._reinforce_prompt_text: str = ""
         self._reinforce_pending: deque[int] = deque()
+        self._reinforce_active: deque[int] = deque()
+        self._reinforce_active_meta: dict = {}
+        self._reinforce_seal_pending: bool = False
+        self._reinforce_seal_meta: dict = {}
         self._reinforce_inject_steps: int = 0
         self._last_reinforce_at: float = 0.0
         # Last connect-time text prompt body accepted from the client. The
@@ -1758,9 +1803,7 @@ class ServerState:
             self.lm_gen.max_turn_text_tokens = max(
                 MAX_TURN_TEXT_TOKENS_MIN, cfg.max_turn_text_tokens
             )
-            self.lm_gen._non_pad_streak = 0
-            self.lm_gen._turn_pad_streak = 0
-            self.lm_gen._pad_force_remaining = 0
+            self.lm_gen.reset_turn_cap_tracking()
             self.mimi.reset_streaming()
             self.lm_gen.reset_streaming()
 
@@ -2013,9 +2056,7 @@ class ServerState:
                 self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(
                     wrap_with_system_tags(PREVIEW_SAMPLE_TEXT)
                 )
-                self.lm_gen._non_pad_streak = 0
-                self.lm_gen._turn_pad_streak = 0
-                self.lm_gen._pad_force_remaining = 0
+                self.lm_gen.reset_turn_cap_tracking()
 
                 self.mimi.reset_streaming()
                 self.lm_gen.reset_streaming()
@@ -2043,9 +2084,7 @@ class ServerState:
                 # next real connect re-primes cleanly. set_streaming_state_inplace
                 # pops the dict it is given, so pass a shallow copy.
                 self.lm_gen.set_streaming_state_inplace(dict(snapshot))
-                self.lm_gen._pad_force_remaining = 0
-                self.lm_gen._non_pad_streak = 0
-                self.lm_gen._turn_pad_streak = 0
+                self.lm_gen.reset_turn_cap_tracking()
                 self.lm_gen.voice_prompt = None
                 self.lm_gen.voice_prompt_audio = None
                 self.lm_gen.voice_prompt_cache = None
@@ -2396,6 +2435,44 @@ class ServerState:
             inject_token: Optional[int] = None
             inject_meta: dict = {}
             vision_packet_completed = False
+            if self._reinforce_active and (
+                self._vision_active
+                or self._vision_pending
+                or inbound_speaking
+                or self._interrupt_gate_remaining > 0
+                or self._stop_response_latched
+                or not self._reinforce_enabled
+                or not self._reinforce_prompt_tokens
+                or not model_silent
+                or self._reinforce_inject_steps >= LIVE_PROMPT_MAX_STEPS
+            ):
+                self._inject_end_status = (
+                    "interrupted"
+                    if (
+                        inbound_speaking
+                        or self._interrupt_gate_remaining > 0
+                        or self._stop_response_latched
+                    )
+                    else "dropped"
+                )
+                self._defer_reinforce_seal()
+            # The deferred seal fires on the first quiet frame even inside
+            # the post-user-turn inject holdoff: reply formation is exactly
+            # when a dangling persona clause would mislead the model, and
+            # waiting out the holdoff would land this gated ritual frame
+            # mid-reply instead of at its onset.
+            if (
+                inject_token is None
+                and self._reinforce_seal_pending
+                and not inbound_speaking
+                and self._interrupt_gate_remaining <= 0
+                and not self._stop_response_latched
+            ):
+                inject_token = self._context_seal_token
+                inject_meta = dict(self._reinforce_seal_meta)
+                self._reinforce_seal_pending = False
+                self._reinforce_seal_meta = {}
+
             if self._vision_active and inbound_speaking:
                 logger.info("vision inject aborted by user speech")
                 self._active_context_meta = dict(self._vision_active_meta)
@@ -2413,7 +2490,8 @@ class ServerState:
                 self._vision_pad_streak = 0
                 self._audio_silence_streak = 0
             if (
-                not self._vision_active
+                inject_token is None
+                and not self._vision_active
                 and self._vision_pending
                 and model_silent
                 and not inbound_speaking
@@ -2422,7 +2500,11 @@ class ServerState:
                 and not self._stop_response_latched
             ):
                 self._promote_vision_context()
-            if self._vision_active and not inbound_speaking:
+            if (
+                inject_token is None
+                and self._vision_active
+                and not inbound_speaking
+            ):
                 if self._vision_inject_steps < LIVE_PROMPT_MAX_STEPS:
                     inject_token = self._vision_active.popleft()
                     self._vision_inject_steps += 1
@@ -2458,11 +2540,9 @@ class ServerState:
                     self._inject_seal_remaining -= 1
 
             # Persona reinforcement reuses the same drip slot but yields to
-            # vision: vision context is time-sensitive, persona drift is
-            # slow, and the two must not interleave token-by-token (that
-            # would scramble both messages). A reinforce window arms only on
-            # a frame vision isn't using, then drains its own queue one
-            # token per frame under the same end-of-thought + cap gate.
+            # vision. A waiting packet becomes immutable once promoted, so
+            # higher-priority work can abandon it and seal the emitted prefix
+            # without letting two context packets interleave.
             if (
                 inject_token is None
                 and not self._vision_active
@@ -2474,7 +2554,7 @@ class ServerState:
                 and self._reinforce_prompt_tokens
             ):
                 now = time.monotonic()
-                if not self._reinforce_pending:
+                if not self._reinforce_pending and not self._reinforce_active:
                     if (
                         model_silent
                         and self._post_turn_inject_holdoff <= 0
@@ -2490,45 +2570,24 @@ class ServerState:
                             "text": self._reinforce_prompt_text,
                             "tokens": len(self._reinforce_prompt_tokens),
                         }
-                        self._reinforce_inject_steps = 0
                         self._last_reinforce_at = now
-                if self._reinforce_pending:
-                    if (
-                        model_silent
-                        and self._reinforce_inject_steps < LIVE_PROMPT_MAX_STEPS
-                    ):
-                        inject_token = self._reinforce_pending.popleft()
-                        self._reinforce_inject_steps += 1
-                        inject_meta = dict(self._reinforce_pending_meta)
-                        if not self._reinforce_pending:
-                            # Fully drained: close the window now. Leaving
-                            # the step count armed keeps the inject state
-                            # (and the client's "Injecting context" status)
-                            # open until the next window replaces it.
-                            self._reinforce_inject_steps = 0
-                            self._inject_seal_remaining = (
-                                CONTEXT_SEAL_HOLD_FRAMES
-                            )
-                    else:
-                        # Window interrupted (streak broke or cap hit):
-                        # abandon the remainder and re-arm on the next
-                        # cooldown. A partial re-assertion is harmless; a
-                        # forced burst causes degenerate single-token loops.
-                        if (
-                            self._reinforce_inject_steps > 0
-                            and self._context_seal_token is not None
-                        ):
-                            inject_token = self._context_seal_token
-                            inject_meta = dict(self._reinforce_pending_meta)
-                        self._clear_reinforce_pending()
-                        self._reinforce_inject_steps = 0
+                if self._reinforce_pending and not self._reinforce_active:
+                    self._promote_reinforce_context()
+                if self._reinforce_active:
+                    inject_token = self._reinforce_active.popleft()
+                    self._reinforce_inject_steps += 1
+                    inject_meta = dict(self._reinforce_active_meta)
+                    if not self._reinforce_active:
+                        self._active_context_meta = dict(
+                            self._reinforce_active_meta
+                        )
+                        self._clear_reinforce_active()
+                        self._inject_end_status = "complete"
+                        self._inject_seal_remaining = CONTEXT_SEAL_HOLD_FRAMES
             else:
-                # Disabled, no persona, or vision is using the slot this
-                # frame. Abandon any in-flight window so the next eligible
-                # one re-asserts the full persona from the start rather than
-                # resuming a stale fragment.
-                self._clear_reinforce_pending()
-                self._reinforce_inject_steps = 0
+                # A waiting packet has emitted nothing and needs no seal.
+                # Active packets are abandoned by the preemption block above.
+                self._clear_reinforce_waiting()
 
             injected_this_frame = inject_token is not None
             # Context tokens ride the t=0 conditioning ritual: every trained
@@ -2693,7 +2752,9 @@ class ServerState:
             now_inject_active = (
                 injected_this_frame
                 or bool(self._vision_active)
+                or bool(self._reinforce_active)
                 or self._reinforce_inject_steps > 0
+                or self._reinforce_seal_pending
                 or self._inject_seal_remaining > 0
             )
             if now_inject_active != self._inject_active:
@@ -2705,11 +2766,11 @@ class ServerState:
                         reinforce_opened = True
                         self._active_context_meta = dict(inject_meta)
                         self._active_context_meta["remaining_tokens"] = len(
-                            self._reinforce_pending
+                            self._reinforce_active
                         )
                         logger.info(
                             "reinforce inject window opened (%d tokens queued)",
-                            len(self._reinforce_pending),
+                            len(self._reinforce_active),
                         )
                     else:
                         self._active_context_meta = dict(
@@ -3106,6 +3167,8 @@ class ServerState:
                 getattr(self, "_inject_active", False)
                 or getattr(self, "_vision_active", ())
                 or getattr(self, "_reinforce_pending", ())
+                or getattr(self, "_reinforce_active", ())
+                or getattr(self, "_reinforce_seal_pending", False)
             ):
                 raise SnapshotDeferred(
                     "context injection is active; retry at the next boundary"
@@ -3170,9 +3233,7 @@ class ServerState:
         # Turn caps and collapse detectors describe the abandoned execution
         # path, not the conversation state being restored. Carrying them over
         # can manufacture an immediate forced-silence edge after rewind.
-        self.lm_gen._non_pad_streak = 0
-        self.lm_gen._turn_pad_streak = 0
-        self.lm_gen._pad_force_remaining = 0
+        self.lm_gen.reset_turn_cap_tracking()
         self._clear_vision_pending()
         self._clear_reinforce_pending()
         self._active_context_meta = {}
@@ -3365,6 +3426,50 @@ class ServerState:
         if self._resume_grant_expiry_handle is not None:
             self._resume_grant_expiry_handle.cancel()
             self._resume_grant_expiry_handle = None
+
+    def _maybe_record_resume_grant(
+        self,
+        *,
+        session: "RTCSession",
+        session_id: str,
+        cfg: Optional[SessionConfig],
+        went_live: bool,
+        state_frozen: bool,
+        server_ended: bool,
+        effective_timeout_sec: int,
+        session_started_at: Optional[float],
+    ) -> bool:
+        """Record resumable state only for an unexpected transport death."""
+        if (
+            not went_live
+            or not state_frozen
+            or server_ended
+            or session.client_ended
+            or session.close_reason is not None
+            or cfg is None
+        ):
+            return False
+
+        remaining_sec = 0
+        if effective_timeout_sec > 0 and session_started_at is not None:
+            remaining_sec = max(
+                1,
+                int(
+                    effective_timeout_sec
+                    - (time.monotonic() - session_started_at)
+                ),
+            )
+        self._clear_resume_grant()
+        self._resume_grant = {
+            "session_id": session_id,
+            "deadline": time.monotonic() + RESUME_GRANT_WINDOW_SEC,
+            "cfg": cfg,
+            "timeout_remaining_sec": remaining_sec,
+            "snapshots": self._session_snapshots.get(session_id, []),
+            "bookmarks": self._session_bookmarks.get(session_id, []),
+        }
+        self._schedule_resume_grant_expiry(self._resume_grant)
+        return True
 
     async def handle_vision_frame(
         self,
@@ -3969,9 +4074,41 @@ class ServerState:
             self._audio_silence_streak = 0
         return waiting_cleared, active_cleared
 
-    def _clear_reinforce_pending(self) -> None:
+    def _promote_reinforce_context(self) -> bool:
+        """Move the waiting persona packet into its immutable active slot."""
+        if self._reinforce_active or not self._reinforce_pending:
+            return False
+        self._reinforce_active.extend(self._reinforce_pending)
+        self._reinforce_active_meta = dict(self._reinforce_pending_meta)
+        self._clear_reinforce_waiting()
+        self._reinforce_inject_steps = 0
+        return True
+
+    def _clear_reinforce_waiting(self) -> None:
         self._reinforce_pending.clear()
         self._reinforce_pending_meta = {}
+
+    def _clear_reinforce_active(self) -> None:
+        self._reinforce_active.clear()
+        self._reinforce_active_meta = {}
+        self._reinforce_inject_steps = 0
+
+    def _defer_reinforce_seal(self) -> None:
+        if (
+            self._reinforce_inject_steps > 0
+            and self._context_seal_token is not None
+            and not self._reinforce_seal_pending
+        ):
+            self._reinforce_seal_pending = True
+            self._reinforce_seal_meta = dict(self._reinforce_active_meta)
+        self._active_context_meta = dict(self._reinforce_active_meta)
+        self._clear_reinforce_active()
+
+    def _clear_reinforce_pending(self) -> None:
+        self._clear_reinforce_waiting()
+        self._clear_reinforce_active()
+        self._reinforce_seal_pending = False
+        self._reinforce_seal_meta = {}
 
     def _gate_outbound_pcm(self, pcm_np: np.ndarray, muted: bool) -> np.ndarray:
         """Silence gated outbound audio with a short ramp at each boundary.
@@ -4076,6 +4213,11 @@ class ServerState:
         """Start a new cap accounting window without cancelling an interrupt."""
         self.lm_gen._non_pad_streak = 0
         self.lm_gen._turn_pad_streak = 0
+        # Any in-flight token copy belongs to the accounting window being
+        # discarded; a stale pending flag would otherwise satisfy the next
+        # read with an abandoned frame's token.
+        self.lm_gen._turn_cap_token_pending = False
+        self.lm_gen._turn_cap_token_recorded = False
         self._collapse_triggers.clear()
         # A live update may land during the shared forced-PAD window used by
         # manual interruption. Preserve that window and mark its current
@@ -4114,9 +4256,7 @@ class ServerState:
             return False
         self._stop_response_latched = False
         self._interrupt_gate_remaining = 0
-        self.lm_gen._pad_force_remaining = 0
-        self.lm_gen._non_pad_streak = 0
-        self.lm_gen._turn_pad_streak = 0
+        self.lm_gen.reset_turn_cap_tracking()
         self._prev_pad_force_remaining = 0
         self._vision_pad_streak = 0
         self._audio_silence_streak = 0
@@ -4169,7 +4309,7 @@ class ServerState:
 
         Returns (resolved_path, requested_path). resolved_path is None
         when no prompt was requested. Raises FileNotFoundError when a
-        named prompt is missing or escapes the uploads dir.
+        named prompt is missing or escapes its configured prompt directory.
         """
         if not voice_prompt_filename:
             return None, None
@@ -4183,7 +4323,18 @@ class ServerState:
             return requested, requested
         if self.voice_prompt_dir is None:
             return None, None
-        requested = os.path.join(self.voice_prompt_dir, voice_prompt_filename)
+        voice_dir = os.path.realpath(self.voice_prompt_dir)
+        requested = os.path.realpath(
+            os.path.join(voice_dir, voice_prompt_filename)
+        )
+        try:
+            contained = os.path.commonpath([voice_dir, requested]) == voice_dir
+        except ValueError:
+            contained = False
+        if not contained:
+            raise FileNotFoundError(
+                f"Requested voice prompt '{voice_prompt_filename}' is outside the voice prompt directory"
+            )
         if not os.path.exists(requested):
             raise FileNotFoundError(
                 f"Requested voice prompt '{voice_prompt_filename}' not found in '{self.voice_prompt_dir}'"
@@ -4647,12 +4798,11 @@ class ServerState:
         resuming = resume_state is not None
         cfg: Optional[SessionConfig] = None
         # Teardown bookkeeping for the resume grant: whether this session
-        # reached the live phase with primed model state, whether the
-        # server or the client deliberately ended it, and the wall-clock
-        # the watchdog budget math needs.
+        # reached the live phase with primed model state, whether the server
+        # deliberately ended it, and the wall-clock the watchdog budget math
+        # needs. RTCSession owns the client-end receipt flag.
         went_live = False
         server_ended = False
-        client_ended = False
         effective_timeout_sec = 0
         session_started_at: Optional[float] = None
         try:
@@ -4908,7 +5058,6 @@ class ServerState:
             vision_partials: dict[str, dict] = {}
 
             async def on_message(msg: dict):
-                nonlocal client_ended
                 mtype = msg.get("type")
                 if mtype == "rewind":
                     bookmark_id = str(msg.get("id") or "")[:BOOKMARK_ID_MAX_LEN]
@@ -5198,7 +5347,7 @@ class ServerState:
                                 exc,
                             )
                         return
-                    if client_ended:
+                    if session.client_ended:
                         # The client already said goodbye; a slider message
                         # still in flight must not mutate lm_gen or log as
                         # applied during teardown.
@@ -5226,6 +5375,7 @@ class ServerState:
                         "vision_ground_user_turns",
                         "inject_silence_rms",
                         "inject_silence_streak",
+                        "caption_cfg_gamma",
                     )
                     # Parse and clamp on the event loop, before touching
                     # lm_gen or the lock, using the same bounds as the
@@ -5240,6 +5390,7 @@ class ServerState:
                     vision_ground_user_turns: Optional[bool] = None
                     inject_silence_rms: Optional[float] = None
                     inject_silence_streak: Optional[int] = None
+                    caption_cfg_gamma: Optional[float] = None
                     try:
                         if "text_temperature" in msg:
                             updates["temp_text"] = clamp_temperature(
@@ -5305,6 +5456,10 @@ class ServerState:
                         if "inject_silence_streak" in msg:
                             inject_silence_streak = clamp_inject_silence_streak(
                                 msg["inject_silence_streak"]
+                            )
+                        if "caption_cfg_gamma" in msg:
+                            caption_cfg_gamma = clamp_caption_cfg_gamma(
+                                msg["caption_cfg_gamma"]
                             )
                     except (TypeError, ValueError) as exc:
                         clog.log("warning", f"update_config: bad value: {exc}")
@@ -5398,6 +5553,7 @@ class ServerState:
                         or audio_temperature is not None
                         or audio_top_k is not None
                         or semantic_temp_cap is not None
+                        or caption_cfg_gamma is not None
                     ):
                         def _apply_live_config():
                             # Mutate scalars under the inference lock so the
@@ -5408,6 +5564,11 @@ class ServerState:
                                     return
                                 if "max_turn_text_tokens" in updates:
                                     self._reset_turn_cap_tracking_for_config_change()
+                                if caption_cfg_gamma is not None:
+                                    # The target applies at the next completed
+                                    # caption; an active decay keeps its current
+                                    # trajectory.
+                                    self._caption_cfg_gamma = caption_cfg_gamma
                                 if semantic_temp_cap is not None:
                                     # Assign before the sampling write so the
                                     # refreshed vector uses the new cap.
@@ -5641,7 +5802,7 @@ class ServerState:
                     # transport death, so teardown would record a resume
                     # grant and pin the snapshot clones for the full
                     # window on every normal End-session click.
-                    client_ended = True
+                    session.client_ended = True
                     clog.log("info", "client ended session")
 
             # Warmup runs in an executor without holding _infer_lock;
@@ -6159,33 +6320,16 @@ class ServerState:
                 # model state resident, so record a grant the same client
                 # can redeem by re-offering with resume_session_id. A fresh
                 # session start discards it; redemption consumes it.
-                if (
-                    went_live
-                    and state_frozen
-                    and not server_ended
-                    and not client_ended
-                    and session.close_reason is None
-                    and cfg is not None
+                if self._maybe_record_resume_grant(
+                    session=session,
+                    session_id=session_id,
+                    cfg=cfg,
+                    went_live=went_live,
+                    state_frozen=state_frozen,
+                    server_ended=server_ended,
+                    effective_timeout_sec=effective_timeout_sec,
+                    session_started_at=session_started_at,
                 ):
-                    remaining_sec = 0
-                    if effective_timeout_sec > 0 and session_started_at is not None:
-                        remaining_sec = max(
-                            1,
-                            int(
-                                effective_timeout_sec
-                                - (time.monotonic() - session_started_at)
-                            ),
-                        )
-                    self._clear_resume_grant()
-                    self._resume_grant = {
-                        "session_id": session_id,
-                        "deadline": time.monotonic() + RESUME_GRANT_WINDOW_SEC,
-                        "cfg": cfg,
-                        "timeout_remaining_sec": remaining_sec,
-                        "snapshots": self._session_snapshots.get(session_id, []),
-                        "bookmarks": self._session_bookmarks.get(session_id, []),
-                    }
-                    self._schedule_resume_grant_expiry(self._resume_grant)
                     clog.log(
                         "info",
                         "transport lost with model state intact; resume "
@@ -6206,7 +6350,7 @@ class ServerState:
                         "server ended it"
                         if server_ended
                         else "client said goodbye"
-                        if client_ended
+                        if session.client_ended
                         else f"close_reason={session.close_reason!r}"
                         if session.close_reason is not None
                         else "session never went live"

@@ -122,6 +122,10 @@ def _pipeline_state() -> tuple[ServerState, _FakeLmGen]:
     state._reinforce_prompt_text = ""
     state._reinforce_pending = deque()
     state._reinforce_pending_meta = {}
+    state._reinforce_active = deque()
+    state._reinforce_active_meta = {}
+    state._reinforce_seal_pending = False
+    state._reinforce_seal_meta = {}
     state._reinforce_inject_steps = 0
     state._last_reinforce_at = 0.0
 
@@ -235,6 +239,49 @@ def test_user_speech_cancels_hold_and_keeps_mic_audio() -> None:
     assert spoken["forced_text"] is None
 
 
+def test_vision_waits_for_reinforce_seal_before_promotion() -> None:
+    state, lm_gen = _pipeline_state()
+    state._reinforce_enabled = True
+    state._reinforce_prompt_tokens = [61, 62, 63]
+    state._reinforce_prompt_text = "persona reminder"
+    state._last_reinforce_at = -1e18
+
+    state._process_audio_frame(_silent_chunk())
+    state._vision_pending.extend([41, 42])
+    state._vision_pending_source = "ambient"
+    state._vision_pending_meta = {"source": "ambient", "text": "scene"}
+    state._process_audio_frame(_silent_chunk())
+    state._process_audio_frame(_silent_chunk())
+
+    forced = [frame["forced_text"] for frame in lm_gen.steps[:3]]
+    assert forced == [61, state._context_seal_token, 41]
+    assert list(state._reinforce_active) == []
+    assert not state._reinforce_seal_pending
+
+
+def test_user_speech_defers_reinforce_seal_without_dangling_clause() -> None:
+    state, lm_gen = _pipeline_state()
+    state._reinforce_enabled = True
+    state._reinforce_prompt_tokens = [61, 62, 63]
+    state._reinforce_prompt_text = "persona reminder"
+    state._last_reinforce_at = -1e18
+
+    state._process_audio_frame(_silent_chunk())
+    state._process_audio_frame(_loud_chunk())
+
+    spoken = lm_gen.steps[1]
+    assert spoken["input_mark"] == MIC_MARK
+    assert spoken["forced_text"] is None
+    assert state._reinforce_seal_pending
+    assert list(state._reinforce_active) == []
+
+    state._process_audio_frame(_silent_chunk())
+
+    assert lm_gen.steps[2]["forced_text"] == state._context_seal_token
+    assert not state._reinforce_seal_pending
+    assert list(state._reinforce_active) == []
+
+
 def test_stop_latch_frames_keep_real_mic_audio() -> None:
     state, lm_gen = _pipeline_state()
     state._stop_response_latched = True
@@ -256,6 +303,8 @@ if __name__ == "__main__":
         test_drip_frames_ride_the_t0_ritual,
         test_completion_hold_pads_then_releases,
         test_user_speech_cancels_hold_and_keeps_mic_audio,
+        test_vision_waits_for_reinforce_seal_before_promotion,
+        test_user_speech_defers_reinforce_seal_without_dangling_clause,
         test_stop_latch_frames_keep_real_mic_audio,
     ]
     for test in tests:
