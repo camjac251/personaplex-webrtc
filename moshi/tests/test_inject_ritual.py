@@ -298,6 +298,43 @@ def test_stop_latch_frames_keep_real_mic_audio() -> None:
     assert latched["agent_silenced"] is True
 
 
+def test_typed_note_queues_at_manual_priority_and_drips() -> None:
+    state, lm_gen = _pipeline_state()
+    # An ambient caption is already waiting; a typed note must displace it.
+    state._vision_pending.extend([41, 42])
+    state._vision_pending_source = "ambient"
+    state._vision_pending_meta = {"source": "ambient", "text": "scene"}
+
+    note_meta = {"source": "manual", "reason": "typed_note", "text": "note"}
+    ok, blocked_by, duplicate = state._queue_waiting_vision_context(
+        [71, 72], "manual", note_meta
+    )
+    assert (ok, blocked_by, duplicate) == (True, "", False)
+    assert list(state._vision_pending) == [71, 72]
+    assert state._vision_pending_source == "manual"
+
+    # The reverse displacement is refused: ambient may not evict a note.
+    ok, blocked_by, duplicate = state._queue_waiting_vision_context(
+        [41, 42], "ambient", {"source": "ambient", "text": "scene"}
+    )
+    assert (ok, blocked_by, duplicate) == (False, "manual", False)
+
+    # The note drips under the standard ritual.
+    state._process_audio_frame(_silent_chunk())
+    state._process_audio_frame(_silent_chunk())
+    assert lm_gen.steps[0] == {
+        "input_mark": SINE_MARK,
+        "agent_silenced": True,
+        "forced_text": 71,
+    }
+    assert lm_gen.steps[1] == {
+        "input_mark": SINE_MARK,
+        "agent_silenced": True,
+        "forced_text": 72,
+    }
+    assert state._inject_seal_remaining == CONTEXT_SEAL_HOLD_FRAMES
+
+
 if __name__ == "__main__":
     tests = [
         test_drip_frames_ride_the_t0_ritual,
@@ -306,6 +343,7 @@ if __name__ == "__main__":
         test_vision_waits_for_reinforce_seal_before_promotion,
         test_user_speech_defers_reinforce_seal_without_dangling_clause,
         test_stop_latch_frames_keep_real_mic_audio,
+        test_typed_note_queues_at_manual_priority_and_drips,
     ]
     for test in tests:
         print(f"{test.__name__} ...")

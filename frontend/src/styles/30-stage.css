@@ -451,6 +451,51 @@
     flex: 1; overflow-y: auto;
     padding: 14px 16px 20px;
   }
+  .context-note-row {
+    display: flex;
+    gap: 8px;
+    padding: 8px 16px;
+    border-top: 1px solid var(--line);
+    background: var(--bg-2);
+  }
+  .context-note-input {
+    flex: 1;
+    min-width: 0;
+    background: var(--bg);
+    color: var(--ink-2);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 6px 10px;
+    font-family: 'Geist Mono', monospace;
+    font-size: 11px;
+  }
+  .context-note-input:focus-visible {
+    outline: 1px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .context-note-input::placeholder { color: var(--ink-5); }
+  .context-note-send {
+    background: var(--accent-veil);
+    color: var(--accent);
+    border: 1px solid rgba(132, 168, 90, 0.3);
+    border-radius: 4px;
+    padding: 6px 12px;
+    font-family: 'Geist Mono', monospace;
+    font-size: 9.5px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    cursor: pointer;
+  }
+  .context-note-send:disabled {
+    color: var(--ink-5);
+    background: transparent;
+    border-color: var(--line);
+    cursor: default;
+  }
+  .context-note-send:focus-visible {
+    outline: 1px solid var(--accent);
+    outline-offset: 1px;
+  }
   .turn-insights {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));

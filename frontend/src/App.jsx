@@ -458,6 +458,7 @@ function App() {
   // Labelled snapshot bookmarks for jump-back, newest first: {id, label, atSec}.
   // Session-scoped runtime state (not persisted); reset when a session starts.
   const [bookmarks, setBookmarks] = useState([]);
+  const [contextNoteDraft, setContextNoteDraft] = useState("");
   const [latencyMs, setLatencyMs] = useState(0);
   const [tailLatencyMs, setTailLatencyMs] = useState(0);
   const [rttSamples, setRttSamples] = useState([]);
@@ -3496,6 +3497,15 @@ function App() {
     toast(`Jumped to ${bm.label}`);
   };
 
+  const submitContextNote = () => {
+    const note = contextNoteDraft.trim();
+    if (!note || phase !== "live") return;
+    if (controlRef.current?.readyState !== "open") return;
+    controlRef.current.send(JSON.stringify({ type: "context_note", text: note }));
+    setContextNoteDraft("");
+    addNotice("info", "Context note sent", "vision");
+  };
+
   const sendLiveConfig = useCallback((partial) => {
     if (!isLive) return;
     // Coalesce the in-flight fields and flush on the trailing edge so a
@@ -5178,6 +5188,32 @@ function App() {
                     )
                   )}
                 </div>
+                {isLive && (
+                  <form
+                    className="context-note-row"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      submitContextNote();
+                    }}
+                  >
+                    <input
+                      type="text"
+                      className="context-note-input"
+                      value={contextNoteDraft}
+                      maxLength={180}
+                      placeholder="Type context for the AI, e.g. You are talking with someone planning a trip"
+                      aria-label="Context note for the AI"
+                      onChange={(event) => setContextNoteDraft(event.target.value)}
+                    />
+                    <button
+                      type="submit"
+                      className="context-note-send"
+                      disabled={!contextNoteDraft.trim()}
+                    >
+                      Inject
+                    </button>
+                  </form>
+                )}
                 {/* biome-ignore lint/a11y/useAriaPropsSupportedByRole: aria-label names this readout region for assistive tech; visible per-row labels are also present */}
                 <div className="turn-insights" aria-label="Conversation telemetry">
                   <div className="turn-insight">

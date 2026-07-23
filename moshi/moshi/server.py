@@ -5763,6 +5763,84 @@ class ServerState:
                             task,
                             live_source=not historical_detail,
                         )
+                elif mtype == "context_note":
+                    if not warmup_done.is_set():
+                        try:
+                            session.send_event(
+                                "context_note",
+                                "Context notes unavailable during warmup",
+                                "warn",
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "context note warmup notify failed: %s: %s",
+                                type(exc).__name__,
+                                exc,
+                            )
+                        return
+                    note_raw = msg.get("text")
+                    note = (
+                        " ".join(str(note_raw).split())
+                        if isinstance(note_raw, str)
+                        else ""
+                    )
+                    if not note:
+                        session.send_event(
+                            "context_note", "Empty context note ignored", "warn"
+                        )
+                        return
+                    context, tokens = self._fit_vision_context(note)
+                    if not tokens:
+                        session.send_event(
+                            "context_note",
+                            "Context note could not be tokenized",
+                            "warn",
+                        )
+                        return
+                    note_meta = {
+                        "source": "manual",
+                        "reason": "typed_note",
+                        "text": context,
+                        "caption": context.rstrip(".!?"),
+                        "tokens": len(tokens),
+                        "remaining_tokens": len(tokens),
+                    }
+                    note_result = {"ok": False, "blocked_by": ""}
+
+                    def _queue_note() -> None:
+                        with self._infer_lock:
+                            if session_id != self._active_session_id:
+                                return
+                            ok, blocked_by, _dup = (
+                                self._queue_waiting_vision_context(
+                                    tokens, "manual", note_meta
+                                )
+                            )
+                            note_result["ok"] = ok
+                            note_result["blocked_by"] = blocked_by
+
+                    await loop.run_in_executor(
+                        self._infer_executor, _queue_note
+                    )
+                    if note_result["ok"]:
+                        self._send_context_status(
+                            "queued", note_meta, sess=session
+                        )
+                        session.send_event(
+                            "context_note",
+                            "Context note queued; it drips in at the next "
+                            "quiet boundary",
+                            "ok",
+                            {"tokens": len(tokens)},
+                        )
+                        clog.log("info", f"context note queued ({len(tokens)} tokens)")
+                    else:
+                        session.send_event(
+                            "context_note",
+                            "Context note not queued",
+                            "warn",
+                            {"blocked_by": note_result["blocked_by"]},
+                        )
                 elif mtype == "use_latest_vision":
                     if not warmup_done.is_set():
                         try:
