@@ -127,6 +127,65 @@ def create_sinewave(duration: float, sample_rate: int) -> np.ndarray:
     return amplitude * np.sin(2 * np.pi * 440.0 * t).astype(np.float32)
 
 
+def trim_boundary_silence(
+    wav: np.ndarray,
+    sr: int,
+    *,
+    rms_threshold: float = 0.002,
+    window_ms: float = 30.0,
+    hop_ms: float = 20.0,
+    guard_ms: float = 100.0,
+) -> np.ndarray:
+    """Trim contiguous near-silence from clip boundaries."""
+    if wav.shape[-1] == 0:
+        return wav
+
+    mono = wav.mean(axis=0) if wav.ndim == 2 else wav
+    sample_count = mono.shape[-1]
+    window_samples = min(
+        sample_count, max(1, round(sr * window_ms / 1000.0))
+    )
+    hop_samples = max(1, round(sr * hop_ms / 1000.0))
+    final_start = sample_count - window_samples
+    starts = np.arange(0, final_start + 1, hop_samples, dtype=np.int64)
+    if starts[-1] != final_start:
+        starts = np.append(starts, final_start)
+
+    energy = np.square(mono, dtype=np.float64)
+    cumulative = np.concatenate(([0.0], np.cumsum(energy)))
+    window_energy = cumulative[starts + window_samples] - cumulative[starts]
+    active = np.sqrt(window_energy / window_samples) >= rms_threshold
+    if not np.any(active):
+        return wav
+
+    active_starts = starts[active]
+    guard_samples = max(0, round(sr * guard_ms / 1000.0))
+    trim_start = max(0, int(active_starts[0]) - guard_samples)
+    trim_end = min(
+        sample_count,
+        int(active_starts[-1]) + window_samples + guard_samples,
+    )
+    if trim_start == 0 and trim_end == sample_count:
+        return wav
+    # A uniformly quiet but valid clip can sit almost entirely under the
+    # fixed RMS threshold; treating most of it as boundary silence would
+    # gut the voice prompt. Keep the original when the trim result is both
+    # absolutely short (under one second) and proportionally small (under a
+    # quarter of the clip): genuine boundary trims fail at least one of
+    # those, while a threshold misfire on a quiet clip fails both.
+    kept = trim_end - trim_start
+    min_keep = min(int(sr), sample_count // 4)
+    if kept < min_keep:
+        logger.warning(
+            "boundary-silence trim would keep only %.2fs of a %.2fs clip; "
+            "keeping the original (clip may be uniformly quiet)",
+            kept / sr,
+            sample_count / sr,
+        )
+        return wav
+    return wav[..., trim_start:trim_end]
+
+
 def normalize_audio(wav: np.ndarray, sr: int, target_lufs: float) -> np.ndarray:
     """Normalize audio to a target LUFS level. Returns mono (T,)."""
     import pyloudnorm as pyln
@@ -754,6 +813,18 @@ class LMGen(StreamingModule[_LMGenState]):
         self._non_pad_streak = 0
         self._turn_pad_streak = 0
         self._pad_force_remaining = 0
+        turn_cap_on_cuda = torch.device(self.lm_model.device).type == "cuda"
+        self._turn_cap_token_host = torch.empty(
+            1,
+            dtype=torch.long,
+            device="cpu",
+            pin_memory=turn_cap_on_cuda,
+        )
+        self._turn_cap_token_event = (
+            torch.cuda.Event() if turn_cap_on_cuda else None
+        )
+        self._turn_cap_token_pending = False
+        self._turn_cap_token_recorded = False
         self.text_prompt_tokens = text_prompt_tokens
         self.audio_silence_frame_cnt = audio_silence_frame_cnt
         self.voice_prompt = None
@@ -1098,15 +1169,20 @@ class LMGen(StreamingModule[_LMGenState]):
         # decoder produces real silence and the turn actually yields. Brief
         # PAD gaps between phrases do not reset the count; only a sustained
         # natural PAD/EPAD run marks a new turn.
-        # The sampled-token accounting happens after the depformer launch to
-        # avoid synchronizing CUDA between the main and depth graphs. A newly
-        # reached cap arms padding for the following frame, preserving the
-        # same maximum number of emitted text tokens.
+        # CUDA copies the sampled token to pinned host memory before the
+        # depformer launch, then host accounting reads it after the frame's
+        # GPU work is submitted. A newly reached cap arms padding for the
+        # following frame, preserving the same maximum emitted-token count.
         pad_id = lm_model.text_padding_token_id
         next_text_token, turn_pad_forced = self._consume_forced_pad(
             next_text_token,
             pad_id,
             text_was_forced=text_was_forced,
+        )
+        self._queue_turn_cap_token_copy(
+            next_text_token,
+            text_was_forced=text_was_forced,
+            turn_pad_forced=turn_pad_forced,
         )
 
         # Update repetition penalty ring buffer with the chosen text token.
@@ -1209,6 +1285,7 @@ class LMGen(StreamingModule[_LMGenState]):
         # sphn.read returns (C, T). normalize_audio downmixes to mono and
         # returns (T,). Re-add the channel dim so the encoder gets (1, T).
         raw_audio = load_audio(voice_prompt, self._sample_rate)
+        raw_audio = trim_boundary_silence(raw_audio, self._sample_rate)
         raw_audio = normalize_audio(raw_audio, self._sample_rate, -24.0)
         if raw_audio.ndim == 1:
             raw_audio = raw_audio[None, :]
@@ -1392,6 +1469,60 @@ class LMGen(StreamingModule[_LMGenState]):
         self._pad_force_remaining -= 1
         return torch.full_like(next_text_token, pad_id), True
 
+    def _queue_turn_cap_token_copy(
+        self,
+        next_text_token: torch.Tensor,
+        *,
+        text_was_forced: bool,
+        turn_pad_forced: bool,
+    ) -> None:
+        event = getattr(self, "_turn_cap_token_event", None)
+        if (
+            event is None
+            or text_was_forced
+            or turn_pad_forced
+            or self.max_turn_text_tokens <= 0
+        ):
+            return
+        self._turn_cap_token_host.copy_(
+            next_text_token[:1], non_blocking=True
+        )
+        event.record(torch.cuda.current_stream(next_text_token.device))
+        self._turn_cap_token_pending = True
+        self._turn_cap_token_recorded = True
+
+    def _read_turn_cap_token(self, next_text_token: torch.Tensor) -> int:
+        if not getattr(self, "_turn_cap_token_pending", False):
+            return int(next_text_token[0])
+        if not getattr(self, "_turn_cap_token_recorded", False):
+            # A pending flag without a freshly recorded event means the
+            # bookkeeping was reset mid-frame; the host buffer is stale, so
+            # fall back to the caller's token instead of consuming it.
+            self._turn_cap_token_pending = False
+            return int(next_text_token[0])
+        event = self._turn_cap_token_event
+        assert event is not None
+        # The event precedes depformer work on the same stream, so this wait
+        # cannot drain the depth graph launched later in the frame.
+        if not event.query():
+            event.synchronize()
+        self._turn_cap_token_pending = False
+        self._turn_cap_token_recorded = False
+        return int(self._turn_cap_token_host[0])
+
+    def reset_turn_cap_tracking(self) -> None:
+        """Zero every turn-cap counter and drop in-flight copy bookkeeping.
+
+        The pinned host buffer may still carry a token from an abandoned
+        frame; clearing both flags guarantees the next accounting pass reads
+        a freshly recorded event or falls back to the caller's token.
+        """
+        self._non_pad_streak = 0
+        self._turn_pad_streak = 0
+        self._pad_force_remaining = 0
+        self._turn_cap_token_pending = False
+        self._turn_cap_token_recorded = False
+
     def _update_turn_cap(
         self,
         next_text_token: torch.Tensor,
@@ -1411,7 +1542,7 @@ class LMGen(StreamingModule[_LMGenState]):
             self._non_pad_streak = 0
             self._turn_pad_streak = 0
             return
-        token = int(next_text_token[0].item())
+        token = self._read_turn_cap_token(next_text_token)
         if token in (0, pad_id):
             self._turn_pad_streak += 1
             if self._turn_pad_streak >= REPETITION_TURN_BREAK_FRAMES:

@@ -8,6 +8,7 @@ from __future__ import annotations
 import sys
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 
 sys.path.insert(0, "moshi")
@@ -16,6 +17,7 @@ from moshi.models.lm import (  # noqa: E402
     DEFAULT_SEMANTIC_TEMPERATURE_CAP,
     REPETITION_TURN_BREAK_FRAMES,
     LMGen,
+    trim_boundary_silence,
 )
 from moshi.utils.sampling import (  # noqa: E402
     sample_token,
@@ -276,6 +278,96 @@ def test_turn_cap_counts_across_short_natural_pauses() -> None:
     assert lm_gen._non_pad_streak == 1
 
 
+def test_boundary_silence_trim_keeps_guarded_speech() -> None:
+    sample_rate = 8_000
+    silence = np.zeros(int(0.4 * sample_rate), dtype=np.float32)
+    t = np.arange(int(0.5 * sample_rate), dtype=np.float32) / sample_rate
+    tone = (0.2 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+    audio = np.concatenate((silence, tone, silence))[None, :]
+
+    trimmed = trim_boundary_silence(audio, sample_rate)
+
+    guard_samples = int(0.1 * sample_rate)
+    window_samples = int(0.03 * sample_rate)
+    expected_samples = tone.size + 2 * guard_samples
+    assert abs(trimmed.shape[-1] - expected_samples) <= 2 * window_samples
+    assert np.max(np.abs(trimmed)) == np.max(np.abs(tone))
+
+
+def test_boundary_silence_trim_preserves_internal_pause() -> None:
+    sample_rate = 8_000
+    boundary_silence = np.zeros(int(0.3 * sample_rate), dtype=np.float32)
+    pause_samples = int(0.25 * sample_rate)
+    pause = np.zeros(pause_samples, dtype=np.float32)
+    t = np.arange(int(0.2 * sample_rate), dtype=np.float32) / sample_rate
+    tone = (0.2 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+    audio = np.concatenate(
+        (boundary_silence, tone, pause, tone, boundary_silence)
+    )[None, :]
+
+    trimmed = trim_boundary_silence(audio, sample_rate)
+
+    silent = np.abs(trimmed[0]) < 1e-7
+    pause_window = np.ones(pause_samples, dtype=np.int32)
+    assert np.any(
+        np.convolve(silent.astype(np.int32), pause_window, mode="valid")
+        == pause_samples
+    )
+
+
+def test_boundary_silence_trim_keeps_all_silence() -> None:
+    silence = np.zeros((1, 8_000), dtype=np.float32)
+    trimmed = trim_boundary_silence(silence, 8_000)
+    assert trimmed is silence
+
+
+def test_boundary_silence_trim_keeps_quiet_valid_clip() -> None:
+    sample_rate = 8_000
+    audio = np.full((1, 4 * sample_rate), 0.0015, dtype=np.float32)
+    center = audio.shape[-1] // 2
+    audio[:, center - 400 : center + 400] = 0.003
+
+    trimmed = trim_boundary_silence(audio, sample_rate)
+
+    assert trimmed is audio
+    assert trimmed.shape[-1] == 4 * sample_rate
+
+
+def test_turn_cap_reset_clears_pending_copy_bookkeeping() -> None:
+    lm_gen = LMGen.__new__(LMGen)
+    lm_gen._non_pad_streak = 7
+    lm_gen._turn_pad_streak = 5
+    lm_gen._pad_force_remaining = 3
+    lm_gen._turn_cap_token_pending = True
+    lm_gen._turn_cap_token_recorded = True
+    lm_gen._turn_cap_token_host = torch.tensor([99], dtype=torch.long)
+
+    lm_gen.reset_turn_cap_tracking()
+
+    assert lm_gen._non_pad_streak == 0
+    assert lm_gen._turn_pad_streak == 0
+    assert lm_gen._pad_force_remaining == 0
+    assert lm_gen._turn_cap_token_pending is False
+    assert lm_gen._turn_cap_token_recorded is False
+
+
+def test_turn_cap_pending_without_fresh_event_uses_current_token() -> None:
+    class _StaleEvent:
+        def query(self) -> bool:
+            raise AssertionError("stale event must not be queried")
+
+    lm_gen = LMGen.__new__(LMGen)
+    lm_gen._turn_cap_token_pending = True
+    lm_gen._turn_cap_token_recorded = False
+    lm_gen._turn_cap_token_event = _StaleEvent()
+    lm_gen._turn_cap_token_host = torch.tensor([99], dtype=torch.long)
+
+    token = lm_gen._read_turn_cap_token(torch.tensor([17], dtype=torch.long))
+
+    assert token == 17
+    assert lm_gen._turn_cap_token_pending is False
+
+
 if __name__ == "__main__":
     tests = [
         test_temperature_updates_graph_input_without_reset,
@@ -288,6 +380,12 @@ if __name__ == "__main__":
         test_new_turn_clears_history_before_penalty,
         test_interrupt_force_window_works_with_turn_cap_disabled,
         test_turn_cap_counts_across_short_natural_pauses,
+        test_boundary_silence_trim_keeps_guarded_speech,
+        test_boundary_silence_trim_preserves_internal_pause,
+        test_boundary_silence_trim_keeps_all_silence,
+        test_boundary_silence_trim_keeps_quiet_valid_clip,
+        test_turn_cap_reset_clears_pending_copy_bookkeeping,
+        test_turn_cap_pending_without_fresh_event_uses_current_token,
     ]
     for test in tests:
         print(f"{test.__name__} ...")
