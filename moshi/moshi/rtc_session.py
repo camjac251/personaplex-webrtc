@@ -37,7 +37,7 @@ from aiortc.sdp import candidate_from_sdp, candidate_to_sdp
 from av.audio.frame import AudioFrame
 from av.audio.resampler import AudioResampler
 
-from .rtc_opus import install_mono_opus_encoder
+from .rtc_opus import encode_failure_total, install_mono_opus_encoder
 
 
 install_mono_opus_encoder()
@@ -1552,6 +1552,7 @@ class RTCSession:
                 "outbound_drop_events",
                 "outbound_flush_events",
                 "outbound_underrun_events",
+                "opus_encode_failures",
             }
             float_fields = {
                 "pcm_dropped_ms",
@@ -1581,6 +1582,7 @@ class RTCSession:
             "pcm_queue_high_water": self._pcm_queue_high_water,
             "pcm_drop_events": self._pcm_drop_events,
             "pcm_dropped_ms": round(self._pcm_dropped_ms, 1),
+            "opus_encode_failures": encode_failure_total(),
         }
         snapshot.update(await self._output_track.diagnostics_snapshot())
         return snapshot

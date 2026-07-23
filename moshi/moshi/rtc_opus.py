@@ -25,6 +25,16 @@ OPUS_TIME_BASE = fractions.Fraction(1, OPUS_SAMPLE_RATE)
 ENCODE_FAILURE_LOG_INTERVAL_SEC = 5.0
 ENCODE_FAILURE_ESCALATE_COUNT = 5
 
+# Cumulative process-wide encode failures. aiortc constructs encoder
+# instances internally, so telemetry reads this module counter instead of
+# reaching into the sender's codec object.
+_encode_failure_total = 0
+
+
+def encode_failure_total() -> int:
+    """Total dropped-frame encode failures since process start."""
+    return _encode_failure_total
+
 
 class MonoOpusEncoder(Encoder):
     """Encode 48 kHz mono PCM with libopus at 64 kbps."""
@@ -82,6 +92,8 @@ class MonoOpusEncoder(Encoder):
                         timestamp = packet_pts - self._first_packet_pts
                     payloads.append(bytes(packet))
         except Exception as exc:
+            global _encode_failure_total
+            _encode_failure_total += 1
             self._encode_failure_count += 1
             now = time.monotonic()
             if self._encode_failure_count == ENCODE_FAILURE_ESCALATE_COUNT:

@@ -26,6 +26,7 @@ from moshi.rtc_session import (  # noqa: E402
     MimiOutputTrack,
     RTCSession,
 )
+import moshi.rtc_opus as rtc_opus  # noqa: E402
 from moshi.server import ServerState  # noqa: E402
 
 
@@ -191,6 +192,7 @@ async def test_transport_diagnostics_expose_counts_without_audio() -> None:
         "pcm_queue_high_water": 7,
         "pcm_drop_events": 3,
         "pcm_dropped_ms": 240.0,
+        "opus_encode_failures": rtc_opus.encode_failure_total(),
         "outbound_buffer_ms": 20.0,
         "outbound_drop_events": 2,
     }
