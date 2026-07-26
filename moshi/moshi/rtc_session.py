@@ -1507,6 +1507,59 @@ class RTCSession:
             self._control.send(json.dumps(payload))
             self._ready_sent = True
 
+    def send_lifecycle_receipt(
+        self,
+        *,
+        resumed: bool,
+        source: str,
+        text_prompt_tokens: int,
+        voice_prompt_frames: int,
+        voice_prompt_complete: bool,
+        audio_silence_a_complete: bool,
+        text_prompt_complete: bool,
+        audio_silence_b_complete: bool,
+        processing_started: bool,
+        ready_sent: bool,
+    ) -> None:
+        """Send typed evidence for this transport leg's startup lifecycle."""
+        if not (self._control and self._control.readyState == "open"):
+            return
+        if source not in {"connect", "resume"}:
+            return
+        counts = (text_prompt_tokens, voice_prompt_frames)
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in counts
+        ):
+            return
+        completion_flags = (
+            resumed,
+            voice_prompt_complete,
+            audio_silence_a_complete,
+            text_prompt_complete,
+            audio_silence_b_complete,
+            processing_started,
+            ready_sent,
+        )
+        if any(not isinstance(value, bool) for value in completion_flags):
+            return
+        if not processing_started or not ready_sent:
+            return
+        payload = {
+            "type": "lifecycle_receipt",
+            "resumed": resumed,
+            "source": source,
+            "text_prompt_tokens": text_prompt_tokens,
+            "voice_prompt_frames": voice_prompt_frames,
+            "voice_prompt_complete": voice_prompt_complete,
+            "audio_silence_a_complete": audio_silence_a_complete,
+            "text_prompt_complete": text_prompt_complete,
+            "audio_silence_b_complete": audio_silence_b_complete,
+            "processing_started": processing_started,
+            "ready_sent": ready_sent,
+        }
+        self._control.send(json.dumps(payload))
+
     def send_stat(
         self,
         vram_used: Optional[int] = None,
@@ -1553,6 +1606,11 @@ class RTCSession:
                 "outbound_flush_events",
                 "outbound_underrun_events",
                 "opus_encode_failures",
+                "inbound_frames",
+                "inbound_non_silent_frames",
+                "user_turn_starts",
+                "user_turn_ends",
+                "mimi_encode_frames",
             }
             float_fields = {
                 "pcm_dropped_ms",
@@ -1562,14 +1620,27 @@ class RTCSession:
                 "outbound_prebuffer_ms",
                 "outbound_flushed_ms",
             }
+            rms_fields = {"inbound_rms_ema"}
+
+            def is_finite_number(value: object) -> bool:
+                return (
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(float(value))
+                )
+
             for field in integer_fields:
                 value = diagnostics.get(field)
-                if isinstance(value, (int, float)):
+                if is_finite_number(value):
                     payload[field] = int(value)
             for field in float_fields:
                 value = diagnostics.get(field)
-                if isinstance(value, (int, float)):
+                if is_finite_number(value):
                     payload[field] = round(float(value), 1)
+            for field in rms_fields:
+                value = diagnostics.get(field)
+                if is_finite_number(value):
+                    payload[field] = round(float(value), 4)
         if len(payload) == 1:
             return
         self._control.send(json.dumps(payload))

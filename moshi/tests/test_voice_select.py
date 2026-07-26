@@ -11,6 +11,7 @@ from __future__ import annotations
 import sys
 
 import numpy as np
+import torch
 
 sys.path.insert(0, "moshi")
 
@@ -182,6 +183,65 @@ def test_full_strength_and_empty_keep_never_embed() -> None:
     assert calls == []
 
 
+def test_voice_prompt_count_is_zero_without_a_prompt() -> None:
+    lm_gen = LMGen.__new__(LMGen)
+    lm_gen.voice_prompt_embeddings = None
+    lm_gen.voice_prompt_audio = None
+
+    assert lm_gen._step_voice_prompt(None) == 0
+
+
+def test_voice_prompt_count_is_zero_for_full_state_restore() -> None:
+    lm_gen = LMGen.__new__(LMGen)
+    lm_gen.voice_prompt_embeddings = [object()]
+    lm_gen.voice_prompt_full_state = {"cache": object()}
+    restored: list[dict[str, object]] = []
+    lm_gen.set_streaming_state_inplace = restored.append
+
+    assert lm_gen._step_voice_prompt(None) == 0
+    assert restored == [lm_gen.voice_prompt_full_state]
+    assert restored[0] is not lm_gen.voice_prompt_full_state
+
+
+def test_voice_prompt_count_matches_embedding_replay() -> None:
+    lm_gen = LMGen.__new__(LMGen)
+    embeddings = [object(), object(), object()]
+    lm_gen.voice_prompt_embeddings = embeddings
+    lm_gen.voice_prompt_full_state = None
+    lm_gen.voice_prompt_cache = None
+    replayed: list[object] = []
+    lm_gen.step_embeddings = replayed.append
+
+    assert lm_gen._step_voice_prompt(None) == len(embeddings)
+    assert replayed == embeddings
+
+
+def test_voice_prompt_count_matches_encoded_audio_frames() -> None:
+    class FakeMimi:
+        def parameters(self):
+            yield torch.empty(0)
+
+        def encode(self, batch):
+            return torch.zeros((batch.shape[0], 1, 1), dtype=torch.long)
+
+    lm_gen = LMGen.__new__(LMGen)
+    lm_gen.voice_prompt_embeddings = None
+    lm_gen.voice_prompt_audio = np.arange(250, dtype=np.float32)[None, :]
+    lm_gen.voice_prompt_strength = 0.5
+    lm_gen.voice_window_embedder = None
+    lm_gen._frame_size = 100
+    lm_gen._sample_rate = SAMPLE_RATE
+    lm_gen.save_voice_prompt_embeddings = False
+    stepped: list[torch.Tensor] = []
+    lm_gen._step_voice_prompt_frame = lambda tokens, _saved: stepped.append(tokens)
+
+    sliced_samples = lm_gen._strength_sliced_voice_prompt_audio().shape[-1]
+    expected_frames = -(-sliced_samples // lm_gen._frame_size)
+
+    assert lm_gen._step_voice_prompt(FakeMimi()) == expected_frames
+    assert len(stepped) == expected_frames
+
+
 if __name__ == "__main__":
     tests = [
         test_selection_picks_most_representative_window,
@@ -192,6 +252,10 @@ if __name__ == "__main__":
         test_short_clip_passes_through_without_embedding,
         test_priming_slice_uses_selected_window,
         test_full_strength_and_empty_keep_never_embed,
+        test_voice_prompt_count_is_zero_without_a_prompt,
+        test_voice_prompt_count_is_zero_for_full_state_restore,
+        test_voice_prompt_count_matches_embedding_replay,
+        test_voice_prompt_count_matches_encoded_audio_frames,
     ]
     for test in tests:
         print(f"{test.__name__} ...")

@@ -173,6 +173,90 @@ describe("session trace privacy", () => {
     const serialized = JSON.stringify(await trace.toReportAsync());
     expect(serialized).not.toContain(SECRET.api);
   });
+
+  test("preserves only numeric inbound activity diagnostics", async () => {
+    const trace = createSessionTrace({ clock: deterministicClock() });
+    trace.record("server.stat", {
+      inbound_frames: 11,
+      inbound_non_silent_frames: 4,
+      inbound_rms_ema: 0.0123,
+      user_turn_starts: 1,
+      user_turn_ends: 1,
+      mimi_encode_frames: 11,
+      text_prompt: SECRET.prompt,
+      session_id: SECRET.session,
+      private_path: "/workspace/private/audio.raw",
+    });
+
+    const report = await trace.toReportAsync();
+    expect(report.events[0].data).toEqual({
+      inbound_frames: 11,
+      inbound_non_silent_frames: 4,
+      inbound_rms_ema: 0.0123,
+      user_turn_starts: 1,
+      user_turn_ends: 1,
+      mimi_encode_frames: 11,
+    });
+    const serialized = JSON.stringify(report);
+    expect(serialized).not.toContain(SECRET.prompt);
+    expect(serialized).not.toContain(SECRET.session);
+    expect(serialized).not.toContain("/workspace/private/audio.raw");
+  });
+
+  test("preserves only typed lifecycle receipts", async () => {
+    const trace = createSessionTrace({ clock: deterministicClock() });
+    trace.record("server.lifecycle_receipt", {
+      resumed: false,
+      source: "connect",
+      text_prompt_tokens: 42,
+      voice_prompt_frames: 75,
+      voice_prompt_complete: true,
+      audio_silence_a_complete: true,
+      text_prompt_complete: true,
+      audio_silence_b_complete: true,
+      processing_started: true,
+      ready_sent: true,
+      text_prompt: SECRET.prompt,
+      voice_prompt: "/workspace/private/voice.wav",
+      session_id: SECRET.session,
+      arbitrary: SECRET.api,
+    });
+    trace.record("server.lifecycle_receipt", {
+      resumed: false,
+      source: "opaqueProjectPassword",
+      text_prompt_tokens: -1.5,
+      voice_prompt_frames: 2.25,
+      voice_prompt_complete: true,
+      audio_silence_a_complete: true,
+      text_prompt_complete: true,
+      audio_silence_b_complete: true,
+      processing_started: true,
+      ready_sent: true,
+      status: SECRET.api,
+      mode: SECRET.session,
+    });
+
+    const report = await trace.toReportAsync({ includeContent: true });
+    expect(report.events[0].data).toEqual({
+      resumed: false,
+      source: "connect",
+      text_prompt_tokens: 42,
+      voice_prompt_frames: 75,
+      voice_prompt_complete: true,
+      audio_silence_a_complete: true,
+      text_prompt_complete: true,
+      audio_silence_b_complete: true,
+      processing_started: true,
+      ready_sent: true,
+    });
+    expect(report.events[1].data).toEqual({});
+    const serialized = JSON.stringify(report);
+    expect(serialized).not.toContain(SECRET.prompt);
+    expect(serialized).not.toContain("/workspace/private/voice.wav");
+    expect(serialized).not.toContain(SECRET.session);
+    expect(serialized).not.toContain(SECRET.api);
+    expect(serialized).not.toContain("opaqueProjectPassword");
+  });
 });
 
 describe("session trace bounds and exports", () => {

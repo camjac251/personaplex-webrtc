@@ -26,6 +26,12 @@ const BOOLEAN_FIELDS = new Set([
   "ready",
   "reinforce_in_silences",
   "resumed",
+  "voice_prompt_complete",
+  "audio_silence_a_complete",
+  "text_prompt_complete",
+  "audio_silence_b_complete",
+  "processing_started",
+  "ready_sent",
   "vision_feed_model",
   "vision_ground_user_turns",
   "vision_in_transcript",
@@ -54,6 +60,9 @@ const NUMBER_FIELDS = new Set([
   "generation",
   "gpu_util",
   "idle_rms",
+  "inbound_frames",
+  "inbound_non_silent_frames",
+  "inbound_rms_ema",
   "inject_silence_rms",
   "inject_silence_streak",
   "interrupts",
@@ -66,6 +75,7 @@ const NUMBER_FIELDS = new Set([
   "max_rtf",
   "max_turn_text_tokens",
   "max_vram_used",
+  "mimi_encode_frames",
   "min",
   "network_drops",
   "network_quality",
@@ -99,6 +109,8 @@ const NUMBER_FIELDS = new Set([
   "text_topk",
   "tokens",
   "total",
+  "user_turn_ends",
+  "user_turn_starts",
   "user_turns",
   "vision_captions",
   "vision_cost_limit_usd",
@@ -108,6 +120,7 @@ const NUMBER_FIELDS = new Set([
   "vision_frames_sent",
   "vision_prompt_chars",
   "voice_blend_mix",
+  "voice_prompt_frames",
   "vram_total",
   "vram_used",
   "width",
@@ -323,11 +336,15 @@ const EVENT_FIELDS = new Set([
   "gpu_util",
   "historical_detail",
   "idle_rms",
+  "inbound_frames",
+  "inbound_non_silent_frames",
+  "inbound_rms_ema",
   "jitter_ms",
   "latency_ms",
   "limit",
   "loss_pct",
   "max",
+  "mimi_encode_frames",
   "min",
   "mode",
   "network_quality",
@@ -344,6 +361,13 @@ const EVENT_FIELDS = new Set([
   "reason",
   "remaining_tokens",
   "resumed",
+  "voice_prompt_frames",
+  "voice_prompt_complete",
+  "audio_silence_a_complete",
+  "text_prompt_complete",
+  "audio_silence_b_complete",
+  "processing_started",
+  "ready_sent",
   "rtf",
   "rtt_ms",
   "seq",
@@ -354,6 +378,8 @@ const EVENT_FIELDS = new Set([
   "tokens",
   "total",
   "transport",
+  "user_turn_ends",
+  "user_turn_starts",
   "vision_frames_gated",
   "vision_frames_sent",
   "vram_used",
@@ -552,6 +578,69 @@ export function sanitizeTraceData(value, { includeContent = false } = {}) {
   return sanitizeSection(value, "event", includeContent);
 }
 
+
+function sanitizeLifecycleReceipt(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const {
+    resumed,
+    source,
+    text_prompt_tokens: textPromptTokens,
+    voice_prompt_frames: voicePromptFrames,
+    voice_prompt_complete: voicePromptComplete,
+    audio_silence_a_complete: audioSilenceAComplete,
+    text_prompt_complete: textPromptComplete,
+    audio_silence_b_complete: audioSilenceBComplete,
+    processing_started: processingStarted,
+    ready_sent: readySent,
+  } = value;
+  if (typeof resumed !== "boolean") return {};
+  if (source !== (resumed ? "resume" : "connect")) return {};
+  if (
+    !Number.isInteger(textPromptTokens) ||
+    textPromptTokens < 0 ||
+    !Number.isInteger(voicePromptFrames) ||
+    voicePromptFrames < 0
+  ) {
+    return {};
+  }
+  const primingComplete = [
+    voicePromptComplete,
+    audioSilenceAComplete,
+    textPromptComplete,
+    audioSilenceBComplete,
+  ];
+  if (primingComplete.some((complete) => typeof complete !== "boolean")) {
+    return {};
+  }
+  if (typeof processingStarted !== "boolean" || typeof readySent !== "boolean") {
+    return {};
+  }
+  if (!processingStarted || !readySent) return {};
+  if (resumed) {
+    if (
+      textPromptTokens !== 0 ||
+      voicePromptFrames !== 0 ||
+      primingComplete.some(Boolean)
+    ) {
+      return {};
+    }
+  } else if (primingComplete.some((complete) => !complete)) {
+    return {};
+  }
+  return {
+    resumed,
+    source,
+    text_prompt_tokens: textPromptTokens,
+    voice_prompt_frames: voicePromptFrames,
+    voice_prompt_complete: voicePromptComplete,
+    audio_silence_a_complete: audioSilenceAComplete,
+    text_prompt_complete: textPromptComplete,
+    audio_silence_b_complete: audioSilenceBComplete,
+    processing_started: processingStarted,
+    ready_sent: readySent,
+  };
+}
+
 export function sanitizeTraceConfig(value, { includeContent = false } = {}) {
   return sanitizeSection(value, "config", includeContent);
 }
@@ -670,13 +759,16 @@ export function createSessionTrace({
   const trace = {
     record(kind, data = {}, { source = "client", level = "info" } = {}) {
       const at = Math.max(0, clock() - startedAt);
+      const safeKind = safeToken(kind, "event");
       const event = {
         seq: nextSeq,
         t_ms: Math.round(at * 10) / 10,
         source: safeToken(source, "client"),
-        kind: safeToken(kind, "event"),
+        kind: safeKind,
         level: safeToken(level, "info"),
-        data: sanitizeTraceData(data, { includeContent: true }),
+        data: safeKind === "server.lifecycle_receipt"
+          ? sanitizeLifecycleReceipt(data)
+          : sanitizeTraceData(data, { includeContent: true }),
       };
       nextSeq += 1;
       events.push(event);

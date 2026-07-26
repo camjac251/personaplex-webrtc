@@ -206,6 +206,9 @@ def test_restore_waits_for_cuda_copy_completion() -> None:
         def set_streaming_state_inplace(self, _state: dict) -> None:
             return None
 
+        def reset_turn_cap_tracking(self) -> None:
+            return None
+
     state = ServerState.__new__(ServerState)
     state.device = torch.device("cuda:0")
     state.mimi = _RestoreModule()
@@ -386,6 +389,10 @@ def test_stop_latch_hold_ceiling_releases_a_starved_latch() -> None:
         _pad_force_remaining = 0
         _non_pad_streak = 0
 
+        def reset_turn_cap_tracking(self) -> None:
+            self._pad_force_remaining = 0
+            self._non_pad_streak = 0
+
     state = ServerState.__new__(ServerState)
     state.lm_gen = _Lm()
     state._stop_response_latched = True
@@ -516,6 +523,10 @@ def test_stop_latch_releases_only_at_a_new_turn_boundary() -> None:
     class _Lm:
         _pad_force_remaining = 12
         _non_pad_streak = 9
+
+        def reset_turn_cap_tracking(self) -> None:
+            self._pad_force_remaining = 0
+            self._non_pad_streak = 0
 
     state = ServerState.__new__(ServerState)
     state.lm_gen = _Lm()

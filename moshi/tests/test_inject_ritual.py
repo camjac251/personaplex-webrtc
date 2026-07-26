@@ -159,6 +159,12 @@ def _pipeline_state() -> tuple[ServerState, _FakeLmGen]:
     state._lm_frame_ms_last = 0.0
     state._lm_frame_ms_ema = 0.0
     state._process_frame_count = 0
+    state._inbound_frames = 0
+    state._inbound_non_silent_frames = 0
+    state._inbound_rms_ema = 0.0
+    state._user_turn_starts = 0
+    state._user_turn_ends = 0
+    state._mimi_encode_frames = 0
     state.frame_size = FRAME_SAMPLES
     state._frame_audio_sec = FRAME_SAMPLES / 24000.0
     return state, lm_gen
@@ -335,6 +341,24 @@ def test_typed_note_queues_at_manual_priority_and_drips() -> None:
     assert state._inject_seal_remaining == CONTEXT_SEAL_HOLD_FRAMES
 
 
+def test_inbound_activity_counters_follow_processed_frames() -> None:
+    state, _lm_gen = _pipeline_state()
+
+    for _ in range(4):
+        state._process_audio_frame(_loud_chunk())
+    for _ in range(7):
+        state._process_audio_frame(_silent_chunk())
+
+    alpha = 0.2
+    expected_rms_ema = 0.5 * (1 - (1 - alpha) ** 4) * (1 - alpha) ** 7
+    assert state._inbound_frames == 11
+    assert state._inbound_non_silent_frames == 4
+    assert np.isclose(state._inbound_rms_ema, expected_rms_ema)
+    assert state._user_turn_starts == 1
+    assert state._user_turn_ends == 1
+    assert state._mimi_encode_frames == 11
+
+
 if __name__ == "__main__":
     tests = [
         test_drip_frames_ride_the_t0_ritual,
@@ -344,6 +368,7 @@ if __name__ == "__main__":
         test_user_speech_defers_reinforce_seal_without_dangling_clause,
         test_stop_latch_frames_keep_real_mic_audio,
         test_typed_note_queues_at_manual_priority_and_drips,
+        test_inbound_activity_counters_follow_processed_frames,
     ]
     for test in tests:
         print(f"{test.__name__} ...")

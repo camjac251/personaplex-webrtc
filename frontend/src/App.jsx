@@ -33,6 +33,7 @@ import { useStoredState } from "./hooks/useStoredState.js";
 import { useToast } from "./hooks/useToast.js";
 import { rmsFromAnalyser } from "./utils/audio.js";
 import { cls, fmt, fmtGb } from "./utils/format.js";
+import { canStartConversation, createSessionLifecycle } from "./utils/sessionLifecycle.js";
 import { createSessionTrace, downloadSessionTrace } from "./utils/sessionTrace.js";
 
 function parseStoredArray(value) {
@@ -658,6 +659,10 @@ function App() {
   const pcRef = useRef(null);
   const controlRef = useRef(null);
   const sessionIdRef = useRef(null);
+  const sessionLifecycleRef = useRef(null);
+  if (sessionLifecycleRef.current === null) {
+    sessionLifecycleRef.current = createSessionLifecycle();
+  }
   const pendingCandidatesRef = useRef([]);
   const candidateStreamRef = useRef(null);
   const micStreamRef = useRef(null);
@@ -803,7 +808,7 @@ function App() {
   };
 
   const isLive = phase === "live";
-  const cfgLocked = phase === "connecting" || phase === "warmup" || phase === "live";
+  const cfgLocked = phase === "connecting" || phase === "warmup" || phase === "live" || phase === "stopping";
   // While locked, the config column collapses to a rail by default; the user
   // can peek at the frozen settings (sideExpanded) and re-collapse. Never
   // unfreezes the controls.
@@ -2069,6 +2074,7 @@ function App() {
   const cleanup = useCallback(
     (options = {}) => {
       const { showDownload = false, keepPhase = false } = options;
+      sessionLifecycleRef.current.dispose();
       stopRecording(showDownload);
       teardownTransport();
       resumingRef.current = false;
@@ -2940,10 +2946,11 @@ function App() {
   reconnectRef.current = reconnect;
 
   const startConversation = useCallback(async () => {
-    if (phase === "connecting" || phase === "warmup" || phase === "live") return;
+    if (!canStartConversation(phase)) return;
     tuningWarnedRef.current = false;
     visionInjectDroughtRef.current = { captions: 0, warned: false };
     cleanup({ keepPhase: true });
+    sessionLifecycleRef.current.beginTransport();
     sessionTraceRef.current = createSessionTrace();
     traceMaximaRef.current = { rtf: 0, gpuUtil: 0, vramUsed: 0 };
     traceTotalsRef.current = {
@@ -3048,7 +3055,7 @@ function App() {
   }, []);
 
   const beginConnectHold = useCallback((event) => {
-    if (phase !== "idle" && phase !== "ended") return;
+    if (!canStartConversation(phase)) return;
     event.currentTarget.setPointerCapture?.(event.pointerId);
     clearConnectHold();
     const startedAt = performance.now();
@@ -3078,14 +3085,17 @@ function App() {
         // transport drop and holds a short resume window.
       }
     }
-    addNotice("info", "Session ended, recording available");
+    addNotice("info", "Ending session, recording will remain available");
     recordTrace("session.goodbye", { end_reason: "user_goodbye" });
     sessionTraceRef.current?.finish("user_goodbye");
-    setPhase("ended");
-    setStageMessage("Session complete");
-    // Give the goodbye a moment on the wire before the pc closes; an
-    // aborted SCTP queue would turn this back into a transport drop.
-    window.setTimeout(() => cleanup({ showDownload: true }), 150);
+    // Keep the transport alive briefly so goodbye can leave the SCTP queue.
+    sessionLifecycleRef.current.stop({
+      cleanup: () => cleanup({ showDownload: true, keepPhase: true }),
+      onPhaseChange: (nextPhase) => {
+        setPhase(nextPhase);
+        setStageMessage(nextPhase === "stopping" ? "Ending session" : "Session complete");
+      },
+    });
   }, [addNotice, cleanup, recordTrace]);
 
   const newConversation = () => {
@@ -4165,8 +4175,8 @@ function App() {
     return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
   }, [elapsedSec]);
 
-  const phaseIdx = { idle: 0, connecting: 1, warmup: 2, live: 3, ended: 4 }[phase] ?? 0;
-  const phaseProgress = { idle: 0, connecting: 25, warmup: 55, live: 82, ended: 100 }[phase] ?? 0;
+  const phaseIdx = { idle: 0, connecting: 1, warmup: 2, live: 3, stopping: 3, ended: 4 }[phase] ?? 0;
+  const phaseProgress = { idle: 0, connecting: 25, warmup: 55, live: 82, stopping: 92, ended: 100 }[phase] ?? 0;
   // Interleave assistant segments and user turns into one chronological list
   // so the transcript reads as a back-and-forth instead of one AI blob.
   const transcriptTurns = [
@@ -4979,10 +4989,11 @@ function App() {
                   className="btn lg block"
                   type="button"
                   disabled
-                  aria-label={phase === "warmup" ? "Warming up" : "Negotiating"}
-                  title={phase === "warmup" ? "Warming up" : "Negotiating"}
+                  aria-label={phase === "stopping" ? "Ending session" : phase === "warmup" ? "Warming up" : "Negotiating"}
+                  title={phase === "stopping" ? "Ending session" : phase === "warmup" ? "Warming up" : "Negotiating"}
+                  aria-busy={phase === "stopping" ? "true" : undefined}
                 >
-                  {Icon.mic}
+                  {phase === "stopping" ? Icon.stop : Icon.mic}
                 </button>
               )
             ) : phase === "idle" || phase === "ended" ? (
@@ -5005,6 +5016,10 @@ function App() {
                   {preflightDone ? (preflight.turn === "ok" ? "Devices tested" : "Re-test devices") : "Test devices"}
                 </button>
               </>
+            ) : phase === "stopping" ? (
+              <button className="btn lg block" type="button" disabled aria-busy="true">
+                Ending session
+              </button>
             ) : phase === "connecting" ? (
               <button className="btn lg block" type="button" disabled>
                 Negotiating
@@ -5040,6 +5055,7 @@ function App() {
               {!isBusy && isLive && <Badge kind="live" label={`Live · ${elapsedStr}`} />}
               {!isBusy && phase === "connecting" && <Badge kind="warn" label="Connecting" />}
               {!isBusy && phase === "warmup" && <Badge kind="warn" label="Warmup" />}
+              {!isBusy && phase === "stopping" && <Badge kind="warn" label="Ending" />}
               {!isBusy && phase === "idle" && <Badge label="Ready" />}
               {!isBusy && phase === "ended" && <Badge label={`Ended · ${elapsedStr}`} />}
             </div>
@@ -5121,8 +5137,8 @@ function App() {
                     </span>
                   </div>
                 )}
-                {(isBusy || reconnecting || phase === "idle" || phase === "connecting" || phase === "warmup") && (
-                  <div className={cls("viz-overlay", (reconnecting || phase === "connecting" || phase === "warmup") && "connecting", isBusy && "error")}>
+                {(isBusy || reconnecting || phase === "idle" || phase === "connecting" || phase === "warmup" || phase === "stopping") && (
+                  <div className={cls("viz-overlay", (reconnecting || phase === "connecting" || phase === "warmup" || phase === "stopping") && "connecting", isBusy && "error")}>
                     <div className="stack">
                       <span className="label">
                         <span className="d" />
@@ -5574,7 +5590,7 @@ function App() {
         <aside className="cons" aria-label="Session diagnostics">
           <div className="cons-sect">
             <div className="cons-h">A · Session</div>
-            <Row label="Status" value={phase} dot={isLive ? "ok" : phase === "connecting" || phase === "warmup" ? "warn" : ""} />
+            <Row label="Status" value={phase} dot={isLive ? "ok" : phase === "connecting" || phase === "warmup" || phase === "stopping" ? "warn" : ""} />
             <Row label="Uptime" value={elapsedStr} />
             <Row label="Voice" value={voiceDisplay} />
             <Row label="Auto-recoveries" value={runtimeCounters.recoveries} dot={runtimeCounters.recoveries > 0 ? "warn" : ""} />

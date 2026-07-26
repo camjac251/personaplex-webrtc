@@ -1668,12 +1668,8 @@ class LMGen(StreamingModule[_LMGenState]):
             _, embeddings = out
             saved_embeddings.append(embeddings)
 
-    def _step_voice_prompt_core(self, mimi) -> Iterator[None]:
-        """Shared core for stepping through the voice prompt.
-
-        This generator yields at each *checkpoint* where the async wrapper may want to
-        consult `is_alive`. The core itself is intentionally unaware of connection state.
-        """
+    def _step_voice_prompt_core(self, mimi) -> Iterator[bool]:
+        """Yield whether each disconnect checkpoint executes a prompt frame."""
         if self.voice_prompt_embeddings is not None:
             if self.voice_prompt_full_state is not None:
                 # set_streaming_state_inplace pops entries from the dict it
@@ -1684,7 +1680,7 @@ class LMGen(StreamingModule[_LMGenState]):
 
             # Replay stored voice prompt embeddings
             for next_embed in self.voice_prompt_embeddings:
-                yield
+                yield True
                 self.step_embeddings(next_embed)
 
             # A blended prompt has no stored final cache: the cache it would
@@ -1699,13 +1695,13 @@ class LMGen(StreamingModule[_LMGenState]):
         elif self.voice_prompt_audio is not None:
             saved_embeddings = []
             for voice_prompt_frame_tokens in self._encode_voice_prompt_frames(mimi):
-                yield
+                yield True
                 self._step_voice_prompt_frame(
                     voice_prompt_frame_tokens,
                     saved_embeddings
                 )
             # One last checkpoint before any optional save (nice-to-have for async disconnect)
-            yield
+            yield False
 
             if self.save_voice_prompt_embeddings:
                 # Save full streaming state (tensors + metadata) to bypass replay next time.
@@ -1727,10 +1723,9 @@ class LMGen(StreamingModule[_LMGenState]):
                 self.save_streaming_state(state_path, meta_path)
         logger.info("done loading voice prompt")
 
-    def _step_voice_prompt(self, mimi):
+    def _step_voice_prompt(self, mimi) -> int:
         # Sync path intentionally does not support `is_alive` / disconnect checks.
-        for _ in self._step_voice_prompt_core(mimi):
-            pass
+        return sum(self._step_voice_prompt_core(mimi))
 
     async def _step_voice_prompt_async(self, mimi, is_alive: Optional[Callable]=None):
         for _ in self._step_voice_prompt_core(mimi):

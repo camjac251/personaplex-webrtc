@@ -27,7 +27,7 @@ from moshi.rtc_session import (  # noqa: E402
     RTCSession,
 )
 import moshi.rtc_opus as rtc_opus  # noqa: E402
-from moshi.server import ServerState  # noqa: E402
+from moshi.server import ServerState, _new_lifecycle_receipt  # noqa: E402
 
 
 class _OutputTrack:
@@ -344,6 +344,14 @@ def test_stat_envelope_only_forwards_numeric_diagnostics() -> None:
         diagnostics={
             "pcm_queue_depth": 4,
             "pcm_dropped_ms": 80.04,
+            "inbound_frames": 11,
+            "inbound_non_silent_frames": 4,
+            "inbound_rms_ema": 0.012345,
+            "user_turn_starts": 1,
+            "user_turn_ends": 1,
+            "mimi_encode_frames": 11,
+            "pcm_drop_events": True,
+            "outbound_buffer_ms": float("nan"),
             "private_path": "/private/secret",
             "outbound_drop_events": "not numeric",
         },
@@ -355,7 +363,117 @@ def test_stat_envelope_only_forwards_numeric_diagnostics() -> None:
         "rtf": 0.42,
         "pcm_queue_depth": 4,
         "pcm_dropped_ms": 80.0,
+        "inbound_frames": 11,
+        "inbound_non_silent_frames": 4,
+        "inbound_rms_ema": 0.0123,
+        "user_turn_starts": 1,
+        "user_turn_ends": 1,
+        "mimi_encode_frames": 11,
     }
+
+
+def test_lifecycle_receipt_emits_only_typed_privacy_safe_fields() -> None:
+    class _Control:
+        readyState = "open"
+
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        def send(self, payload: str) -> None:
+            self.sent.append(payload)
+
+    session = RTCSession.__new__(RTCSession)
+    session._control = _Control()
+    session.send_lifecycle_receipt(
+        resumed=False,
+        source="connect",
+        text_prompt_tokens=42,
+        voice_prompt_frames=75,
+        voice_prompt_complete=True,
+        audio_silence_a_complete=True,
+        text_prompt_complete=True,
+        audio_silence_b_complete=True,
+        processing_started=True,
+        ready_sent=True,
+    )
+
+    assert json.loads(session._control.sent[0]) == {
+        "type": "lifecycle_receipt",
+        "resumed": False,
+        "source": "connect",
+        "text_prompt_tokens": 42,
+        "voice_prompt_frames": 75,
+        "voice_prompt_complete": True,
+        "audio_silence_a_complete": True,
+        "text_prompt_complete": True,
+        "audio_silence_b_complete": True,
+        "processing_started": True,
+        "ready_sent": True,
+    }
+
+
+def test_lifecycle_receipt_starts_with_fixed_empty_priming_state() -> None:
+    assert _new_lifecycle_receipt(resuming=False) == {
+        "resumed": False,
+        "source": "connect",
+        "text_prompt_tokens": 0,
+        "voice_prompt_frames": 0,
+        "voice_prompt_complete": False,
+        "audio_silence_a_complete": False,
+        "text_prompt_complete": False,
+        "audio_silence_b_complete": False,
+        "processing_started": False,
+        "ready_sent": False,
+    }
+    assert _new_lifecycle_receipt(resuming=True) == {
+        "resumed": True,
+        "source": "resume",
+        "text_prompt_tokens": 0,
+        "voice_prompt_frames": 0,
+        "voice_prompt_complete": False,
+        "audio_silence_a_complete": False,
+        "text_prompt_complete": False,
+        "audio_silence_b_complete": False,
+        "processing_started": False,
+        "ready_sent": False,
+    }
+
+
+def test_lifecycle_receipt_rejects_incomplete_startup() -> None:
+    class _Control:
+        readyState = "open"
+
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        def send(self, payload: str) -> None:
+            self.sent.append(payload)
+
+    session = RTCSession.__new__(RTCSession)
+    session._control = _Control()
+    common = {
+        "resumed": False,
+        "source": "connect",
+        "text_prompt_tokens": 42,
+        "voice_prompt_frames": 75,
+        "voice_prompt_complete": True,
+        "audio_silence_a_complete": True,
+        "text_prompt_complete": True,
+        "audio_silence_b_complete": True,
+    }
+
+    session.send_lifecycle_receipt(
+        **common,
+        processing_started=False,
+        ready_sent=True,
+    )
+    session.send_lifecycle_receipt(
+        **common,
+        processing_started=True,
+        ready_sent=False,
+    )
+
+    assert session._control.sent == []
 
 
 class _Peer:
@@ -670,6 +788,9 @@ if __name__ == "__main__":
         test_outbound_shed_prefers_silence_and_crossfades,
         test_outbound_diagnostics_separate_flush_from_backlog_drop,
         test_stat_envelope_only_forwards_numeric_diagnostics,
+        test_lifecycle_receipt_emits_only_typed_privacy_safe_fields,
+        test_lifecycle_receipt_starts_with_fixed_empty_priming_state,
+        test_lifecycle_receipt_rejects_incomplete_startup,
         test_control_commands_preserve_wire_order,
         test_close_drains_active_control_and_cancels_waiters,
         test_queued_goodbye_survives_teardown_and_suppresses_resume_grant,

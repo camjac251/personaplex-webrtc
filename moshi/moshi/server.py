@@ -253,6 +253,21 @@ def _resolve_session_seed(requested: Optional[int]) -> int:
     return int(requested)
 
 
+def _new_lifecycle_receipt(*, resuming: bool) -> dict[str, bool | int | str]:
+    return {
+        "resumed": resuming,
+        "source": "resume" if resuming else "connect",
+        "text_prompt_tokens": 0,
+        "voice_prompt_frames": 0,
+        "voice_prompt_complete": False,
+        "audio_silence_a_complete": False,
+        "text_prompt_complete": False,
+        "audio_silence_b_complete": False,
+        "processing_started": False,
+        "ready_sent": False,
+    }
+
+
 def wrap_with_system_tags(text: str) -> str:
     """Add system tags as the model expects if they are missing.
     Example: "<system> You enjoy talking with people. Have a deep conversation about technology. Your name is Jane. <system>"
@@ -721,6 +736,7 @@ ASR_MAX_PENDING_TURNS = 3
 # RMS floor below which a buffered turn is considered silence and dropped.
 # Keeps the recognizer from hallucinating words out of room tone.
 ASR_SILENCE_RMS = 0.005
+INBOUND_RMS_EMA_ALPHA = 0.2
 
 # One-shot visual grounding. Passive captions update this state; manual or
 # opt-in user-turn grounding can then feed one compact packet into Moshi. Keep
@@ -1243,6 +1259,12 @@ class ServerState:
         self._lm_frame_ms_last: float = 0.0
         self._lm_frame_ms_ema: float = 0.0
         self._process_frame_count: int = 0
+        self._inbound_frames: int = 0
+        self._inbound_non_silent_frames: int = 0
+        self._inbound_rms_ema: float = 0.0
+        self._user_turn_starts: int = 0
+        self._user_turn_ends: int = 0
+        self._mimi_encode_frames: int = 0
         self._inflight_phase: str = "idle"
         self._inflight_phase_started_at: float = 0.0
         self._inflight_frame_started_at: float = 0.0
@@ -1830,6 +1852,12 @@ class ServerState:
             self._lm_frame_ms_last = 0.0
             self._lm_frame_ms_ema = 0.0
             self._process_frame_count = 0
+            self._inbound_frames = 0
+            self._inbound_non_silent_frames = 0
+            self._inbound_rms_ema = 0.0
+            self._user_turn_starts = 0
+            self._user_turn_ends = 0
+            self._mimi_encode_frames = 0
             self._gpu_util_last = None
             self._vram_used_last = None
             self._observed_idle_rms_ema = 0.0
@@ -1848,6 +1876,7 @@ class ServerState:
         return {
             "voice_load_ms": voice_load_ms,
             "voice_description": voice_description,
+            "text_prompt_tokens": len(self.lm_gen.text_prompt_tokens),
             "audio_top_k": audio_top_k,
             "audio_top_k_changed": audio_top_k_changed,
         }
@@ -2353,9 +2382,19 @@ class ServerState:
             if chunk_np.size
             else 0.0
         )
+        self._inbound_frames += 1
+        if chunk_rms >= ASR_SILENCE_RMS:
+            self._inbound_non_silent_frames += 1
+        self._inbound_rms_ema += INBOUND_RMS_EMA_ALPHA * (
+            chunk_rms - self._inbound_rms_ema
+        )
         user_turn_started, user_turn_ended = self._update_user_turn_activity(
             chunk_rms
         )
+        if user_turn_started:
+            self._user_turn_starts += 1
+        if user_turn_ended:
+            self._user_turn_ends += 1
         stop_user_turn_ended = self._update_stop_latch_user_turn_activity(
             chunk_rms
         )
@@ -2422,6 +2461,7 @@ class ServerState:
             # Mimi and LM state must advance under the same lock so a snapshot
             # cannot capture the codec after frame N and the LM before it.
             codes = self.mimi.encode(chunk)
+            self._mimi_encode_frames += 1
             self._set_inflight_phase("control")
             prev_pad_streak = self._vision_pad_streak
             # End-of-thought gate: the model has finished its current
@@ -4674,8 +4714,8 @@ class ServerState:
              the answer. The browser opens its 'control' DataChannel.
           3. A background task waits for a ``config`` DataChannel
              message, applies it, runs system prompts under the lock,
-             sends ``ready``, then starts the GPU process loop and
-             holds the lock until the peer connection closes.
+             starts the GPU process loop, sends ``ready`` and its lifecycle
+             receipt, then holds the lock until the peer connection closes.
 
         An optional ``resume_session_id`` in the body asks to continue a
         session whose transport just died. When it matches an unexpired
@@ -4862,6 +4902,7 @@ class ServerState:
         _wd_t: Optional[asyncio.Task] = None
         recording_spill_tasks: set[asyncio.Future] = set()
         resuming = resume_state is not None
+        lifecycle_receipt = _new_lifecycle_receipt(resuming=resuming)
         cfg: Optional[SessionConfig] = None
         # Teardown bookkeeping for the resume grant: whether this session
         # reached the live phase with primed model state, whether the server
@@ -4972,6 +5013,9 @@ class ServerState:
                     except BaseException:
                         pass
                     raise
+                lifecycle_receipt["text_prompt_tokens"] = configure_result[
+                    "text_prompt_tokens"
+                ]
                 if configure_result["voice_description"]:
                     clog.log(
                         "info",
@@ -6111,6 +6155,14 @@ class ServerState:
                         )
                         try:
                             diagnostics = await session.diagnostics_snapshot()
+                            diagnostics.update({
+                                "inbound_frames": self._inbound_frames,
+                                "inbound_non_silent_frames": self._inbound_non_silent_frames,
+                                "inbound_rms_ema": self._inbound_rms_ema,
+                                "user_turn_starts": self._user_turn_starts,
+                                "user_turn_ends": self._user_turn_ends,
+                                "mimi_encode_frames": self._mimi_encode_frames,
+                            })
                             session.send_stat(
                                 vram_used,
                                 gpu_util,
@@ -6158,13 +6210,16 @@ class ServerState:
                         )
                     )
                     try:
-                        await asyncio.shield(in_flight)
+                        phase_result = await asyncio.shield(in_flight)
                     except asyncio.CancelledError:
                         try:
                             await in_flight
                         except BaseException:
                             pass
                         raise
+                    if phase_name == "voice_prompt":
+                        lifecycle_receipt["voice_prompt_frames"] = phase_result
+                    lifecycle_receipt[f"{phase_name}_complete"] = True
                     clog.log(
                         "info",
                         f"timing: prompt phase {phase_name} "
@@ -6356,7 +6411,12 @@ class ServerState:
                         f"config-applied resume notify failed: {type(exc).__name__}: {exc}",
                     )
             session.start_processing()
+            lifecycle_receipt["processing_started"] = bool(
+                session._processing_started
+            )
             session.send_ready(identity)
+            lifecycle_receipt["ready_sent"] = bool(session._ready_sent)
+            session.send_lifecycle_receipt(**lifecycle_receipt)
             # Tell the client whether the vision pipeline is reachable so
             # it can disable the Add Vision button (or warn the user) when
             # the server has no GEMINI_API_KEY configured. A resumed
