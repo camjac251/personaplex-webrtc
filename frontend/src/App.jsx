@@ -54,6 +54,13 @@ function parseStoredObject(value) {
   }
 }
 
+const UPLOADED_VOICE_HANDLE_RE =
+  /^upload:upload_[A-Za-z0-9_-]{11}\.(?:wav|mp3|flac|ogg|m4a|aac|opus)$/;
+
+function parseStoredUploadedVoiceHandle(value) {
+  return UPLOADED_VOICE_HANDLE_RE.test(value) ? value : "";
+}
+
 function hasStoredValue(key) {
   try {
     return localStorage.getItem(key) !== null;
@@ -399,6 +406,7 @@ const TUNING_DEVIATION_FIELDS = [
   ["repetition_penalty", "rep penalty", "repPenalty"],
   ["repetition_penalty_context", "rep context", "repContext"],
   ["padding_bonus", "pad bonus", "padBonus"],
+  ["turn_onset_bias", "onset bias", "turnOnsetBias"],
   ["max_turn_text_tokens", "max turn", "maxTurn"],
 ];
 
@@ -438,6 +446,7 @@ function App() {
       "pp_repPenaltySlider",
       "pp_repContextSlider",
       "pp_padBonusSlider",
+      "pp_turnOnsetBiasSlider",
       "pp_maxTurnSlider",
     ].some(hasStoredValue);
   }
@@ -526,12 +535,20 @@ function App() {
     DEFAULTS.turnHandling,
     (value) => (value === "assisted" ? "assisted" : "native"),
   );
-  const [uploadedVoiceFilename, setUploadedVoiceFilename] = useState("");
+  // Persist only the server-issued opaque handle so an explicitly retained
+  // clone remains removable after a reload. The source name, decoded facts,
+  // and local preview URL stay memory-only.
+  const [uploadedVoiceFilename, setUploadedVoiceFilename] = useStoredState(
+    "pp_uploadedVoiceHandle",
+    "",
+    parseStoredUploadedVoiceHandle,
+  );
   const [uploadedVoiceLabel, setUploadedVoiceLabel] = useState("");
   const [uploadedVoiceMeta, setUploadedVoiceMeta] = useState(null);
   const [uploadedVoicePreviewUrl, setUploadedVoicePreviewUrl] = useState("");
   const [uploadStatus, setUploadStatus] = useState("");
   const [uploadKind, setUploadKind] = useState("");
+  const [voiceBusy, setVoiceBusy] = useState("");
   // How strongly an uploaded clip conditions the timbre, as an integer
   // 0..100 for the UI; the payload sends the 0..1 float. Only meaningful
   // with a clip uploaded. Connect-time only, like the rest of the prefix.
@@ -553,6 +570,7 @@ function App() {
   const [repPenalty, setRepPenalty] = useStoredState("pp_repPenaltySlider", DEFAULTS.repPenalty, (value) => clampInferenceValue("repPenalty", value, DEFAULTS.repPenalty));
   const [repContext, setRepContext] = useStoredState("pp_repContextSlider", DEFAULTS.repContext, (value) => clampInferenceValue("repContext", value, DEFAULTS.repContext));
   const [padBonus, setPadBonus] = useStoredState("pp_padBonusSlider", DEFAULTS.padBonus, (value) => clampInferenceValue("padBonus", value, DEFAULTS.padBonus));
+  const [turnOnsetBias, setTurnOnsetBias] = useStoredState("pp_turnOnsetBiasSlider", DEFAULTS.turnOnsetBias, (value) => clampInferenceValue("turnOnsetBias", value, DEFAULTS.turnOnsetBias));
   const [maxTurn, setMaxTurn] = useStoredState("pp_maxTurnSlider", DEFAULTS.maxTurn, (value) => clampInferenceValue("maxTurn", value, DEFAULTS.maxTurn));
   const [tuningRangeMode, setTuningRangeMode] = useStoredState(
     "pp_tuningRangeMode",
@@ -597,6 +615,7 @@ function App() {
         repPenalty,
         repContext,
         padBonus,
+        turnOnsetBias,
         maxTurn,
       },
     };
@@ -800,6 +819,7 @@ function App() {
     repetition_penalty: Number(repPenalty),
     repetition_penalty_context: Number.parseInt(repContext, 10),
     padding_bonus: Number(padBonus),
+    turn_onset_bias: Number(turnOnsetBias),
     max_turn_text_tokens: Number.parseInt(maxTurn, 10),
     vision_feed_model: !!visionFeedModel,
     vision_ground_user_turns: !!visionOn && !!visionGroundTurns,
@@ -809,6 +829,7 @@ function App() {
 
   const isLive = phase === "live";
   const cfgLocked = phase === "connecting" || phase === "warmup" || phase === "live" || phase === "stopping";
+  const voiceOperationsLocked = cfgLocked || Boolean(voiceBusy);
   // While locked, the config column collapses to a rail by default; the user
   // can peek at the frozen settings (sideExpanded) and re-collapse. Never
   // unfreezes the controls.
@@ -840,6 +861,7 @@ function App() {
     repPenalty,
     repContext,
     padBonus,
+    turnOnsetBias,
     maxTurn,
   };
   const tuningOutsideSafeRange = inferenceValuesOutsideRange(
@@ -900,7 +922,22 @@ function App() {
     setUploadedVoicePreviewUrl("");
     setUploadStatus("");
     setUploadKind("");
-  }, []);
+  }, [setUploadedVoiceFilename]);
+
+  useEffect(
+    () => () => {
+      voicePreviewAudioRef.current?.pause?.();
+      if (uploadedVoicePreviewUrlRef.current) {
+        URL.revokeObjectURL(uploadedVoicePreviewUrlRef.current);
+        uploadedVoicePreviewUrlRef.current = "";
+      }
+      if (voicePreviewObjectUrlRef.current) {
+        URL.revokeObjectURL(voicePreviewObjectUrlRef.current);
+        voicePreviewObjectUrlRef.current = "";
+      }
+    },
+    [],
+  );
 
   const getMicConstraints = useCallback(
     () => ({
@@ -988,6 +1025,7 @@ function App() {
           setRepPenalty(nextDefaults.repPenalty);
           setRepContext(nextDefaults.repContext);
           setPadBonus(nextDefaults.padBonus);
+          setTurnOnsetBias(nextDefaults.turnOnsetBias);
           setMaxTurn(nextDefaults.maxTurn);
         }
         try {
@@ -1016,6 +1054,7 @@ function App() {
     setTextTemp,
     setTextTopk,
     setTurnHandling,
+    setTurnOnsetBias,
   ]);
 
   useEffect(() => {
@@ -1153,6 +1192,7 @@ function App() {
       repPenalty: Number(repPenalty),
       repContext: Number(repContext),
       padBonus: Number(padBonus),
+      turnOnsetBias: Number(turnOnsetBias),
       maxTurn: Number(maxTurn),
       echoCancel: !!echoCancel,
       noiseSupp: !!noiseSupp,
@@ -1193,6 +1233,7 @@ function App() {
     textTemp,
     textTopk,
     turnHandling,
+    turnOnsetBias,
     uploadedVoiceFilename,
     visionFeedModel,
     visionGroundTurns,
@@ -1244,10 +1285,17 @@ function App() {
       setPresetId(preset.id);
       setTextPrompt(preset.prompt);
     }
-    setVoice(typeof profile.voice === "string" && profile.voice ? profile.voice : "NATF1");
-    setVoiceGender("all");
-    setVoiceBlend(false);
-    clearUploadedVoice();
+    if (uploadedVoiceFilename) {
+      addNotice(
+        "warn",
+        "Profile settings loaded without replacing the active clone. Remove the clone to change voices.",
+      );
+    } else {
+      setVoice(typeof profile.voice === "string" && profile.voice ? profile.voice : "NATF1");
+      setVoiceGender("all");
+      setVoiceBlend(false);
+      clearUploadedVoice();
+    }
     setAdherenceMode(
       ADHERENCE_MODES.some((item) => item.id === profile.adherenceMode)
         ? profile.adherenceMode
@@ -1282,6 +1330,7 @@ function App() {
     setRepPenalty(clampInferenceValue("repPenalty", profile.repPenalty, modelDefaults.repPenalty));
     setRepContext(clampInferenceValue("repContext", profile.repContext, modelDefaults.repContext));
     setPadBonus(clampInferenceValue("padBonus", profile.padBonus, modelDefaults.padBonus));
+    setTurnOnsetBias(clampInferenceValue("turnOnsetBias", profile.turnOnsetBias, modelDefaults.turnOnsetBias));
     setMaxTurn(clampInferenceValue("maxTurn", profile.maxTurn, modelDefaults.maxTurn));
     setEchoCancel(typeof profile.echoCancel === "boolean" ? profile.echoCancel : DEFAULTS.echoCancel);
     setNoiseSupp(typeof profile.noiseSupp === "boolean" ? profile.noiseSupp : DEFAULTS.noiseSupp);
@@ -1334,6 +1383,7 @@ function App() {
   }, [
     addNotice,
     clearUploadedVoice,
+    uploadedVoiceFilename,
     setAdherenceMode,
     setAudioTemp,
     setAudioTopk,
@@ -1356,6 +1406,7 @@ function App() {
     setTextTemp,
     setTextTopk,
     setTurnHandling,
+    setTurnOnsetBias,
     setVisionInTranscript,
     setVisionReactionMode,
     setReinforceInSilences,
@@ -1452,6 +1503,7 @@ function App() {
       repetition_penalty: clampInferenceValue("repPenalty", repPenalty, DEFAULTS.repPenalty, tuningRangeMode),
       repetition_penalty_context: clampInferenceValue("repContext", repContext, DEFAULTS.repContext, tuningRangeMode),
       padding_bonus: clampInferenceValue("padBonus", padBonus, DEFAULTS.padBonus, tuningRangeMode),
+      turn_onset_bias: clampInferenceValue("turnOnsetBias", turnOnsetBias, DEFAULTS.turnOnsetBias, tuningRangeMode),
       max_turn_text_tokens: clampInferenceValue("maxTurn", maxTurn, DEFAULTS.maxTurn, tuningRangeMode),
       seed: seedRandom ? -1 : Number.parseInt(seed, 10),
       session_timeout_sec: Number(idleTimeout) > 0 ? Number(idleTimeout) * 60 : 0,
@@ -1485,6 +1537,7 @@ function App() {
     repPenalty,
     repContext,
     padBonus,
+    turnOnsetBias,
     maxTurn,
     tuningRangeMode,
     seedRandom,
@@ -1495,42 +1548,48 @@ function App() {
     injectSilenceStreak,
   ]);
 
-  const buildConfigProfile = useCallback(() => ({
-    version: 1,
-    exported_at: new Date().toISOString(),
-    session_profile_id: sessionProfileId === "custom" ? "" : sessionProfileId,
-    preset_id: presetId,
-    adherence_mode: adherenceMode,
-    expression_mode: expressionMode,
-    voice_filter: { gender: voiceGender },
-    uploaded_voice_label: uploadedVoiceLabel,
-    uploaded_voice_meta: uploadedVoiceMeta,
-    config: { ...buildConfigPayload(), text_prompt: textPrompt || "" },
-    resolved_text_prompt: composeTextPrompt(),
-    mic: {
-      echo_cancellation: !!echoCancel,
-      noise_suppression: !!noiseSupp,
-      auto_gain: !!autoGain,
-      output_device_id: outputDeviceId,
-    },
-    interaction: {
-      turn_handling: turnHandling,
-    },
-    vision: {
-      interval_ms: Number(visionIntervalMs),
-      cost_limit_usd: Number(visionCostLimitUsd),
-      reaction_mode: visionReactionMode,
-      feed_model: !!visionFeedModel,
-      ground_user_turns: !!visionGroundTurns,
-    },
-  }), [
+  const buildConfigProfile = useCallback(() => {
+    const config = { ...buildConfigPayload(), text_prompt: textPrompt || "" };
+    if (uploadedVoiceFilename) {
+      // Config files are portable settings, not private-media manifests.
+      // Preserve the need to re-upload and the strength value without
+      // exporting the live deletion handle, source name, or signal report.
+      config.voice_prompt = "upload:reupload-required";
+    }
+    return {
+      version: 1,
+      exported_at: new Date().toISOString(),
+      session_profile_id: sessionProfileId === "custom" ? "" : sessionProfileId,
+      preset_id: presetId,
+      adherence_mode: adherenceMode,
+      expression_mode: expressionMode,
+      voice_filter: { gender: voiceGender },
+      config,
+      resolved_text_prompt: composeTextPrompt(),
+      mic: {
+        echo_cancellation: !!echoCancel,
+        noise_suppression: !!noiseSupp,
+        auto_gain: !!autoGain,
+        output_device_id: outputDeviceId,
+      },
+      interaction: {
+        turn_handling: turnHandling,
+      },
+      vision: {
+        interval_ms: Number(visionIntervalMs),
+        cost_limit_usd: Number(visionCostLimitUsd),
+        reaction_mode: visionReactionMode,
+        feed_model: !!visionFeedModel,
+        ground_user_turns: !!visionGroundTurns,
+      },
+    };
+  }, [
     presetId,
     sessionProfileId,
     adherenceMode,
     expressionMode,
     voiceGender,
-    uploadedVoiceLabel,
-    uploadedVoiceMeta,
+    uploadedVoiceFilename,
     buildConfigPayload,
     composeTextPrompt,
     textPrompt,
@@ -1603,6 +1662,7 @@ function App() {
     setRepPenalty(clampInferenceValue("repPenalty", config.repetition_penalty, DEFAULTS.repPenalty));
     setRepContext(clampInferenceValue("repContext", config.repetition_penalty_context, DEFAULTS.repContext));
     setPadBonus(clampInferenceValue("padBonus", config.padding_bonus, DEFAULTS.padBonus));
+    setTurnOnsetBias(clampInferenceValue("turnOnsetBias", config.turn_onset_bias, DEFAULTS.turnOnsetBias));
     setMaxTurn(clampInferenceValue("maxTurn", config.max_turn_text_tokens, DEFAULTS.maxTurn));
     setInjectSilenceRms(clampInferenceValue("injectSilenceRms", config.inject_silence_rms, DEFAULTS.injectSilenceRms));
     setInjectSilenceStreak(clampInferenceValue("injectSilenceStreak", config.inject_silence_streak, DEFAULTS.injectSilenceStreak));
@@ -1619,40 +1679,46 @@ function App() {
     // the catalog has loaded.
     const knownVoices = voiceList.length ? voiceList : VOICES;
     const voicePrompt = typeof config.voice_prompt === "string" ? config.voice_prompt : "";
-    if (voicePrompt.startsWith("upload:")) {
-      clearUploadedVoice();
-      setUploadStatus("Config references an uploaded clip. Re-upload the audio to use it.");
-      setUploadKind("error");
-      // Repopulate the strength slider so a re-uploaded clip resumes at
-      // the saved value; the clip itself can't be restored from the config
-      // alone. Only an upload-voice config encodes a real choice: preset
-      // exports carry the constant 1.0.
-      const cloneStrengthFloat = readNumber(config.clone_strength, cloneStrength / 100);
-      setCloneStrength(Math.max(0, Math.min(100, Math.round(cloneStrengthFloat * 100))));
-    } else if (voicePrompt.endsWith(".pt")) {
-      const voiceName = voicePrompt.slice(0, -3);
-      if (knownVoices.includes(voiceName)) {
-        setVoice(voiceName);
-      } else {
-        addNotice("warn", `Voice ${voiceName} not in the server catalog; kept the current voice`);
+    if (uploadedVoiceFilename) {
+      addNotice(
+        "warn",
+        "Config settings loaded without replacing the active clone. Remove the clone to change voices.",
+      );
+    } else {
+      if (voicePrompt.startsWith("upload:")) {
+        setUploadStatus("Config references an uploaded clip. Re-upload the audio to use it.");
+        setUploadKind("error");
+        // Repopulate the strength slider so a re-uploaded clip resumes at
+        // the saved value; the clip itself can't be restored from the config
+        // alone. Only an upload-voice config encodes a real choice: preset
+        // exports carry the constant 1.0.
+        const cloneStrengthFloat = readNumber(config.clone_strength, cloneStrength / 100);
+        setCloneStrength(Math.max(0, Math.min(100, Math.round(cloneStrengthFloat * 100))));
+      } else if (voicePrompt.endsWith(".pt")) {
+        const voiceName = voicePrompt.slice(0, -3);
+        if (knownVoices.includes(voiceName)) {
+          setVoice(voiceName);
+        } else {
+          addNotice("warn", `Voice ${voiceName} not in the server catalog; kept the current voice`);
+        }
+        clearUploadedVoice();
       }
-      clearUploadedVoice();
-    }
 
-    const voicePromptB = typeof config.voice_prompt_b === "string" ? config.voice_prompt_b : "";
-    const blendMixFloat = readNumber(config.voice_blend_mix, 0);
-    if (voicePromptB.endsWith(".pt") && blendMixFloat > 0) {
-      const voiceBName = voicePromptB.slice(0, -3);
-      if (knownVoices.includes(voiceBName)) {
-        setVoiceB(voiceBName);
-        setBlendMix(Math.max(0, Math.min(100, Math.round(blendMixFloat * 100))));
-        setVoiceBlend(true);
+      const voicePromptB = typeof config.voice_prompt_b === "string" ? config.voice_prompt_b : "";
+      const blendMixFloat = readNumber(config.voice_blend_mix, 0);
+      if (voicePromptB.endsWith(".pt") && blendMixFloat > 0) {
+        const voiceBName = voicePromptB.slice(0, -3);
+        if (knownVoices.includes(voiceBName)) {
+          setVoiceB(voiceBName);
+          setBlendMix(Math.max(0, Math.min(100, Math.round(blendMixFloat * 100))));
+          setVoiceBlend(true);
+        } else {
+          setVoiceBlend(false);
+          addNotice("warn", `Blend voice ${voiceBName} not in the server catalog; blend disabled`);
+        }
       } else {
         setVoiceBlend(false);
-        addNotice("warn", `Blend voice ${voiceBName} not in the server catalog; blend disabled`);
       }
-    } else {
-      setVoiceBlend(false);
     }
 
     const filter = profile?.voice_filter || {};
@@ -1669,7 +1735,7 @@ function App() {
     const interval = readNumber(profile?.vision?.interval_ms, visionIntervalMs);
     if (interval >= 1000 && interval <= 30000) setVisionIntervalMs(interval);
     setVisionCostLimitUsd(Math.max(0, readNumber(profile?.vision?.cost_limit_usd, visionCostLimitUsd)));
-  }, [addNotice, allSessionProfiles, clearUploadedVoice, cloneStrength, textPrompt, visionCostLimitUsd, visionIntervalMs, voiceList, setAdherenceMode, setExpressionMode, setAudioTemp, setTextTemp, setTextTopk, setTextMinP, setAudioTopk, setSemanticTempCap, setCaptionCfgGamma, setRepPenalty, setRepContext, setPadBonus, setMaxTurn, setInjectSilenceRms, setInjectSilenceStreak, setSeedRandom, setSeed, setIdleTimeout, setTextPrompt, setVisionPrompt, setVisionPromptReplace, setVisionInTranscript, setVisionReactionMode, setReinforceInSilences, setVoice, setVoiceBlend, setVoiceB, setBlendMix, setCloneStrength, setEchoCancel, setNoiseSupp, setAutoGain, setOutputDeviceId, setTurnHandling, setVisionIntervalMs, setVisionCostLimitUsd]);
+  }, [addNotice, allSessionProfiles, clearUploadedVoice, cloneStrength, textPrompt, uploadedVoiceFilename, visionCostLimitUsd, visionIntervalMs, voiceList, setAdherenceMode, setExpressionMode, setAudioTemp, setTextTemp, setTextTopk, setTextMinP, setAudioTopk, setSemanticTempCap, setCaptionCfgGamma, setRepPenalty, setRepContext, setPadBonus, setTurnOnsetBias, setMaxTurn, setInjectSilenceRms, setInjectSilenceStreak, setSeedRandom, setSeed, setIdleTimeout, setTextPrompt, setVisionPrompt, setVisionPromptReplace, setVisionInTranscript, setVisionReactionMode, setReinforceInSilences, setVoice, setVoiceBlend, setVoiceB, setBlendMix, setCloneStrength, setEchoCancel, setNoiseSupp, setAutoGain, setOutputDeviceId, setTurnHandling, setVisionIntervalMs, setVisionCostLimitUsd]);
 
   const exportConfig = useCallback(() => {
     const profile = JSON.stringify(buildConfigProfile(), null, 2);
@@ -1836,6 +1902,7 @@ function App() {
       ["Rep", currentProfileSnapshot.repPenalty, pinned.repPenalty],
       ["Rep ctx", currentProfileSnapshot.repContext, pinned.repContext],
       ["Pad", currentProfileSnapshot.padBonus, pinned.padBonus],
+      ["Onset", currentProfileSnapshot.turnOnsetBias, pinned.turnOnsetBias],
       ["Max turn", currentProfileSnapshot.maxTurn, pinned.maxTurn],
       ["Echo", currentProfileSnapshot.echoCancel, pinned.echoCancel],
       ["Noise", currentProfileSnapshot.noiseSupp, pinned.noiseSupp],
@@ -2558,6 +2625,7 @@ function App() {
         reconcileInference("repetition_penalty", "repPenalty", setRepPenalty);
         reconcileInference("repetition_penalty_context", "repContext", setRepContext);
         reconcileInference("padding_bonus", "padBonus", setPadBonus);
+        reconcileInference("turn_onset_bias", "turnOnsetBias", setTurnOnsetBias);
         reconcileInference("max_turn_text_tokens", "maxTurn", setMaxTurn);
         reconcileInference("inject_silence_rms", "injectSilenceRms", setInjectSilenceRms);
         reconcileInference("inject_silence_streak", "injectSilenceStreak", setInjectSilenceStreak);
@@ -3589,6 +3657,7 @@ function App() {
       repPenalty: clampInferenceValue("repPenalty", repPenalty, DEFAULTS.repPenalty, "safe"),
       repContext: clampInferenceValue("repContext", repContext, DEFAULTS.repContext, "safe"),
       padBonus: clampInferenceValue("padBonus", padBonus, DEFAULTS.padBonus, "safe"),
+      turnOnsetBias: clampInferenceValue("turnOnsetBias", turnOnsetBias, DEFAULTS.turnOnsetBias, "safe"),
       maxTurn: clampInferenceValue("maxTurn", maxTurn, DEFAULTS.maxTurn, "safe"),
     };
     setTextTemp(next.textTemp);
@@ -3601,6 +3670,7 @@ function App() {
     setRepPenalty(next.repPenalty);
     setRepContext(next.repContext);
     setPadBonus(next.padBonus);
+    setTurnOnsetBias(next.turnOnsetBias);
     setMaxTurn(next.maxTurn);
     setTuningRangeMode("safe");
     setSessionProfileId("custom");
@@ -3615,6 +3685,7 @@ function App() {
       repetition_penalty: next.repPenalty,
       repetition_penalty_context: next.repContext,
       padding_bonus: next.padBonus,
+      turn_onset_bias: next.turnOnsetBias,
       max_turn_text_tokens: next.maxTurn,
     });
   }, [
@@ -3639,9 +3710,11 @@ function App() {
     setTextTemp,
     setTextTopk,
     setTuningRangeMode,
+    setTurnOnsetBias,
     textMinP,
     textTemp,
     textTopk,
+    turnOnsetBias,
   ]);
 
   const resetTuningDefaults = useCallback((notify = true, resetTurn = true) => {
@@ -3655,6 +3728,7 @@ function App() {
     setRepPenalty(modelDefaults.repPenalty);
     setRepContext(modelDefaults.repContext);
     setPadBonus(modelDefaults.padBonus);
+    setTurnOnsetBias(modelDefaults.turnOnsetBias);
     setMaxTurn(modelDefaults.maxTurn);
     if (resetTurn) setTurnHandling(modelDefaults.turnHandling);
     setTuningRangeMode("safe");
@@ -3670,6 +3744,7 @@ function App() {
       repetition_penalty: modelDefaults.repPenalty,
       repetition_penalty_context: modelDefaults.repContext,
       padding_bonus: modelDefaults.padBonus,
+      turn_onset_bias: modelDefaults.turnOnsetBias,
       max_turn_text_tokens: modelDefaults.maxTurn,
     });
     if (notify) addNotice("ok", "Inference tuning reset to stable defaults");
@@ -3690,6 +3765,7 @@ function App() {
     setTextTopk,
     setTurnHandling,
     setTuningRangeMode,
+    setTurnOnsetBias,
   ]);
 
   const interruptResponse = useCallback(
@@ -3735,14 +3811,24 @@ function App() {
   }), []);
 
   const previewUploadedVoice = useCallback(() => {
-    if (!uploadedVoicePreviewUrl) return;
+    if (!uploadedVoicePreviewUrl || voiceOperationsLocked) return;
+    setVoiceBusy("clip");
     voicePreviewAudioRef.current?.pause?.();
     const audio = new Audio(uploadedVoicePreviewUrl);
     voicePreviewAudioRef.current = audio;
+    const release = () => {
+      if (voicePreviewAudioRef.current === audio) {
+        voicePreviewAudioRef.current = null;
+      }
+      setVoiceBusy((current) => (current === "clip" ? "" : current));
+    };
+    audio.onended = release;
+    audio.onerror = release;
     audio.play().catch((error) => {
+      release();
       addNotice("err", `Preview failed: ${error.message || error}`);
     });
-  }, [addNotice, uploadedVoicePreviewUrl]);
+  }, [addNotice, uploadedVoicePreviewUrl, voiceOperationsLocked]);
 
   // Synthesize and play a short sample of a preset voice. The server holds
   // the single GPU, so a preview is only honored when no session is live; it
@@ -3753,8 +3839,13 @@ function App() {
       if (!id) return;
       // Mirror the server's reject-while-live policy in the UI. The sidebar
       // is locked during a session anyway; this is the fast local path.
-      if (isLive) {
-        addNotice("warn", "Voice preview unavailable during a live session");
+      if (voiceOperationsLocked || uploadedVoiceFilename) {
+        addNotice(
+          "warn",
+          uploadedVoiceFilename
+            ? "Remove the active clone before previewing preset voices"
+            : "Voice preview unavailable while voice controls are locked",
+        );
         return;
       }
       // Pressing the stop glyph (same voice already previewing) stops it.
@@ -3809,14 +3900,16 @@ function App() {
         setPreviewing((current) => (current === id ? null : current));
       }
     },
-    [addNotice, isLive, previewing],
+    [addNotice, previewing, uploadedVoiceFilename, voiceOperationsLocked],
   );
 
   const uploadVoice = async (file) => {
-    if (!file) return;
+    if (!file || uploadedVoiceFilename || voiceOperationsLocked) return;
+    setVoiceBusy("upload");
     if (file.size > 20 * 1024 * 1024) {
       setUploadStatus("File too large. Max 20 MB.");
       setUploadKind("error");
+      setVoiceBusy("");
       return;
     }
     const previewUrl = URL.createObjectURL(file);
@@ -3825,6 +3918,7 @@ function App() {
       URL.revokeObjectURL(previewUrl);
       setUploadStatus(`Clip too long (${fmt(meta.duration, 1)} s). Max 60 s.`);
       setUploadKind("error");
+      setVoiceBusy("");
       return;
     }
     setUploadStatus(`Uploading ${file.name}`);
@@ -3843,19 +3937,145 @@ function App() {
       setSessionProfileId("custom");
       setUploadedVoiceFilename(json.filename);
       setUploadedVoiceLabel(file.name);
-      setUploadedVoiceMeta(meta);
+      setUploadedVoiceMeta({
+        ...meta,
+        analysis: json.analysis || null,
+        selection: json.selection || null,
+      });
       setUploadedVoicePreviewUrl(previewUrl);
       const detail = `${meta.duration ? `${fmt(meta.duration, 1)} s · ` : ""}${fmt(meta.size / (1024 * 1024), 1)} MB`;
-      setUploadStatus(`Using uploaded voice: ${file.name} (${detail})`);
-      setUploadKind("success");
+      const warnings = Array.isArray(json.analysis?.warning_codes)
+        ? json.analysis.warning_codes
+        : [];
+      setUploadStatus(
+        warnings.length
+          ? `Reference accepted with ${warnings.length} signal warning${warnings.length === 1 ? "" : "s"}`
+          : `Reference signal ready (${detail})`,
+      );
+      setUploadKind(warnings.length ? "warning" : "success");
       addNotice("ok", "Voice reference uploaded");
     } catch (error) {
       URL.revokeObjectURL(previewUrl);
-      clearUploadedVoice();
-      setUploadStatus(`Upload failed: ${error.message || error}`);
+      const code = error.message || String(error);
+      const uploadErrors = {
+        all_silent: "The decoded clip is silent. Choose a recording with audible speech.",
+        empty: "The clip contains no decoded audio. Choose another file.",
+        non_finite: "The decoded signal is invalid. Re-export the recording.",
+        unsupported_channel: "This channel layout is unsupported. Export mono or stereo.",
+        oversized: "The file exceeds 20 MB. Export a smaller reference.",
+        overlong: "The clip exceeds 60 seconds. Trim it before uploading.",
+        undecodable: "The server could not decode this audio format. Re-export as WAV or MP3.",
+        session_busy: "Enrollment is unavailable during a live or resumable session.",
+      };
+      setUploadStatus(uploadErrors[code] || "Voice upload failed. Try another reference.");
       setUploadKind("error");
+    } finally {
+      setVoiceBusy("");
     }
   };
+
+  const previewConditionedClone = useCallback(
+    async (mode) => {
+      if (!uploadedVoiceFilename || voiceOperationsLocked) return;
+      if (cfgLocked) {
+        setUploadStatus("Conditioned preview unavailable during a live session");
+        setUploadKind("error");
+        return;
+      }
+      setVoiceBusy(mode);
+      setUploadStatus(`Generating ${mode} conditioned preview`);
+      setUploadKind("uploading");
+      try {
+        const res = await fetch("/api/voice-preview", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            voice: uploadedVoiceFilename,
+            mode,
+            clone_strength: Number(cloneStrength) / 100,
+            retain: false,
+          }),
+        });
+        if (!res.ok) {
+          const payload = await res.json().catch(() => null);
+          if (res.status === 409) throw new Error("session_busy");
+          throw new Error(payload?.error || "preview_failed");
+        }
+        const blob = await res.blob();
+        voicePreviewAudioRef.current?.pause?.();
+        if (voicePreviewObjectUrlRef.current) {
+          URL.revokeObjectURL(voicePreviewObjectUrlRef.current);
+        }
+        const objectUrl = URL.createObjectURL(blob);
+        voicePreviewObjectUrlRef.current = objectUrl;
+        const audio = new Audio(objectUrl);
+        voicePreviewAudioRef.current = audio;
+        const release = () => {
+          if (voicePreviewObjectUrlRef.current === objectUrl) {
+            URL.revokeObjectURL(objectUrl);
+            voicePreviewObjectUrlRef.current = "";
+          }
+          if (voicePreviewAudioRef.current === audio) {
+            voicePreviewAudioRef.current = null;
+          }
+        };
+        audio.onended = release;
+        audio.onerror = release;
+        try {
+          await audio.play();
+        } catch (error) {
+          release();
+          throw error;
+        }
+        setUploadStatus(`${mode === "tail" ? "Tail" : "Representative"} conditioned preview playing`);
+        setUploadKind("success");
+      } catch (error) {
+        setUploadStatus(
+          error.message === "session_busy"
+            ? "Conditioned preview is busy during a live or resumable session."
+            : "Conditioned preview failed. Try again while the server is idle.",
+        );
+        setUploadKind("error");
+      } finally {
+        setVoiceBusy("");
+      }
+    },
+    [cfgLocked, cloneStrength, uploadedVoiceFilename, voiceOperationsLocked],
+  );
+
+  const removeUploadedVoice = useCallback(async () => {
+    if (!uploadedVoiceFilename || voiceOperationsLocked) return;
+    const uploadId = uploadedVoiceFilename.replace(/^upload:/, "");
+    setVoiceBusy("delete");
+    setUploadStatus("Removing clone");
+    setUploadKind("uploading");
+    try {
+      const res = await fetch("/api/voice-delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ upload_id: uploadId }),
+      });
+      const payload = await res.json().catch(() => null);
+      if (res.status === 404 && payload?.status === "not_found") {
+        clearUploadedVoice();
+        addNotice("warn", "Voice clone was already absent from this server");
+        return;
+      }
+      if (!res.ok) throw new Error("delete_failed");
+      clearUploadedVoice();
+      addNotice("ok", "Voice clone removed");
+    } catch {
+      setUploadStatus("Clone removal failed. Retry while connected to this server.");
+      setUploadKind("error");
+    } finally {
+      setVoiceBusy("");
+    }
+  }, [
+    addNotice,
+    clearUploadedVoice,
+    uploadedVoiceFilename,
+    voiceOperationsLocked,
+  ]);
 
   const runPreflight = async () => {
     setPreflightOpen(true);
@@ -4193,7 +4413,7 @@ function App() {
   ].sort((a, b) => a.at - b.at);
   const blendActive = voiceBlend && !uploadedVoiceFilename && voiceB && voiceB !== voice && blendMix > 0;
   const voiceDisplay = uploadedVoiceFilename
-    ? uploadedVoiceLabel || "uploaded"
+    ? uploadedVoiceLabel || "retained clone"
     : blendActive
       ? `${voice}+${voiceB}`
       : voice;
@@ -4374,7 +4594,11 @@ function App() {
                   label="Session profile"
                   caption="Session profile"
                   info="profile"
-                  disabled={!serverInfo.modelVariant}
+                  disabled={
+                    !serverInfo.modelVariant ||
+                    voiceOperationsLocked ||
+                    Boolean(uploadedVoiceFilename)
+                  }
                   value={sessionProfileId}
                   options={[
                     ...allSessionProfiles.map((profile) => ({
@@ -4620,19 +4844,22 @@ function App() {
                   const seedValue = [...item].reduce((sum, char) => sum + char.charCodeAt(0), 0);
                   const heights = Array.from({ length: 11 }, (_, index) => 3 + ((seedValue * (index + 1) * 7) % 11));
                   const selectVoice = () => {
+                    if (uploadedVoiceFilename || voiceOperationsLocked) return;
                     setSessionProfileId("custom");
                     setVoice(item);
-                    clearUploadedVoice();
                   };
                   const isPreviewing = previewing === item;
+                  const presetVoiceDisabled =
+                    Boolean(uploadedVoiceFilename) || voiceOperationsLocked;
                   return (
                     // biome-ignore lint/a11y: row is a voice selector with a nested preview button; Enter/Space keyboard handler and aria-pressed are provided; a semantic restructure is deferred pending visual QA
                     <div
                       key={item}
                       role="button"
-                      tabIndex={0}
+                      tabIndex={presetVoiceDisabled ? -1 : 0}
                       className={cls("voice", !uploadedVoiceFilename && voice === item && "active")}
                       aria-pressed={!uploadedVoiceFilename && voice === item}
+                      aria-disabled={presetVoiceDisabled}
                       aria-label={`Use voice ${item}`}
                       onClick={selectVoice}
                       onKeyDown={(e) => {
@@ -4645,6 +4872,7 @@ function App() {
                       <button
                         type="button"
                         className={cls("play", isPreviewing && "playing")}
+                        disabled={presetVoiceDisabled}
                         aria-label={isPreviewing ? `Stop preview of voice ${item}` : `Preview voice ${item}`}
                         onClick={(e) => {
                           e.stopPropagation();
@@ -4726,7 +4954,7 @@ function App() {
               )}
             </div>
 
-            <div className="sect">
+            <div className="sect" aria-busy={Boolean(voiceBusy)}>
               <div className="sect-h">
                 <div>
                   <div className="sect-num">03 · CLONE</div>
@@ -4740,10 +4968,24 @@ function App() {
               <button
                 type="button"
                 className="drop"
+                disabled={
+                  voiceOperationsLocked || Boolean(uploadedVoiceFilename)
+                }
                 onClick={() => cloneFileRef.current?.click()}
               >
-                <div className="t">{uploadedVoiceLabel || "Drop audio or click to upload"}</div>
-                <div>10 to 60 s, one clean speaker, common audio formats</div>
+                <div className="t">
+                  {uploadedVoiceLabel ||
+                    (uploadedVoiceFilename
+                      ? "Retained voice clone"
+                      : voiceBusy === "upload"
+                        ? "Uploading…"
+                        : "Drop audio or click to upload")}
+                </div>
+                <div>
+                  {uploadedVoiceFilename
+                    ? "Remove the active clone before uploading another."
+                    : "10 to 60 s, one clean speaker, common audio formats"}
+                </div>
               </button>
               <input
                 ref={cloneFileRef}
@@ -4752,12 +4994,27 @@ function App() {
                 type="file"
                 accept="audio/*,.wav,.mp3,.flac,.ogg,.m4a,.opus,.aac"
                 aria-label="Upload voice reference clip"
-                onChange={(event) => uploadVoice(event.target.files?.[0])}
+                disabled={
+                  voiceOperationsLocked || Boolean(uploadedVoiceFilename)
+                }
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  event.target.value = "";
+                  uploadVoice(file);
+                }}
               />
-              {uploadStatus && <div className={cls("upload-status", uploadKind)}>{uploadStatus}</div>}
+              {uploadStatus && (
+                <div className={cls("upload-status", uploadKind)} aria-live="polite">
+                  {uploadStatus}
+                </div>
+              )}
               {uploadedVoiceMeta && (
                 <div className="clone-meta">
-                  <span>{uploadedVoiceMeta.duration ? `${fmt(uploadedVoiceMeta.duration, 1)} s` : "duration unknown"}</span>
+                  <span>
+                    {uploadedVoiceMeta.analysis?.total_duration_seconds
+                      ? `${fmt(uploadedVoiceMeta.analysis.total_duration_seconds, 1)} s decoded`
+                      : "decoded duration unknown"}
+                  </span>
                   <span>{fmt(uploadedVoiceMeta.size / (1024 * 1024), 1)} MB</span>
                   <span>{uploadedVoiceMeta.type}</span>
                 </div>
@@ -4767,7 +5024,7 @@ function App() {
                   <button
                     className="btn ghost"
                     type="button"
-                    disabled={!uploadedVoicePreviewUrl}
+                    disabled={!uploadedVoicePreviewUrl || voiceOperationsLocked}
                     onClick={previewUploadedVoice}
                   >
                     Preview clip
@@ -4775,17 +5032,116 @@ function App() {
                   <button
                     className="btn ghost"
                     type="button"
-                    onClick={clearUploadedVoice}
+                    disabled={voiceOperationsLocked}
+                    onClick={removeUploadedVoice}
                   >
                     Remove clone
                   </button>
                 </div>
               )}
               {uploadedVoiceFilename && (
+                <div className="clone-actions conditioned-preview-actions">
+                  <button
+                    className="btn ghost"
+                    type="button"
+                    disabled={voiceOperationsLocked}
+                    onClick={() => previewConditionedClone("tail")}
+                  >
+                    {voiceBusy === "tail" ? "Generating…" : "Tail preview"}
+                  </button>
+                  <button
+                    className="btn ghost"
+                    type="button"
+                    disabled={
+                      voiceOperationsLocked ||
+                      uploadedVoiceMeta?.selection?.mode !== "representative"
+                    }
+                    onClick={() => previewConditionedClone("representative")}
+                  >
+                    {voiceBusy === "representative"
+                      ? "Generating…"
+                      : "Representative preview"}
+                  </button>
+                </div>
+              )}
+              {uploadedVoiceMeta?.analysis && (
+                <div className="reference-signal-strip">
+                  <div className="reference-signal-summary">
+                    <span className="mono">
+                      {uploadedVoiceMeta.analysis.warning_codes?.length
+                        ? "warning"
+                        : "ready"}
+                    </span>
+                    <span>
+                      {uploadedVoiceMeta.analysis.warning_codes?.includes("clipped")
+                        ? "Reduce input gain if available."
+                        : uploadedVoiceMeta.analysis.warning_codes?.includes("noise_heavy")
+                          ? "Use a quieter recording if available."
+                          : uploadedVoiceMeta.analysis.warning_codes?.includes("silence_heavy")
+                            ? "Trim long pauses if available."
+                            : uploadedVoiceMeta.analysis.warning_codes?.includes("short")
+                              ? "Use a longer sample if available."
+                              : uploadedVoiceMeta.analysis.warning_codes?.includes("quiet")
+                                ? "Use a louder source if available."
+                                : "Decoded signal is ready for conditioning."}
+                    </span>
+                  </div>
+                  <details>
+                    <summary>Measured signal facts</summary>
+                    <div className="reference-signal-facts mono">
+                      <span>
+                        usable {fmt(uploadedVoiceMeta.analysis.usable_duration_seconds, 1)} s
+                      </span>
+                      <span>
+                        voiced {fmt(uploadedVoiceMeta.analysis.voiced_duration_seconds, 1)} s
+                      </span>
+                      <span>
+                        lead {fmt(uploadedVoiceMeta.analysis.leading_silence_seconds, 1)} s
+                      </span>
+                      <span>
+                        trail {fmt(uploadedVoiceMeta.analysis.trailing_silence_seconds, 1)} s
+                      </span>
+                      <span>silence {fmt(uploadedVoiceMeta.analysis.silence_ratio * 100, 0)}%</span>
+                      <span>RMS {fmt(uploadedVoiceMeta.analysis.rms, 3)}</span>
+                      <span>
+                        loudness {fmt(uploadedVoiceMeta.analysis.loudness_dbfs, 1)} dBFS
+                      </span>
+                      <span>peak {fmt(uploadedVoiceMeta.analysis.peak, 3)}</span>
+                      <span>clipped {fmt(uploadedVoiceMeta.analysis.clipped_ratio * 100, 2)}%</span>
+                      <span>noise estimate {fmt(uploadedVoiceMeta.analysis.noise_ratio * 100, 0)}%</span>
+                      {uploadedVoiceMeta.selection && (
+                        <span>
+                          {uploadedVoiceMeta.selection.mode === "representative" &&
+                          uploadedVoiceMeta.selection.fallback_reason == null
+                            ? `representative interval ${fmt(
+                                uploadedVoiceMeta.selection.start_seconds,
+                                2,
+                              )} to ${fmt(
+                                uploadedVoiceMeta.selection.end_seconds,
+                                2,
+                              )} s`
+                            : `tail fallback${
+                                uploadedVoiceMeta.selection.fallback_reason
+                                  ? ` (${uploadedVoiceMeta.selection.fallback_reason.replaceAll("_", " ")})`
+                                  : ""
+                              }; representative interval unavailable`}
+                        </span>
+                      )}
+                    </div>
+                    <p>
+                      {uploadedVoiceMeta.selection?.mode === "representative" &&
+                      uploadedVoiceMeta.selection?.fallback_reason == null
+                        ? "Tail preview uses the clip end; Representative preview and the live clone use the selected interval. Selection does not measure identity confidence or verify that only one speaker is present."
+                        : "Representative preview is unavailable. Tail preview and the live clone use the deterministic clip-end window."}
+                    </p>
+                  </details>
+                </div>
+              )}
+              {uploadedVoiceFilename && (
                 <div className="clone-strength">
                   <div className="clone-strength-row">
                     <span className="l" style={{ display: "inline-flex", alignItems: "center" }}>
-                      Clone strength
+                      Conditioning window
                       <Info k="cloneStrength" />
                     </span>
                     <span className="v mono">{cloneStrength}%</span>
@@ -4797,13 +5153,15 @@ function App() {
                     max={100}
                     step={5}
                     value={cloneStrength}
-                    aria-label="Clone strength"
+                    aria-label="Reference window used for conditioning"
                     onChange={(event) => {
                       setCloneStrength(Number(event.target.value));
                       setSessionProfileId("custom");
                     }}
                   />
-                  <div className="clone-strength-hint">How strongly the reference clip conditions timbre</div>
+                  <div className="clone-strength-hint">
+                    Reference-window length; higher values replay more of the clip.
+                  </div>
                 </div>
               )}
             </div>
@@ -5528,6 +5886,7 @@ function App() {
                   </RailColumn>
                   <RailColumn title="TURN" aggregate={`${maxTurn} tok · pad ${fmt(padBonus, 1)}`}>
                     <MiniSlider label="Padding bonus" info="padBonus" value={padBonus} onChange={(value) => { setPadBonus(value); setSessionProfileId("custom"); }} onCommit={guardedTuningCommit("padBonus", setPadBonus, (v) => ({ padding_bonus: Number(v) }))} min={tuningRanges.padBonus.min} max={tuningRanges.padBonus.max} step={tuningRanges.padBonus.step} format={(v) => fmt(v, 1)} />
+                    <MiniSlider label="Onset bias" info="turnOnsetBias" value={turnOnsetBias} onChange={(value) => { setTurnOnsetBias(value); setSessionProfileId("custom"); }} onCommit={guardedTuningCommit("turnOnsetBias", setTurnOnsetBias, (v) => ({ turn_onset_bias: Number(v) }))} min={tuningRanges.turnOnsetBias.min} max={tuningRanges.turnOnsetBias.max} step={tuningRanges.turnOnsetBias.step} format={(v) => fmt(v, 1)} />
                     <MiniSlider label="Max length" info="maxTurn" value={maxTurn} onChange={(value) => { setMaxTurn(value); setSessionProfileId("custom"); }} onCommit={guardedTuningCommit("maxTurn", setMaxTurn, (v) => ({ max_turn_text_tokens: Number.parseInt(v, 10) }))} min={tuningRanges.maxTurn.min} max={tuningRanges.maxTurn.max} step={tuningRanges.maxTurn.step} format={(v) => `${v}`} />
                   </RailColumn>
                   <RailColumn title="CONTEXT" aggregate={visionOn || reinforceInSilences ? (injectStat.idleRms != null ? `live ${fmt(injectStat.idleRms, 3)} · ${injectStat.streak ?? 0}f` : `${fmt(injectSilenceRms, 3)} · ${injectSilenceStreak}f`) : "inactive"}>

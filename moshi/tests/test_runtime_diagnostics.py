@@ -8,27 +8,40 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 import re
+import subprocess
 import sys
+import tempfile
 import threading
 import time
+import types
 from collections import deque
+from pathlib import Path
+from unittest.mock import patch
 
-import torch
 import numpy as np
+import torch
 
 sys.path.insert(0, "moshi")
 
-from moshi.server import (  # noqa: E402
+from moshi.runtime_metrics import FrameLifecycle, RuntimeMetrics
+from moshi.server import (
     BASE_HF_REPO,
     GEMINI_VISION_MODEL,
     RL_HF_REPO,
     STOP_LATCH_MAX_HOLD_SEC,
     ServerState,
     SnapshotDeferred,
+    _asr_model_files_sha256,
+    _AsrEngine,
     _derive_context_seal_token,
+    _handle_runtime_summary_request,
     _model_identity,
+    _prepare_runtime_metrics,
+    _resolve_server_build,
     _resolve_session_seed,
+    _voice_conditioning_sha256,
 )
 
 
@@ -89,7 +102,19 @@ def test_server_info_reports_active_vision_model() -> None:
     state.model_identity = _model_identity(RL_HF_REPO, "a" * 40)
     state.gpu_name = "test-gpu"
     state.vram_total = 24 * 1024**3
-    state.server_build = "test-build"
+    state.driver_version = "590.48"
+    state.torch_version = "2.9.0"
+    state.cuda_version = "13.0"
+    state.server_build = "c" * 40
+    state.asr_model_sha256 = "d" * 64
+    state.process_flags = {
+        "caption_cfg": False,
+        "cpu_offload": False,
+        "kv_sink_frames": 0,
+        "periodic_snapshots": False,
+        "asr_available": False,
+        "voice_picker_available": True,
+    }
     state._gemini_api_key = "configured"
 
     response = asyncio.run(state.handle_server_info(None))
@@ -97,6 +122,395 @@ def test_server_info_reports_active_vision_model() -> None:
 
     assert payload["vision_available"] is True
     assert payload["vision_model"] == GEMINI_VISION_MODEL
+    assert payload["asr_model_sha256"] == "d" * 64
+    assert payload["process_flags"]["cpu_offload"] is False
+
+
+def test_voice_conditioning_identity_tracks_assets_and_controls() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        primary = root / "primary.pt"
+        secondary = root / "secondary.pt"
+        primary.write_bytes(b"primary-v1")
+        secondary.write_bytes(b"secondary")
+
+        legacy = _voice_conditioning_sha256(
+            str(primary),
+            None,
+            blend_active=False,
+            voice_blend_mix=0.0,
+            clone_strength=1.0,
+            uploaded_primary=False,
+            voice_picker_available=False,
+        )
+        primary.write_bytes(b"primary-v2")
+        changed = _voice_conditioning_sha256(
+            str(primary),
+            None,
+            blend_active=False,
+            voice_blend_mix=0.0,
+            clone_strength=1.0,
+            uploaded_primary=False,
+            voice_picker_available=False,
+        )
+        assert changed != legacy
+
+        primary.with_suffix(".safetensors").write_bytes(b"state-v1")
+        primary.with_suffix(".json").write_text(
+            '{"schema": 1}',
+            encoding="utf-8",
+        )
+        full_state = _voice_conditioning_sha256(
+            str(primary),
+            None,
+            blend_active=False,
+            voice_blend_mix=0.0,
+            clone_strength=1.0,
+            uploaded_primary=False,
+            voice_picker_available=False,
+        )
+        primary.write_bytes(b"ignored-legacy-payload")
+        assert (
+            _voice_conditioning_sha256(
+                str(primary),
+                None,
+                blend_active=False,
+                voice_blend_mix=0.0,
+                clone_strength=1.0,
+                uploaded_primary=False,
+                voice_picker_available=False,
+            )
+            == full_state
+        )
+        primary.with_suffix(".json").write_text(
+            '{"schema": 2}',
+            encoding="utf-8",
+        )
+        assert (
+            _voice_conditioning_sha256(
+                str(primary),
+                None,
+                blend_active=False,
+                voice_blend_mix=0.0,
+                clone_strength=1.0,
+                uploaded_primary=False,
+                voice_picker_available=False,
+            )
+            != full_state
+        )
+
+        blend = _voice_conditioning_sha256(
+            str(primary),
+            str(secondary),
+            blend_active=True,
+            voice_blend_mix=0.25,
+            clone_strength=1.0,
+            uploaded_primary=False,
+            voice_picker_available=False,
+        )
+        different_mix = _voice_conditioning_sha256(
+            str(primary),
+            str(secondary),
+            blend_active=True,
+            voice_blend_mix=0.5,
+            clone_strength=1.0,
+            uploaded_primary=False,
+            voice_picker_available=False,
+        )
+        assert different_mix != blend
+
+        upload = root / "upload.wav"
+        upload.write_bytes(b"uploaded-voice")
+        weak_clone = _voice_conditioning_sha256(
+            str(upload),
+            None,
+            blend_active=False,
+            voice_blend_mix=0.0,
+            clone_strength=0.5,
+            uploaded_primary=True,
+            voice_picker_available=False,
+        )
+        assert (
+            _voice_conditioning_sha256(
+                str(upload),
+                None,
+                blend_active=False,
+                voice_blend_mix=0.0,
+                clone_strength=0.75,
+                uploaded_primary=True,
+                voice_picker_available=False,
+            )
+            != weak_clone
+        )
+        selected_a = np.array([[0.1, 0.2]], dtype=np.float32)
+        selected_b = np.array([[0.1, 0.3]], dtype=np.float32)
+        selected_identity = _voice_conditioning_sha256(
+            str(upload),
+            None,
+            blend_active=False,
+            voice_blend_mix=0.0,
+            clone_strength=0.5,
+            uploaded_primary=True,
+            voice_picker_available=True,
+            selected_audio=selected_a,
+        )
+        assert (
+            _voice_conditioning_sha256(
+                str(upload),
+                None,
+                blend_active=False,
+                voice_blend_mix=0.0,
+                clone_strength=0.5,
+                uploaded_primary=True,
+                voice_picker_available=True,
+                selected_audio=selected_b,
+            )
+            != selected_identity
+        )
+        assert (
+            _voice_conditioning_sha256(
+                str(upload),
+                None,
+                blend_active=False,
+                voice_blend_mix=0.0,
+                clone_strength=0.5,
+                uploaded_primary=True,
+                voice_picker_available=True,
+            )
+            != weak_clone
+        )
+
+
+def test_asr_identity_tracks_resolved_model_content_not_path() -> None:
+    def write_model(root: Path, model_bytes: bytes) -> None:
+        root.mkdir()
+        (root / "config.json").write_text(
+            '{"model":"whisper"}',
+            encoding="utf-8",
+        )
+        (root / "model.bin").write_bytes(model_bytes)
+        (root / "tokenizer.json").write_text(
+            '{"tokenizer":"test"}',
+            encoding="utf-8",
+        )
+        (root / "ignored.txt").write_text("not loaded", encoding="utf-8")
+
+    with tempfile.TemporaryDirectory() as raw:
+        base = Path(raw)
+        first = base / "first"
+        second = base / "second"
+        write_model(first, b"same-model")
+        write_model(second, b"same-model")
+
+        first_digest = _asr_model_files_sha256(str(first))
+        assert _asr_model_files_sha256(str(second)) == first_digest
+
+        (second / "ignored.txt").write_text("changed", encoding="utf-8")
+        assert _asr_model_files_sha256(str(second)) == first_digest
+
+        (second / "model.bin").write_bytes(b"different-model")
+        assert _asr_model_files_sha256(str(second)) != first_digest
+
+
+def test_asr_load_resolves_label_and_uses_content_identity() -> None:
+    class _WhisperModel:
+        loaded_paths: tuple[str, ...] = ()
+
+        def __init__(self, model_path: str, **_kwargs) -> None:
+            self.__class__.loaded_paths += (model_path,)
+
+    with tempfile.TemporaryDirectory() as raw:
+        first_root = Path(raw) / "snapshot-a"
+        second_root = Path(raw) / "snapshot-b"
+        for root, payload in (
+            (first_root, b"resolved-model-a"),
+            (second_root, b"resolved-model-b"),
+        ):
+            root.mkdir()
+            (root / "config.json").write_text("{}", encoding="utf-8")
+            (root / "model.bin").write_bytes(payload)
+        requested: list[str] = []
+        resolved_paths = iter((str(first_root), str(second_root)))
+
+        package = types.ModuleType("faster_whisper")
+        package.__path__ = []
+        package.WhisperModel = _WhisperModel
+        utils = types.ModuleType("faster_whisper.utils")
+
+        def download_model(model_id: str) -> str:
+            requested.append(model_id)
+            return next(resolved_paths)
+
+        utils.download_model = download_model
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "faster_whisper": package,
+                    "faster_whisper.utils": utils,
+                },
+            ),
+            patch("moshi.server.logger.info") as info_log,
+        ):
+            first_engine = _AsrEngine.load(
+                "private-selector-sentinel",
+                torch.device("cpu"),
+                src_rate=16_000,
+            )
+            second_engine = _AsrEngine.load(
+                "private-selector-sentinel",
+                torch.device("cpu"),
+                src_rate=16_000,
+            )
+
+        assert first_engine is not None
+        assert second_engine is not None
+        assert requested == [
+            "private-selector-sentinel",
+            "private-selector-sentinel",
+        ]
+        assert _WhisperModel.loaded_paths == (
+            str(first_root),
+            str(second_root),
+        )
+        assert first_engine.model_sha256 == _asr_model_files_sha256(
+            str(first_root)
+        )
+        assert second_engine.model_sha256 == _asr_model_files_sha256(
+            str(second_root)
+        )
+        assert first_engine.model_sha256 != second_engine.model_sha256
+        first_engine.shutdown()
+        second_engine.shutdown()
+        success_log_calls = repr(info_log.call_args_list)
+        assert "private-selector-sentinel" not in success_log_calls
+        assert str(first_root) not in success_log_calls
+        assert str(second_root) not in success_log_calls
+
+        class _FailingWhisperModel:
+            def __init__(self, model_path: str, **_kwargs) -> None:
+                raise RuntimeError(f"cannot load {model_path}")
+
+        package.WhisperModel = _FailingWhisperModel
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "faster_whisper": package,
+                    "faster_whisper.utils": utils,
+                },
+            ),
+            patch("moshi.server.logger.warning") as warning_log,
+        ):
+            assert (
+                _AsrEngine.load(
+                    str(first_root),
+                    torch.device("cpu"),
+                    src_rate=16_000,
+                )
+                is None
+            )
+        failure_log_calls = repr(warning_log.call_args_list)
+        assert "stage=%s error_type=%s" in failure_log_calls
+        assert "backend_load" in failure_log_calls
+        assert "RuntimeError" in failure_log_calls
+        assert str(first_root) not in failure_log_calls
+
+
+def test_server_build_is_immutable_or_exactly_unknown() -> None:
+    for value in ("dev", "abc1234", "v1.2.3", "unknown"):
+        with patch.dict(os.environ, {"SERVER_BUILD": value}, clear=False):
+            assert _resolve_server_build() == "unknown"
+
+    with patch.dict(os.environ, {"SERVER_BUILD": "A" * 40}, clear=False):
+        assert _resolve_server_build() == "a" * 40
+    with patch.dict(
+        os.environ,
+        {"SERVER_BUILD": f"sha256:{'B' * 64}"},
+        clear=False,
+    ):
+        assert _resolve_server_build() == f"sha256:{'b' * 64}"
+
+    clean = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+    revision = subprocess.CompletedProcess(
+        [],
+        0,
+        stdout=f"{'d' * 40}\n",
+        stderr="",
+    )
+    with patch.dict(os.environ, {}, clear=True):
+        with patch(
+            "moshi.server.subprocess.run",
+            side_effect=[clean, revision],
+        ):
+            assert _resolve_server_build() == "d" * 40
+
+        dirty = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=" M moshi/moshi/server.py\n",
+            stderr="",
+        )
+        with patch("moshi.server.subprocess.run", return_value=dirty):
+            assert _resolve_server_build() == "unknown"
+
+        with patch(
+            "moshi.server.subprocess.run",
+            side_effect=OSError("git unavailable"),
+        ):
+            assert _resolve_server_build() == "unknown"
+
+
+def test_runtime_summary_request_is_inference_free_and_validated() -> None:
+    class _Session:
+        def __init__(self) -> None:
+            self.sent = []
+
+        def send_runtime_summary(self, summary, *, request_id) -> None:
+            self.sent.append((request_id, summary))
+
+    metrics = RuntimeMetrics()
+    session = _Session()
+    assert _handle_runtime_summary_request(
+        session,
+        metrics,
+        {"type": "runtime_summary_request", "request_id": 7},
+    )
+    assert session.sent == [(7, metrics.snapshot())]
+    for request_id in (True, -1, 1.5, "7", None):
+        assert not _handle_runtime_summary_request(
+            session,
+            metrics,
+            {
+                "type": "runtime_summary_request",
+                "request_id": request_id,
+            },
+        )
+    assert len(session.sent) == 1
+
+
+def test_fresh_session_resets_metrics_but_resume_preserves_them() -> None:
+    lifecycle = FrameLifecycle(
+        pcm_arrival_at=1.0,
+        frame_ready_at=1.01,
+        executor_submitted_at=1.02,
+        worker_entered_at=1.03,
+        worker_completed_at=1.04,
+        result_delivered_at=1.05,
+        output_enqueued_at=1.06,
+    )
+    metrics = RuntimeMetrics()
+    metrics.record_completed(lifecycle, output_enqueued=True)
+    before_fresh = metrics.snapshot()
+    _prepare_runtime_metrics(metrics, resuming=False)
+    after_fresh = metrics.snapshot()
+    assert after_fresh["generation"] == before_fresh["generation"] + 1
+    assert after_fresh["completed_frames"] == 0
+
+    metrics.record_completed(lifecycle, output_enqueued=True)
+    before_resume = metrics.snapshot()
+    _prepare_runtime_metrics(metrics, resuming=True)
+    assert metrics.snapshot() == before_resume
 
 
 def test_random_seed_resolves_to_a_replayable_value() -> None:
@@ -617,6 +1031,12 @@ if __name__ == "__main__":
         test_periodic_snapshots_default_off,
         test_model_identity_distinguishes_rl_base_and_custom,
         test_server_info_reports_active_vision_model,
+        test_voice_conditioning_identity_tracks_assets_and_controls,
+        test_asr_identity_tracks_resolved_model_content_not_path,
+        test_asr_load_resolves_label_and_uses_content_identity,
+        test_server_build_is_immutable_or_exactly_unknown,
+        test_runtime_summary_request_is_inference_free_and_validated,
+        test_fresh_session_resets_metrics_but_resume_preserves_them,
         test_random_seed_resolves_to_a_replayable_value,
         test_stale_baseline_is_not_an_auto_rewind_target,
         test_backpressure_status_names_active_inference_phase,

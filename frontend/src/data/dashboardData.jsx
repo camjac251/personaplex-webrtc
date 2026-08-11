@@ -172,6 +172,7 @@ export const DEFAULTS = {
   repPenalty: 1.0,
   repContext: 64,
   padBonus: 0,
+  turnOnsetBias: 0,
   maxTurn: 120,
   turnHandling: "native",
   injectSilenceRms: 0.01,
@@ -200,6 +201,7 @@ export const INFERENCE_RANGES = {
     repPenalty: { min: 1, max: 1.3, step: 0.05 },
     repContext: { min: 0, max: 128, step: 8, integer: true },
     padBonus: { min: 0, max: 1, step: 0.1 },
+    turnOnsetBias: { min: -1, max: 1, step: 0.1 },
     maxTurn: { min: 40, max: 240, step: 10, integer: true },
   },
   // Expert bounds mirror the server clamps in moshi/rtc_session.py; a wider
@@ -215,6 +217,7 @@ export const INFERENCE_RANGES = {
     repPenalty: { min: 1, max: 1.5, step: 0.05 },
     repContext: { min: 0, max: 256, step: 8, integer: true },
     padBonus: { min: 0, max: 2, step: 0.1 },
+    turnOnsetBias: { min: -4, max: 4, step: 0.1 },
     maxTurn: { min: 40, max: 2000, step: 10, integer: true },
     injectSilenceRms: { min: 0.001, max: 0.02, step: 0.001 },
     injectSilenceStreak: { min: 4, max: 20, step: 1, integer: true },
@@ -471,9 +474,23 @@ export const PARAM_INFO = {
     title: "Padding bonus",
     body: (
       <>
-        Adds a logit boost to the silence/PAD token so the model yields sooner.
-        Default is <b>0</b> (off): the boost competes with the model starting
-        its reply, so it slows response onset and can cut replies short.
+        Adds a logit boost to the silence/PAD token while the model is
+        mid-turn, so a running reply wraps up sooner. Onset is untouched: the
+        boost never competes with the model starting its reply (use Turn
+        onset bias for that). Default is <b>0</b> (off); high values can cut
+        replies short.
+      </>
+    ),
+  },
+  turnOnsetBias: {
+    title: "Turn onset bias",
+    body: (
+      <>
+        Biases the end-of-padding token that marks the model starting to
+        speak. Negative values delay onset (more patient turn-taking);
+        positive values hasten it (more eager). Default is <b>0</b> (off).
+        Independent from Padding bonus, which only shortens a reply already
+        underway.
       </>
     ),
   },

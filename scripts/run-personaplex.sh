@@ -20,11 +20,28 @@ HEALTHY_RUN_SEC=300
 
 cd "$APP_DIR" || exit 1
 set -a
+# shellcheck disable=SC1091
 . ./.env
 set +a
 
+personaplex_configured_build="${SERVER_BUILD:-}"
+
 backoff=$BACKOFF_MIN_SEC
 while true; do
+  # Recompute a derived identity before each child launch. A long-running
+  # supervisor can outlive a checkout update between server restarts.
+  if [[ -n "$personaplex_configured_build" ]]; then
+    export SERVER_BUILD="$personaplex_configured_build"
+  else
+    personaplex_build="unknown"
+    if [[ -z "$(git status --porcelain --untracked-files=normal 2>/dev/null)" ]]; then
+      personaplex_revision="$(git rev-parse HEAD 2>/dev/null || true)"
+      if [[ "$personaplex_revision" =~ ^[0-9a-fA-F]{40,64}$ ]]; then
+        personaplex_build="${personaplex_revision,,}"
+      fi
+    fi
+    export SERVER_BUILD="$personaplex_build"
+  fi
   echo "[supervisor] starting moshi-server at $(date -u +%H:%M:%S)"
   started_at=$(date +%s)
   .venv/bin/moshi-server --host 0.0.0.0 --port "$PORT" \

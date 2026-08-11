@@ -128,7 +128,7 @@ def create_sinewave(duration: float, sample_rate: int) -> np.ndarray:
     return amplitude * np.sin(2 * np.pi * 440.0 * t).astype(np.float32)
 
 
-def trim_boundary_silence(
+def boundary_trim_bounds(
     wav: np.ndarray,
     sr: int,
     *,
@@ -136,10 +136,10 @@ def trim_boundary_silence(
     window_ms: float = 30.0,
     hop_ms: float = 20.0,
     guard_ms: float = 100.0,
-) -> np.ndarray:
-    """Trim contiguous near-silence from clip boundaries."""
+) -> tuple[int, int]:
+    """Return the exact conservative boundary interval used for conditioning."""
     if wav.shape[-1] == 0:
-        return wav
+        return 0, 0
 
     mono = wav.mean(axis=0) if wav.ndim == 2 else wav
     sample_count = mono.shape[-1]
@@ -157,7 +157,7 @@ def trim_boundary_silence(
     window_energy = cumulative[starts + window_samples] - cumulative[starts]
     active = np.sqrt(window_energy / window_samples) >= rms_threshold
     if not np.any(active):
-        return wav
+        return 0, sample_count
 
     active_starts = starts[active]
     guard_samples = max(0, round(sr * guard_ms / 1000.0))
@@ -167,7 +167,7 @@ def trim_boundary_silence(
         int(active_starts[-1]) + window_samples + guard_samples,
     )
     if trim_start == 0 and trim_end == sample_count:
-        return wav
+        return 0, sample_count
     # A uniformly quiet but valid clip can sit almost entirely under the
     # fixed RMS threshold; treating most of it as boundary silence would
     # gut the voice prompt. Keep the original when the trim result is both
@@ -183,8 +183,31 @@ def trim_boundary_silence(
             kept / sr,
             sample_count / sr,
         )
+        return 0, sample_count
+    return trim_start, trim_end
+
+
+def trim_boundary_silence(
+    wav: np.ndarray,
+    sr: int,
+    *,
+    rms_threshold: float = 0.002,
+    window_ms: float = 30.0,
+    hop_ms: float = 20.0,
+    guard_ms: float = 100.0,
+) -> np.ndarray:
+    """Trim contiguous near-silence from clip boundaries."""
+    start, end = boundary_trim_bounds(
+        wav,
+        sr,
+        rms_threshold=rms_threshold,
+        window_ms=window_ms,
+        hop_ms=hop_ms,
+        guard_ms=guard_ms,
+    )
+    if start == 0 and end == wav.shape[-1]:
         return wav
-    return wav[..., trim_start:trim_end]
+    return wav[..., start:end]
 
 
 def normalize_audio(wav: np.ndarray, sr: int, target_lufs: float) -> np.ndarray:
@@ -779,6 +802,7 @@ class LMGen(StreamingModule[_LMGenState]):
         repetition_penalty: float = 1.0,
         repetition_penalty_context: int = 64,
         padding_bonus: float = 0.0,
+        turn_onset_bias: float = 0.0,
         max_turn_text_tokens: int = 0,
         semantic_temperature_cap: float = DEFAULT_SEMANTIC_TEMPERATURE_CAP,
         caption_cfg: bool = False,
@@ -795,6 +819,7 @@ class LMGen(StreamingModule[_LMGenState]):
         self.repetition_penalty = repetition_penalty
         self.repetition_penalty_context = max(0, min(repetition_penalty_context, MAX_REPETITION_CONTEXT))
         self.padding_bonus = padding_bonus
+        self.turn_onset_bias = turn_onset_bias
         self.max_turn_text_tokens = max_turn_text_tokens
         self.semantic_temperature_cap = float(semantic_temperature_cap)
         # Min-p truncation for the text head only: keep tokens whose
@@ -819,6 +844,10 @@ class LMGen(StreamingModule[_LMGenState]):
         self._non_pad_streak = 0
         self._turn_pad_streak = 0
         self._pad_force_remaining = 0
+        # True from a forced-text frame until the next naturally sampled
+        # text token; holds the continuation-only padding bonus off while
+        # the frozen _non_pad_streak still reads positive.
+        self._forced_text_recent = False
         turn_cap_on_cuda = torch.device(self.lm_model.device).type == "cuda"
         self._turn_cap_token_host = torch.empty(
             1,
@@ -895,6 +924,10 @@ class LMGen(StreamingModule[_LMGenState]):
         # upload path reads this; the embeddings-replay and blend paths ignore
         # it. Set at connect time before priming, never live.
         self.voice_prompt_strength: float = 1.0
+        # Content-free, enrollment-time representative interval. It anchors
+        # the frame-aligned strength window; invalid or absent intervals
+        # deterministically keep the tail.
+        self.voice_selection_interval: Optional[tuple[int, int]] = None
         # Optional (mono_window, sample_rate) -> embedding callable for
         # best-of-N voice window selection (voice_select.select_voice_window).
         # None keeps the plain tail slice. Set once at server startup when
@@ -1130,15 +1163,16 @@ class LMGen(StreamingModule[_LMGenState]):
 
         # Shape of text_logits should be [B, K_text=1, T=1, Card_text].
         # text_logits may alias a CUDA-graph captured output buffer. Apply the
-        # repetition penalty first because it already returns a clone; only
-        # make a separate copy when padding bias is the sole mutation.
+        # repetition penalty first because it already returns a clone; the
+        # bias helper makes its own copy when a bias write would land on the
+        # still-aliased buffer.
         text_logits_f = text_logits.float()
         cfg_active = self.caption_cfg and text_logits_f.shape[0] == 2
         if cfg_active:
             # Guided text logits: the unconditional row plus cfg_gamma times
             # the context-conditioned delta. The single guided row is
             # penalized and sampled once below; the clone at gamma 1.0 keeps
-            # the padding-bonus write off the graph output buffer.
+            # the bias writes off the graph output buffer.
             gamma = float(self.cfg_gamma)
             cond = text_logits_f[0:1]
             if gamma == 1.0:
@@ -1148,16 +1182,7 @@ class LMGen(StreamingModule[_LMGenState]):
                 text_logits_f = uncond + gamma * (cond - uncond)
         if self.repetition_penalty > 1.0 and self.repetition_penalty_context > 0:
             text_logits_f = self._apply_text_repetition_penalty(text_logits_f)
-        elif (
-            self.padding_bonus != 0.0
-            and text_logits_f.data_ptr() == text_logits.data_ptr()
-        ):
-            text_logits_f = text_logits_f.clone()
-        # Bias the text padding token up to encourage the model to yield its
-        # turn. Moshi emits text_padding_token when it has nothing to say; a
-        # positive bonus shortens rambling. 0 = off, 2-4 typical.
-        if self.padding_bonus != 0.0:
-            text_logits_f[..., lm_model.text_padding_token_id] += self.padding_bonus
+        text_logits_f = self._apply_text_logit_biases(text_logits_f, text_logits)
         sampled_text_token = sample_token(
             text_logits_f,
             self.use_sampling,
@@ -1302,6 +1327,7 @@ class LMGen(StreamingModule[_LMGenState]):
         if raw_audio.ndim == 1:
             raw_audio = raw_audio[None, :]
         self.voice_prompt_audio = raw_audio
+        self.voice_selection_interval = None
         self.voice_prompt_cache = None
         self.voice_prompt_embeddings = None
         self.voice_prompt_full_state = None
@@ -1317,7 +1343,7 @@ class LMGen(StreamingModule[_LMGenState]):
             # as well: the tensor restore copies via Tensor.copy_, which
             # broadcasts (1, ...) into (2, ...), priming both rows
             # identically.
-            logger.info("loading full streaming state from %s", state_path)
+            logger.info("loading voice prompt state kind=full")
             full_state = load_streaming_state(state_path, meta_path, device=self.lm_model.device)
             self._migrate_legacy_full_state(full_state)
             # Stash the dict; _step_voice_prompt_core applies it during
@@ -1333,7 +1359,7 @@ class LMGen(StreamingModule[_LMGenState]):
             return
 
         # Fallback to legacy .pt loading (replay required)
-        logger.info("loading legacy voice prompt embeddings from %s", path)
+        logger.info("loading voice prompt state kind=legacy")
         data = torch.load(path, map_location="cpu", weights_only=True)
         self.voice_prompt_audio = None
         self.voice_prompt_embeddings = data["embeddings"].to(self.lm_model.device)
@@ -1378,7 +1404,10 @@ class LMGen(StreamingModule[_LMGenState]):
         form, which is a wholesale state overwrite and cannot be mixed.
         """
         data = torch.load(path, map_location="cpu", weights_only=True)
-        return data["embeddings"].to(self.lm_model.device)
+        embeddings = data.get("embeddings") if isinstance(data, dict) else None
+        if not isinstance(embeddings, torch.Tensor):
+            raise ValueError("voice blend requires a legacy embedding payload")
+        return embeddings.to(self.lm_model.device)
 
     def load_voice_prompt_blend(self, path_a: str, path_b: str, mix: float):
         """Condition on a frame-aligned mix of two voices' per-frame embeddings.
@@ -1467,6 +1496,43 @@ class LMGen(StreamingModule[_LMGenState]):
             self.repetition_penalty,
         )
 
+    def _apply_text_logit_biases(
+        self, text_logits_f: torch.Tensor, source_logits: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply the continuation-only padding bonus and the onset bias.
+
+        padding_bonus lifts PAD only mid-turn: ungated it outbids EPAD at
+        the moment speech would start, so it waits for the previous frame's
+        accounting to show natural text underway (``_non_pad_streak > 0``,
+        the one-frame lag accepted for max_turn_text_tokens). Forced-text
+        windows freeze that streak, so ``_forced_text_recent`` holds the
+        bonus off until a natural text token is sampled again: the reply
+        after a caption drip is an onset, not a continuation. The
+        accounting zeroes the streak whenever ``max_turn_text_tokens <= 0``,
+        keeping those server-constructed configs ungated. turn_onset_bias
+        adds to the EPAD logit: negative delays speech onset, positive
+        hastens it. ``source_logits`` is the model's own output; the clone
+        keeps in-place writes off a still-aliased CUDA-graph buffer, and a
+        frame with no bias write allocates nothing.
+        """
+        padding_bonus_active = self.padding_bonus != 0.0 and (
+            self.max_turn_text_tokens <= 0
+            or (self._non_pad_streak > 0 and not self._forced_text_recent)
+        )
+        if not padding_bonus_active and self.turn_onset_bias == 0.0:
+            return text_logits_f
+        if text_logits_f.data_ptr() == source_logits.data_ptr():
+            text_logits_f = text_logits_f.clone()
+        if padding_bonus_active:
+            text_logits_f[..., self.lm_model.text_padding_token_id] += (
+                self.padding_bonus
+            )
+        if self.turn_onset_bias != 0.0:
+            text_logits_f[..., self.lm_model.end_of_text_padding_id] += (
+                self.turn_onset_bias
+            )
+        return text_logits_f
+
     def _consume_forced_pad(
         self,
         next_text_token: torch.Tensor,
@@ -1532,6 +1598,7 @@ class LMGen(StreamingModule[_LMGenState]):
         self._non_pad_streak = 0
         self._turn_pad_streak = 0
         self._pad_force_remaining = 0
+        self._forced_text_recent = False
         self._turn_cap_token_pending = False
         self._turn_cap_token_recorded = False
 
@@ -1545,6 +1612,10 @@ class LMGen(StreamingModule[_LMGenState]):
     ) -> None:
         """Count text across brief pauses, resetting at a real turn break."""
         if text_was_forced:
+            # The freeze keeps the cap count across the window; the flag
+            # keeps the frozen streak from reading as text underway to the
+            # padding-bonus gate until natural text resumes.
+            self._forced_text_recent = True
             return
         if turn_pad_forced:
             self._non_pad_streak = 0
@@ -1562,6 +1633,7 @@ class LMGen(StreamingModule[_LMGenState]):
             return
         self._turn_pad_streak = 0
         self._non_pad_streak += 1
+        self._forced_text_recent = False
         if self._non_pad_streak >= self.max_turn_text_tokens:
             self._pad_force_remaining = REPETITION_TURN_BREAK_FRAMES
             self._non_pad_streak = 0
@@ -1609,6 +1681,43 @@ class LMGen(StreamingModule[_LMGenState]):
         self._audio_top_k.fill_(top_k)
         return top_k_changed
 
+    def _strength_voice_prompt_bounds(self) -> tuple[int, int]:
+        """Return the frame-aligned conditioning interval for current controls."""
+        audio = self.voice_prompt_audio
+        strength = max(0.0, min(1.0, self.voice_prompt_strength))
+        total_samples = audio.shape[-1]
+        if strength >= 1.0:
+            return 0, total_samples
+        total_frames = -(-total_samples // self._frame_size)
+        keep_frames = round(total_frames * strength)
+        if keep_frames <= 0:
+            return 0, 0
+        keep_samples = min(total_samples, keep_frames * self._frame_size)
+        interval = getattr(self, "voice_selection_interval", None)
+        if interval is not None and keep_samples < total_samples:
+            anchor_start, anchor_end = interval
+            if (
+                0 <= anchor_start < anchor_end <= total_samples
+                and anchor_start % self._frame_size == 0
+            ):
+                center = (anchor_start + anchor_end) // 2
+                start = ((center - keep_samples // 2) // self._frame_size) * self._frame_size
+                start = max(0, min(start, total_samples - keep_samples))
+                start = (start // self._frame_size) * self._frame_size
+                return start, start + keep_samples
+        if self.voice_window_embedder is None or keep_samples >= total_samples:
+            aligned_end = (total_samples // self._frame_size) * self._frame_size
+            if aligned_end >= keep_samples:
+                return aligned_end - keep_samples, aligned_end
+            return 0, total_samples
+        start = select_voice_window(
+            audio[0],
+            self._sample_rate,
+            keep_samples,
+            self.voice_window_embedder,
+        )
+        return start, start + keep_samples
+
     def _strength_sliced_voice_prompt_audio(self):
         """Window of the uploaded clip selected by voice_prompt_strength.
 
@@ -1622,25 +1731,10 @@ class LMGen(StreamingModule[_LMGenState]):
         Returns the slice as a (C, T') array on the same axis layout the
         encoder iterator expects.
         """
-        audio = self.voice_prompt_audio
-        strength = max(0.0, min(1.0, self.voice_prompt_strength))
-        if strength >= 1.0:
-            return audio
-        total_samples = audio.shape[-1]
-        total_frames = -(-total_samples // self._frame_size)  # ceil
-        keep_frames = round(total_frames * strength)
-        if keep_frames <= 0:
-            return audio[:, :0]
-        keep_samples = min(total_samples, keep_frames * self._frame_size)
-        if self.voice_window_embedder is None or keep_samples >= total_samples:
-            return audio[:, -keep_samples:]
-        start = select_voice_window(
-            audio[0],
-            self._sample_rate,
-            keep_samples,
-            self.voice_window_embedder,
-        )
-        return audio[:, start : start + keep_samples]
+        start, end = self._strength_voice_prompt_bounds()
+        if start == 0 and end == self.voice_prompt_audio.shape[-1]:
+            return self.voice_prompt_audio
+        return self.voice_prompt_audio[:, start:end]
 
     def _encode_voice_prompt_frames(self, mimi):
         return encode_from_sphn(

@@ -19,11 +19,14 @@ import argparse
 import asyncio
 import datetime as dt
 import fractions
+import hashlib
 import json
 import math
+import re
+import secrets
 import sys
 import time
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Any, Optional
 
@@ -41,14 +44,13 @@ from aiortc.sdp import candidate_from_sdp, candidate_to_sdp
 from av import AudioFrame
 from av.audio.resampler import AudioResampler
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNNER_PATH = Path(__file__).resolve()
 ANALYZER_PATH = REPO_ROOT / "moshi" / "tests" / "duplex_harness.py"
 sys.path.insert(0, str(REPO_ROOT / "moshi" / "tests"))
 sys.path.insert(0, str(REPO_ROOT / "moshi"))
 
-from duplex_harness import (  # noqa: E402
+from duplex_harness import (
     FRAME_MS,
     FRAME_SAMPLES,
     WEBRTC_SAMPLE_RATE,
@@ -61,8 +63,11 @@ from duplex_harness import (  # noqa: E402
     sha256_file,
     write_artifacts,
 )
-from moshi.rtc_session import SessionConfig, parse_session_config  # noqa: E402
-
+from moshi.rtc_session import SessionConfig, parse_session_config
+from moshi.runtime_metrics import (
+    LIFECYCLE_METRICS,
+    numeric_summary_tree,
+)
 
 STUN_FALLBACK = [
     {
@@ -78,6 +83,9 @@ DEFAULT_REGRESSION_PROMPT = (
     "keep turns short unless there is something worth unpacking."
 )
 APPLIED_CONFIG_KEYS = (
+    "voice_blend_mix",
+    "clone_strength",
+    "vision_prompt_replace",
     "reinforce_in_silences",
     "vision_in_transcript",
     "vision_feed_model",
@@ -86,13 +94,20 @@ APPLIED_CONFIG_KEYS = (
     "text_temperature",
     "audio_temperature",
     "text_topk",
+    "text_min_p",
+    "semantic_temp_cap",
     "audio_topk",
     "repetition_penalty",
     "repetition_penalty_context",
     "padding_bonus",
+    "turn_onset_bias",
     "max_turn_text_tokens",
+    "session_timeout_sec",
+    "vision_cost_limit_usd",
+    "vision_cost_per_call_usd",
     "inject_silence_rms",
     "inject_silence_streak",
+    "caption_cfg_gamma",
 )
 OPERATIONAL_EVENT_TYPES = {
     "action_cancelled",
@@ -116,6 +131,41 @@ STAT_COUNTER_FIELDS = (
     "outbound_flush_events",
     "outbound_flushed_ms",
 )
+PROCESS_IDENTITY_KEYS = (
+    "server_build",
+    "model_repo",
+    "model_revision",
+    "gpu_name",
+    "vram_total",
+    "driver_version",
+    "torch_version",
+    "cuda_version",
+    "asr_model_sha256",
+    "vision_model",
+    "process_flags",
+)
+REQUIRED_PROCESS_FLAGS = {
+    "caption_cfg": bool,
+    "cpu_offload": bool,
+    "kv_sink_frames": int,
+    "periodic_snapshots": bool,
+    "asr_available": bool,
+    "voice_picker_available": bool,
+}
+IMMUTABLE_BUILD_RE = re.compile(
+    r"(?:[0-9a-f]{40,64}|sha256:[0-9a-f]{64})"
+)
+PRIVATE_CONFIG_FIELDS = {
+    "text_prompt",
+    "system_prompt",
+    "vision_prompt",
+    "voice_prompt",
+    "voice_prompt_b",
+}
+PUBLIC_CONFIG_FIELDS = {
+    field.name for field in fields(SessionConfig)
+} - PRIVATE_CONFIG_FIELDS
+RUNTIME_SUMMARY_TIMEOUT_SEC = 5.0
 
 
 class RunnerError(RuntimeError):
@@ -422,6 +472,282 @@ def _build_exact_config(
     return asdict(parsed)
 
 
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _voice_request_sha256(config: dict[str, Any]) -> str:
+    value = "\0".join(
+        (
+            str(config.get("voice_prompt") or ""),
+            str(config.get("voice_prompt_b") or ""),
+            f"{float(config.get('voice_blend_mix') or 0.0):.9g}",
+        )
+    )
+    return _sha256_text(value)
+
+
+def _redacted_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Remove content-bearing fields while retaining hashes and controls."""
+
+    redacted: dict[str, Any] = {}
+    for key in PUBLIC_CONFIG_FIELDS:
+        if key not in config:
+            continue
+        value = config.get(key)
+        if (
+            isinstance(value, (bool, int))
+            or value is None
+            or isinstance(value, float)
+            and math.isfinite(value)
+        ):
+            redacted[key] = value
+    for key in ("text_prompt", "system_prompt", "vision_prompt"):
+        value = config.get(key)
+        if isinstance(value, str):
+            redacted[f"{key}_sha256"] = _sha256_text(value)
+            redacted.setdefault(f"{key}_chars", len(value))
+    if "voice_prompt" in config or "voice_prompt_b" in config:
+        redacted["voice_request_sha256"] = _voice_request_sha256(config)
+    return redacted
+
+
+def _strict_equal(left: object, right: object) -> bool:
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            _strict_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _strict_equal(a, b) for a, b in zip(left, right)
+        )
+    return bool(left == right)
+
+
+def _safe_identity_payload(
+    payload: dict[str, Any],
+    *,
+    include_voice: bool = False,
+) -> dict[str, Any]:
+    """Whitelist process identity fields for default run metadata."""
+
+    safe: dict[str, Any] = {}
+    for key in PROCESS_IDENTITY_KEYS:
+        value = payload.get(key)
+        if key == "process_flags":
+            flags = value if isinstance(value, dict) else {}
+            safe[key] = {
+                name: (
+                    flags.get(name)
+                    if type(flags.get(name)) is expected_type
+                    and not (
+                        name == "kv_sink_frames"
+                        and flags.get(name, -1) < 0
+                    )
+                    else None
+                )
+                for name, expected_type in REQUIRED_PROCESS_FLAGS.items()
+            }
+            continue
+        if key == "vram_total":
+            safe[key] = (
+                value
+                if type(value) is int and value > 0
+                else 0
+            )
+            continue
+        if key == "server_build":
+            safe[key] = (
+                value.lower()
+                if isinstance(value, str)
+                and IMMUTABLE_BUILD_RE.fullmatch(value.lower())
+                else "unknown"
+            )
+            continue
+        if key == "model_revision":
+            safe[key] = (
+                value.lower()
+                if isinstance(value, str)
+                and re.fullmatch(r"[0-9a-fA-F]{40,64}", value)
+                else "unknown"
+            )
+            continue
+        if key == "asr_model_sha256":
+            safe[key] = (
+                value.lower()
+                if isinstance(value, str)
+                and re.fullmatch(r"[0-9a-fA-F]{64}", value)
+                else "unknown"
+            )
+            continue
+        safe[key] = (
+            f"sha256:{_sha256_text(value)}"
+            if isinstance(value, str) and value
+            else "unknown"
+        )
+    if include_voice:
+        for key in (
+            "voice_request_sha256",
+            "voice_conditioning_sha256",
+        ):
+            value = payload.get(key)
+            safe[key] = (
+                value.lower()
+                if isinstance(value, str)
+                and re.fullmatch(r"[0-9a-fA-F]{64}", value)
+                else "unknown"
+            )
+    return safe
+
+
+def _identity_failures(
+    server_info: dict[str, Any],
+    ready: dict[str, Any],
+    *,
+    expected_voice_sha256: str,
+) -> list[str]:
+    failures = []
+    for key in PROCESS_IDENTITY_KEYS:
+        server_value = server_info.get(key)
+        ready_value = ready.get(key)
+        if (
+            server_value is None
+            or server_value == ""
+            or server_value == "unknown"
+        ):
+            failures.append(f"server identity {key!r} is missing or unknown")
+        if not _strict_equal(server_value, ready_value):
+            failures.append(
+                f"ready identity {key!r} does not match /api/info"
+            )
+    server_build = server_info.get("server_build")
+    if not isinstance(server_build, str) or not IMMUTABLE_BUILD_RE.fullmatch(
+        server_build.lower()
+    ):
+        failures.append("server build identity is not immutable")
+    model_revision = server_info.get("model_revision")
+    if not isinstance(model_revision, str) or not re.fullmatch(
+        r"[0-9a-fA-F]{40,64}",
+        model_revision,
+    ):
+        failures.append("model revision identity is not immutable")
+    asr_model_sha256 = server_info.get("asr_model_sha256")
+    if (
+        not isinstance(asr_model_sha256, str)
+        or not re.fullmatch(r"[0-9a-fA-F]{64}", asr_model_sha256)
+    ):
+        failures.append("ASR model identity is not immutable")
+    vision_model = server_info.get("vision_model")
+    if not isinstance(vision_model, str) or not vision_model.strip():
+        failures.append("vision model identity is missing")
+    vram_total = server_info.get("vram_total")
+    if type(vram_total) is not int or vram_total <= 0:
+        failures.append("server VRAM identity is invalid")
+    process_flags = server_info.get("process_flags")
+    if not isinstance(process_flags, dict) or set(process_flags) != set(
+        REQUIRED_PROCESS_FLAGS
+    ):
+        failures.append("server process flags do not match the P0 schema")
+    else:
+        for key, expected_type in REQUIRED_PROCESS_FLAGS.items():
+            if type(process_flags[key]) is not expected_type:
+                failures.append(
+                    f"server process flag {key!r} has the wrong type"
+                )
+        if (
+            type(process_flags.get("kv_sink_frames")) is int
+            and process_flags["kv_sink_frames"] < 0
+        ):
+            failures.append("server process flag 'kv_sink_frames' is negative")
+    if ready.get("voice_request_sha256") != expected_voice_sha256:
+        failures.append("ready voice request identity does not match config")
+    voice_conditioning_sha256 = ready.get(
+        "voice_conditioning_sha256"
+    )
+    if (
+        not isinstance(voice_conditioning_sha256, str)
+        or not re.fullmatch(
+            r"[0-9a-fA-F]{64}",
+            voice_conditioning_sha256,
+        )
+    ):
+        failures.append("ready voice conditioning identity is invalid")
+    return failures
+
+
+def _build_run_metadata(
+    *,
+    run_started_at: str,
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    input_wav: Path,
+    input_duration: float,
+    exact_config: dict[str, Any],
+    applied_config: dict[str, Any],
+    applied_config_source: str | None,
+    server_info: dict[str, Any],
+    ready_payload: dict[str, Any],
+    vad: VadConfig,
+    include_sensitive_connection_metadata: bool,
+    base_url: str,
+    session_id: str | None,
+) -> dict[str, Any]:
+    """Build the redacted default metadata sidecar for a private replay."""
+
+    manifest_id = str(manifest["id"])
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", manifest_id):
+        manifest_id = f"sha256:{_sha256_text(manifest_id)}"
+    safe_ready = _safe_identity_payload(
+        ready_payload,
+        include_voice=True,
+    )
+    metadata: dict[str, Any] = {
+        "schema_version": 2,
+        "started_at": run_started_at,
+        "artifact_sensitivity": (
+            "private_replay_bundle_with_connection_metadata"
+            if include_sensitive_connection_metadata
+            else "private_replay_bundle"
+        ),
+        "manifest_id": manifest_id,
+        "manifest_sha256": sha256_file(manifest_path),
+        "input_sha256": sha256_file(input_wav),
+        "input_duration_ms": round(input_duration * 1000.0, 1),
+        "voice_request_sha256": _voice_request_sha256(exact_config),
+        "voice_conditioning_sha256": safe_ready[
+            "voice_conditioning_sha256"
+        ],
+        "requested_config": _redacted_config(exact_config),
+        "applied_config": _redacted_config(applied_config),
+        "applied_config_source": (
+            applied_config_source
+            if applied_config_source in {"connect", "resume"}
+            else "unknown"
+        ),
+        "server_info": _safe_identity_payload(server_info),
+        "ready": safe_ready,
+        "vad": asdict(vad),
+        "tooling": {
+            "runner": {
+                "path": str(RUNNER_PATH.relative_to(REPO_ROOT)),
+                "sha256": sha256_file(RUNNER_PATH),
+            },
+            "analyzer": {
+                "path": str(ANALYZER_PATH.relative_to(REPO_ROOT)),
+                "sha256": sha256_file(ANALYZER_PATH),
+            },
+        },
+    }
+    if include_sensitive_connection_metadata:
+        metadata["sensitive_connection_metadata"] = {
+            "base_url": base_url,
+            "session_id": session_id,
+        }
+    return metadata
+
+
 def _validate_scenario_timeline(
     manifest: dict[str, Any], scenario_duration_ms: float
 ) -> None:
@@ -456,7 +782,10 @@ def _valid_stat_number(value: Any) -> bool:
     )
 
 
-def _runtime_metrics(events: list[dict[str, Any]]) -> dict[str, Any]:
+def _runtime_metrics(
+    events: list[dict[str, Any]],
+    runtime_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     stats = []
     for event in events:
         message = event.get("message", {})
@@ -481,6 +810,12 @@ def _runtime_metrics(events: list[dict[str, Any]]) -> dict[str, Any]:
             if event.get("direction") == "transport"
             and event.get("message", {}).get("type") == "connection_state"
         ],
+        "runtime_summary": (
+            runtime_summary
+            if runtime_summary is not None
+            and numeric_summary_tree(runtime_summary)
+            else None
+        ),
     }
     for field in STAT_COUNTER_FIELDS:
         values = [
@@ -500,6 +835,136 @@ def _runtime_metrics(events: list[dict[str, Any]]) -> dict[str, Any]:
         else:
             result[metric_name] = round(max(values), 1)
     return result
+
+
+def _runtime_summary_failures(
+    holder: dict[str, Any],
+) -> list[str]:
+    if holder.get("pre_request_count"):
+        return ["server returned a runtime_summary before it was requested"]
+    if holder.get("timed_out"):
+        return ["server did not return the final runtime_summary before timeout"]
+    if holder.get("received_count") != 1:
+        return ["server returned an unexpected number of runtime_summary messages"]
+    if holder.get("matching_count") != 1:
+        return ["server did not return exactly one matching runtime_summary"]
+    if holder.get("mismatched_count"):
+        return ["runtime_summary response request_id did not match"]
+    if holder.get("duplicate_count") or holder.get("late_count"):
+        return ["server returned a duplicate or late runtime_summary"]
+    if not holder.get("received"):
+        return ["server did not return the final runtime_summary"]
+    if holder.get("response_request_id") != holder.get("request_id"):
+        return ["runtime_summary response request_id did not match"]
+    summary = holder.get("summary")
+    if not isinstance(summary, dict) or not numeric_summary_tree(summary):
+        return ["runtime_summary was missing or contained non-numeric data"]
+    lifecycle = summary.get("lifecycle")
+    if not isinstance(lifecycle, dict) or set(lifecycle) != set(
+        LIFECYCLE_METRICS
+    ):
+        return ["runtime_summary omitted lifecycle distributions"]
+    completed = summary.get("completed_frames")
+    without_output = summary.get("frames_without_output")
+    if (
+        type(completed) is not int
+        or completed < 0
+        or type(without_output) is not int
+        or not 0 <= without_output <= completed
+    ):
+        return ["runtime_summary frame accounting was invalid"]
+    expected_output = completed - without_output
+    for name in LIFECYCLE_METRICS:
+        distribution = lifecycle.get(name)
+        if not isinstance(distribution, dict):
+            return ["runtime_summary lifecycle distribution was malformed"]
+        count = distribution.get("count")
+        expected = (
+            expected_output
+            if name in {"output_enqueue_ms", "server_pipeline_ms"}
+            else completed
+        )
+        if type(count) is not int or count != expected:
+            return ["runtime_summary lifecycle counts were inconsistent"]
+    return []
+
+
+def _new_runtime_summary_holder() -> dict[str, Any]:
+    return {
+        "received": False,
+        "received_count": 0,
+        "pre_request_count": 0,
+        "matching_count": 0,
+        "mismatched_count": 0,
+        "duplicate_count": 0,
+        "late_count": 0,
+        "timed_out": False,
+        "sealed": False,
+        "request_sent": False,
+        "request_id": secrets.randbelow(2**31 - 1) + 1,
+        "response_request_id": None,
+        "summary": None,
+    }
+
+
+def _record_runtime_summary_response(
+    holder: dict[str, Any],
+    message: dict[str, Any],
+) -> bool:
+    """Record at most one response after this run's final request."""
+
+    holder["received_count"] += 1
+    if not holder.get("request_sent"):
+        holder["pre_request_count"] += 1
+        return False
+    request_id = message.get("request_id")
+    if holder.get("sealed"):
+        holder["late_count"] += 1
+        return False
+    if (
+        isinstance(request_id, bool)
+        or not isinstance(request_id, int)
+        or request_id != holder.get("request_id")
+    ):
+        holder["mismatched_count"] += 1
+        return False
+    if holder.get("matching_count"):
+        holder["duplicate_count"] += 1
+        return False
+    holder["received"] = True
+    holder["matching_count"] = 1
+    holder["response_request_id"] = request_id
+    holder["summary"] = message.get("summary")
+    return True
+
+
+async def _request_final_runtime_summary(
+    control: Any,
+    recorder: EventRecorder,
+    holder: dict[str, Any],
+    ready: asyncio.Event,
+    *,
+    timeout: float = RUNTIME_SUMMARY_TIMEOUT_SEC,
+) -> None:
+    """Request, await, then seal one correlated end-of-run snapshot."""
+
+    request = {
+        "type": "runtime_summary_request",
+        "request_id": holder["request_id"],
+    }
+    recorder.record("out", request)
+    holder["request_sent"] = True
+    control.send(json.dumps(request))
+    try:
+        await asyncio.wait_for(ready.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        holder["timed_out"] = True
+        recorder.record(
+            "harness",
+            {"type": "runtime_summary_timeout"},
+        )
+    await asyncio.sleep(0)
+    holder["sealed"] = True
 
 
 def _queue_health_failures(
@@ -537,6 +1002,8 @@ def _config_values_match(expected: Any, observed: Any) -> bool:
             and not isinstance(observed, bool)
             and math.isclose(float(observed), expected, rel_tol=1e-6, abs_tol=1e-6)
         )
+    if type(expected) is int:
+        return type(observed) is int and observed == expected
     return observed == expected
 
 
@@ -564,8 +1031,7 @@ def _config_application_failures(
                 )
         elif not _config_values_match(expected, observed):
             failures.append(
-                f"config_applied mismatch for {key!r}: "
-                f"requested {expected!r}, observed {observed!r}"
+                f"config_applied mismatch for {key!r}"
             )
     return failures
 
@@ -747,6 +1213,7 @@ async def run_scenario(
     extra_config: dict[str, Any],
     ready_timeout: float,
     vad: VadConfig,
+    include_sensitive_connection_metadata: bool = False,
 ) -> tuple[dict[str, Any], Path]:
     manifest = load_manifest(manifest_path)
     input_samples, sample_rate = load_pcm16_wav(input_wav)
@@ -773,6 +1240,8 @@ async def run_scenario(
         ready_payload: dict[str, Any] = {}
         applied_config: dict[str, Any] = {}
         applied_config_source: Optional[str] = None
+        runtime_summary_holder = _new_runtime_summary_holder()
+        runtime_summary_ready = asyncio.Event()
         output_task: Optional[asyncio.Task] = None
         candidate_task: Optional[asyncio.Task] = None
         pending_candidates: list[Any] = []
@@ -848,6 +1317,12 @@ async def run_scenario(
                     applied_config.clear()
                     applied_config.update(config)
                     applied_config_source = str(source or "unknown")
+            elif message.get("type") == "runtime_summary":
+                if _record_runtime_summary_response(
+                    runtime_summary_holder,
+                    message,
+                ):
+                    runtime_summary_ready.set()
             elif message.get("type") in {"error", "end"}:
                 fatal.set()
 
@@ -942,6 +1417,12 @@ async def run_scenario(
                         )
             recorder.record("harness", {"type": "scenario_finished"})
             if control.readyState == "open":
+                await _request_final_runtime_summary(
+                    control,
+                    recorder,
+                    runtime_summary_holder,
+                    runtime_summary_ready,
+                )
                 goodbye = {"type": "goodbye"}
                 recorder.record("out", goodbye)
                 control.send(json.dumps(goodbye))
@@ -955,7 +1436,15 @@ async def run_scenario(
                 sample_rate=WEBRTC_SAMPLE_RATE,
                 vad=vad,
             )
-            runtime_metrics = _runtime_metrics(events)
+            runtime_summary = runtime_summary_holder.get("summary")
+            runtime_metrics = _runtime_metrics(
+                events,
+                runtime_summary=(
+                    runtime_summary
+                    if isinstance(runtime_summary, dict)
+                    else None
+                ),
+            )
             metrics["runtime"] = runtime_metrics
             operational_failures = list(metrics.pop("required_failures", []))
             operational_failures.extend(
@@ -965,6 +1454,16 @@ async def run_scenario(
             )
             operational_failures.extend(
                 _config_application_failures(exact_config, applied_config)
+            )
+            operational_failures.extend(
+                _identity_failures(
+                    server_info,
+                    ready_payload,
+                    expected_voice_sha256=_voice_request_sha256(exact_config),
+                )
+            )
+            operational_failures.extend(
+                _runtime_summary_failures(runtime_summary_holder)
             )
             if applied_config_source != "connect":
                 operational_failures.append(
@@ -990,38 +1489,31 @@ async def run_scenario(
             metrics["operational_failures"] = list(
                 dict.fromkeys(operational_failures)
             )
+            metrics["quality_complete"] = False
+            metrics["quality_failures"] = []
             metrics["failures"] = [
                 *metrics["operational_failures"],
                 *metrics.get("threshold_failures", []),
             ]
             metrics["passed"] = not metrics["failures"]
-            run_metadata = {
-                "schema_version": 1,
-                "started_at": run_started_at,
-                "base_url": base_url,
-                "session_id": session_id,
-                "manifest_path": str(manifest_path.resolve()),
-                "manifest_sha256": sha256_file(manifest_path),
-                "input_path": str(input_wav.resolve()),
-                "input_sha256": sha256_file(input_wav),
-                "input_duration_ms": round(input_duration * 1000.0, 1),
-                "requested_config": exact_config,
-                "applied_config": applied_config,
-                "applied_config_source": applied_config_source,
-                "server_info": server_info,
-                "ready": ready_payload,
-                "vad": asdict(vad),
-                "tooling": {
-                    "runner": {
-                        "path": str(RUNNER_PATH.relative_to(REPO_ROOT)),
-                        "sha256": sha256_file(RUNNER_PATH),
-                    },
-                    "analyzer": {
-                        "path": str(ANALYZER_PATH.relative_to(REPO_ROOT)),
-                        "sha256": sha256_file(ANALYZER_PATH),
-                    },
-                },
-            }
+            run_metadata = _build_run_metadata(
+                run_started_at=run_started_at,
+                manifest=manifest,
+                manifest_path=manifest_path,
+                input_wav=input_wav,
+                input_duration=input_duration,
+                exact_config=exact_config,
+                applied_config=applied_config,
+                applied_config_source=applied_config_source,
+                server_info=server_info,
+                ready_payload=ready_payload,
+                vad=vad,
+                include_sensitive_connection_metadata=(
+                    include_sensitive_connection_metadata
+                ),
+                base_url=base_url,
+                session_id=session_id,
+            )
             target = write_artifacts(
                 artifact_dir,
                 manifest=manifest,
@@ -1082,6 +1574,14 @@ def _parser() -> argparse.ArgumentParser:
             "server, config, action, and required-expectation failures remain fatal"
         ),
     )
+    parser.add_argument(
+        "--include-sensitive-connection-metadata",
+        action="store_true",
+        help=(
+            "Retain base URL and session id in run.json for trusted local "
+            "debugging; marks the private bundle accordingly"
+        ),
+    )
     return parser
 
 
@@ -1127,6 +1627,9 @@ async def _async_main(args: argparse.Namespace) -> int:
             extra_config=extra_config,
             ready_timeout=args.ready_timeout,
             vad=vad,
+            include_sensitive_connection_metadata=(
+                args.include_sensitive_connection_metadata
+            ),
         )
         exit_failure = _scenario_exit_failure(
             metrics, ignore_thresholds=args.no_fail_on_thresholds

@@ -81,6 +81,8 @@ If you deploy behind NAT and need STUN to discover a server-reflexive candidate,
 | `PERSONAPLEX_HF_REPO` | Custom model repository override (optional) |
 | `PERSONAPLEX_HF_REVISION` | Override the pinned model revision (optional; required with a custom repo) |
 | `PERSONAPLEX_PERIODIC_SNAPSHOTS` | `0` by default; set `1` to enable 60 s snapshot refreshes for long-session auto-rewind |
+| `PERSONAPLEX_VOICE_PICKER` | `0` by default; set `1` with the `voice-selection` extra to enable CPU-only representative-window selection |
+| `SERVER_BUILD` | Optional immutable deployment identity: a full 40-64 character commit digest or `sha256:<64 hex>`; invalid labels report as `unknown` |
 | `WEBRTC_STUN_URLS` | Optional comma-separated STUN URLs for NAT'd hosts; empty means fully direct |
 
 The launcher defaults to the pinned Seamless RL checkpoint. Set `PERSONAPLEX_MODEL=base` to roll back to the pinned NVIDIA base checkpoint. Both aliases select a matching immutable revision automatically, so restarting an unchanged environment cannot silently pick up different assets. A custom `PERSONAPLEX_HF_REPO` must be paired with `PERSONAPLEX_HF_REVISION`.
@@ -104,11 +106,29 @@ uv run python scripts/run_duplex_regression.py \
   moshi/tests/fixtures/duplex/turn_taking.json
 ```
 
-The runner uses the production WebRTC/DataChannel protocol and captures the actual remote audio. It scores pause takeover, turn latency, Stop acknowledgement and audible yield, cap events, clipping, repetition, text bursts, and RTF. Artifacts include both audio stems, raw control events, configuration, model revision, tool hashes, and metrics. Treat these developer artifacts as sensitive: unlike the dashboard's privacy-safe report, they can contain conversation audio and text, prompts and full config, the server URL and session ID, absolute local paths, and raw server/control metadata. Keep them on trusted storage and inspect/redact them before sharing.
+The runner uses the production WebRTC/DataChannel protocol and captures the actual remote audio. It scores pause takeover, turn latency, Stop acknowledgement and audible yield, cap events, clipping, repetition, text bursts, and RTF. The ignored replay bundle includes both audio stems and raw control events, so the directory remains private even though `run.json` replaces prompts, requested voice labels, resolved voice-conditioning assets, and free-form runtime identifiers with hashes. The default metadata also omits the server URL, session ID, network details, and absolute input paths. `--include-sensitive-connection-metadata` is a trusted-local-debug opt-in that retains the base URL and session ID and marks the bundle accordingly. Never share the raw replay directory without an explicit review/export step.
 
-Runtime metrics also retain input-queue depth/high-water/drop counters and output-buffer high-water/drop/flush counters from the server's periodic stat envelope. Any dropped inbound microphone audio is a hard run failure. Outbound backlog shedding is the intentional latency guard seen in normal GPU runs, so up to 200 ms is recorded without failing; more than 200 ms is a suppressible quality-threshold failure. Explicit output flushes are informational and never fail a run.
+Runtime metrics retain input-queue depth/high-water/drop counters and output-buffer high-water/drop/flush counters from the server's periodic stat envelope. Before teardown, the runner sends a uniquely correlated final `runtime_summary` request and accepts exactly one response received after that request. The bounded summary contains true PCM-arrival-to-output lifecycle distributions, including executor wait and worker time; outputless and teardown-cancelled model frames remain separately accountable. The older `rtf` field remains labeled as a sampled EMA. Any dropped inbound microphone audio is a hard run failure. Outbound backlog shedding is the intentional latency guard seen in normal GPU runs, so up to 200 ms is recorded without failing; more than 200 ms is a suppressible quality-threshold failure. Explicit output flushes are informational and never fail a run.
 
 `--no-fail-on-thresholds` is only for collecting results that exceed numeric quality limits. Missing required turns/events, config mismatches, absent RTF telemetry, failed actions, server errors, early disconnects, and signaling failures still produce a non-zero exit status.
+
+Compare two private bundles while enforcing a single changed identity field:
+
+```bash
+uv run python scripts/compare_duplex_runs.py \
+  --experimental-variable process_flags.kv_sink_frames \
+  artifacts/duplex/baseline artifacts/duplex/candidate
+```
+
+The comparison contains content-free numeric values and deltas, failure counts
+and digests, and hashed non-numeric experimental values. It rejects an unknown
+build identity or drift in the checkpoint, input, requested voice, resolved
+voice asset content, seed, complete applied configuration, tooling, GPU,
+vision model selection, resolved ASR model content, CPU offload, or any other
+undeclared process flag.
+A run pair remains `Inconclusive` until both metrics files explicitly set
+`quality_complete` to `true`, provide `quality_failures` lists, and contain the
+same numeric measurement paths.
 
 ## Voices
 
@@ -119,7 +139,32 @@ Pre-packaged voice embeddings:
 - **Variety (female)**: VARF0 through VARF4
 - **Variety (male)**: VARM0 through VARM4
 
-You can also upload 10-30 s of clean audio for any speaker via the **Clone a voice** panel. Mono or stereo, any common format. The model uses it as a voice prefix and continues in that timbre. Not zero-shot perfect, but recognisable.
+You can also upload up to 60 s of audio for a speaker via the **Clone a voice**
+panel. The server decodes and downmixes the reference, rejects only structural
+problems (undecodable, empty, non-finite, silent, unsupported-channel,
+oversized, or overlong), and reports quality concerns as overridable warnings.
+Conditioned Tail and Representative previews use the same fixed conditioning
+prompt, seed, sampling controls, clone strength, checkpoint, and reference.
+The representative interval is used only when selection completed without a
+fallback; otherwise both enrollment and the UI identify the deterministic tail
+fallback. This interval is a conditioning-window choice, not identity
+confidence or multi-speaker verification. Previews are ephemeral unless the
+request explicitly opts into retention, and **Remove clone** first deletes the
+clone's previews, then its enrollment artifacts. A failed deletion remains
+retryable. The browser stores only the validated opaque handle needed to keep
+that removal action available after reload; the source filename, decoded
+signal report, and live handle are excluded from exported config files.
+
+Representative selection is optional and CPU-only. Install it with
+`uv sync --extra voice-selection`, then set `PERSONAPLEX_VOICE_PICKER=1`.
+The WavLM model loads lazily only on the dedicated enrollment worker, is
+explicitly unloaded at shutdown, and never uses the PersonaPlex CUDA device.
+Without the extra or flag, enrollment and conditioning fall back
+deterministically to the frame-aligned tail window.
+
+These local previews validate the enrollment transaction, not spoken quality.
+Any claim about voice similarity or behavior on Spheron requires a separate,
+recorded target-GPU qualification run.
 
 ## Vision (optional)
 

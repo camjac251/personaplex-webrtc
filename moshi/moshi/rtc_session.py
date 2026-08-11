@@ -15,11 +15,12 @@ Text and control messages travel on a single bidirectional
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import Executor
 import fractions
 import json
 import math
+import time
 from collections import deque
+from concurrent.futures import Executor
 from dataclasses import dataclass
 from typing import AsyncIterator, Awaitable, Callable, Optional
 
@@ -38,7 +39,7 @@ from av.audio.frame import AudioFrame
 from av.audio.resampler import AudioResampler
 
 from .rtc_opus import encode_failure_total, install_mono_opus_encoder
-
+from .runtime_metrics import FrameLifecycle, RuntimeMetrics, numeric_summary_tree
 
 install_mono_opus_encoder()
 
@@ -463,6 +464,11 @@ PADDING_BONUS_MIN = 0.0
 # The bonus adds directly to the PAD logit every step, so 2.0 is already
 # a ~7x yield bias; larger values effectively mute response onset.
 PADDING_BONUS_MAX = 2.0
+# Additive logit bias on the EPAD onset marker: negative delays speech
+# onset (more patient), positive hastens it (more eager). 4.0 already
+# swings the onset odds ~55x, so wider values pin the behavior.
+TURN_ONSET_BIAS_MIN = -4.0
+TURN_ONSET_BIAS_MAX = 4.0
 # Keep the truncation circuit breaker meaningful for every user-supplied
 # configuration. Caps below the server's collapse-signal floor truncate
 # without feeding auto-rewind (see server.COLLAPSE_SIGNAL_MIN_TURN_TOKENS).
@@ -560,6 +566,15 @@ def clamp_repetition_penalty_context(value) -> int:
 
 def clamp_padding_bonus(value) -> float:
     return _clamp_float(value, PADDING_BONUS_MIN, PADDING_BONUS_MAX, "padding_bonus")
+
+
+def clamp_turn_onset_bias(value) -> float:
+    return _clamp_float(
+        value,
+        TURN_ONSET_BIAS_MIN,
+        TURN_ONSET_BIAS_MAX,
+        "turn_onset_bias",
+    )
 
 
 def clamp_text_min_p(value) -> float:
@@ -851,11 +866,16 @@ class SessionConfig:
     repetition_penalty: float = 1.0
     repetition_penalty_context: int = 64
     # Keep these aligned with the embedded client's advanced slider defaults.
-    # Padding bonus defaults off: it taxes response onset every frame (PAD
-    # competes directly with EPAD at the moment the model would start
-    # speaking) and truncates turns mid-thought. The max-turn cap remains a
-    # circuit breaker; repetition penalty is available as an opt-in fallback.
+    # Padding bonus defaults off and applies only mid-turn (the server's turn
+    # accounting shows text underway), so it shortens rambling without taxing
+    # response onset, where PAD competes directly with EPAD. The max-turn cap
+    # remains a circuit breaker; repetition penalty is available as an opt-in
+    # fallback.
     padding_bonus: float = 0.0
+    # Live-tunable additive bias on the EPAD onset logit: negative delays
+    # speech onset (more patient), positive hastens it (more eager). 0
+    # disables it.
+    turn_onset_bias: float = 0.0
     max_turn_text_tokens: int = 120
     # Session length cap in seconds; 0 disables the watchdog (no time bound).
     # The client sends minutes converted to seconds, so the server stores and
@@ -941,6 +961,9 @@ def parse_session_config(payload: dict) -> SessionConfig:
         padding_bonus=clamp_padding_bonus(
             payload.get("padding_bonus", defaults.padding_bonus)
         ),
+        turn_onset_bias=clamp_turn_onset_bias(
+            payload.get("turn_onset_bias", defaults.turn_onset_bias)
+        ),
         max_turn_text_tokens=clamp_max_turn_text_tokens(
             payload.get("max_turn_text_tokens", defaults.max_turn_text_tokens)
         ),
@@ -980,6 +1003,7 @@ class RTCSession:
         ice_servers: Optional[list[dict]] = None,
         backpressure_status: Optional[BackpressureStatusFn] = None,
         process_executor: Optional[Executor] = None,
+        runtime_metrics: RuntimeMetrics | None = None,
     ) -> None:
         """Create a peer-connection session.
 
@@ -995,6 +1019,8 @@ class RTCSession:
         self._log = log
         self._backpressure_status = backpressure_status
         self._process_executor = process_executor
+        self._runtime_metrics = runtime_metrics
+        self._monotonic = time.monotonic
 
         configured = list(ice_servers) if ice_servers else []
         self._pc = RTCPeerConnection(
@@ -1007,9 +1033,9 @@ class RTCSession:
 
         # Buffered queues. Match the existing 200 ms cap on inbound PCM
         # so GPU stalls shed stale mic audio rather than ballooning latency.
-        self._pcm_queue: asyncio.Queue[tuple[int, np.ndarray]] = asyncio.Queue(
-            maxsize=10
-        )
+        self._pcm_queue: asyncio.Queue[
+            tuple[int, np.ndarray, float]
+        ] = asyncio.Queue(maxsize=10)
         # Inbound audio is dropped silently until start_processing() runs.
         # Otherwise the warmup phase (~10 s for raw-audio voice prompts)
         # spams ~50 "pcm queue full" warnings per second while the model
@@ -1020,6 +1046,10 @@ class RTCSession:
         self._processing_paused = False
         self._pipeline_generation = 0
         self._pending_pcm: Optional[np.ndarray] = None
+        # Sample-count/timestamp provenance parallel to _pending_pcm. Keeping
+        # this metadata separate leaves the existing ndarray concatenation,
+        # slicing, and queue order unchanged.
+        self._pending_pcm_segments: deque[tuple[int, float]] = deque()
         self._process_idle = asyncio.Event()
         self._process_idle.set()
         self._last_drop_warn_at = 0.0
@@ -1215,14 +1245,11 @@ class RTCSession:
         ``_processing_started`` so ``_inbound_loop`` stops silently
         dropping new audio.
         """
-        while True:
-            try:
-                self._pcm_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
+        self._drain_pcm_queue()
         self._processing_started = True
         self._processing_paused = False
         self._pending_pcm = None
+        self._pending_pcm_segments.clear()
         self._pcm_queue_high_water = 0
         self._pcm_drop_events = 0
         self._pcm_dropped_ms = 0.0
@@ -1295,13 +1322,22 @@ class RTCSession:
     async def clear_output_audio(self) -> None:
         await self._output_track.clear_buffer()
 
-    @staticmethod
-    def _drain_queue(queue: asyncio.Queue) -> None:
+    def _drain_pcm_queue(self) -> tuple[int, int]:
+        """Drain queued microphone chunks and account for discarded audio."""
+
+        chunks = 0
+        samples = 0
         while True:
             try:
-                queue.get_nowait()
+                _, pcm, _ = self._pcm_queue.get_nowait()
             except asyncio.QueueEmpty:
-                return
+                break
+            chunks += 1
+            samples += int(pcm.size)
+        if self._runtime_metrics is not None:
+            self._runtime_metrics.note_discarded_pcm_chunk(chunks)
+            self._runtime_metrics.note_discarded_pcm_samples(samples)
+        return chunks, samples
 
     def _trim_standing_inbound_backlog(self) -> float:
         """Keep at most one fresh model frame of queued microphone audio.
@@ -1313,7 +1349,7 @@ class RTCSession:
 
         Returns dropped audio duration in milliseconds.
         """
-        queued: list[tuple[int, np.ndarray]] = []
+        queued: list[tuple[int, np.ndarray, float]] = []
         while True:
             try:
                 queued.append(self._pcm_queue.get_nowait())
@@ -1322,40 +1358,92 @@ class RTCSession:
         if not queued:
             return 0.0
 
-        kept_reversed: list[tuple[int, np.ndarray]] = []
+        kept_reversed: list[tuple[int, np.ndarray, float]] = []
         kept_samples = 0
+        dropped_chunks = 0
         dropped_samples = 0
-        for generation, samples in reversed(queued):
+        for generation, samples, arrived_at in reversed(queued):
             if generation != self._pipeline_generation:
+                dropped_chunks += 1
                 dropped_samples += samples.size
                 continue
             if (
                 kept_reversed
                 and kept_samples + samples.size > self._frame_size
             ):
+                dropped_chunks += 1
                 dropped_samples += samples.size
                 continue
-            kept_reversed.append((generation, samples))
+            kept_reversed.append((generation, samples, arrived_at))
             kept_samples += samples.size
         for item in reversed(kept_reversed):
             self._pcm_queue.put_nowait(item)
         if dropped_samples <= 0:
             return 0.0
+        if self._runtime_metrics is not None:
+            self._runtime_metrics.note_discarded_pcm_chunk(dropped_chunks)
+            self._runtime_metrics.note_discarded_pcm_samples(
+                dropped_samples
+            )
         self._pcm_drop_events += 1
         dropped_ms = dropped_samples / MIMI_SAMPLE_RATE * 1000.0
         self._pcm_dropped_ms += dropped_ms
         return dropped_ms
+
+    def _consume_pending_timing(self, sample_count: int) -> tuple[float, float]:
+        """Consume timestamp provenance for exactly ``sample_count`` samples.
+
+        The earliest contributing arrival starts the server-pipeline interval;
+        the latest contributing arrival is when the complete frame first
+        existed. Segment splitting changes only timing metadata, never PCM.
+        """
+
+        remaining = int(sample_count)
+        earliest: float | None = None
+        latest: float | None = None
+        while remaining > 0 and self._pending_pcm_segments:
+            segment_samples, arrived_at = self._pending_pcm_segments.popleft()
+            if earliest is None:
+                earliest = arrived_at
+            latest = arrived_at
+            consumed = min(remaining, segment_samples)
+            remaining -= consumed
+            leftover = segment_samples - consumed
+            if leftover > 0:
+                self._pending_pcm_segments.appendleft((leftover, arrived_at))
+        if remaining or earliest is None or latest is None:
+            raise RuntimeError("PCM timing provenance does not match buffered samples")
+        return earliest, latest
+
+    def _timed_process_frame(
+        self,
+        chunk: np.ndarray,
+    ) -> tuple[list[tuple[np.ndarray, str | None]], float, float]:
+        """Call the model callback and return worker boundaries."""
+
+        entered_at = self._monotonic()
+        results = self._process_fn(chunk)
+        return results, entered_at, self._monotonic()
 
     async def pause_and_flush_audio(self) -> int:
         """Pause inference and invalidate queued or in-flight audio."""
         self._processing_paused = True
         self._pipeline_generation += 1
         generation = self._pipeline_generation
-        self._drain_queue(self._pcm_queue)
+        self._drain_pcm_queue()
+        pending_samples = (
+            0 if self._pending_pcm is None else int(self._pending_pcm.size)
+        )
+        if self._runtime_metrics is not None:
+            self._runtime_metrics.note_discarded_pending_samples(
+                pending_samples
+            )
         self._pending_pcm = None
+        self._pending_pcm_segments.clear()
         await self._process_idle.wait()
-        self._drain_queue(self._pcm_queue)
+        self._drain_pcm_queue()
         self._pending_pcm = None
+        self._pending_pcm_segments.clear()
         await self._output_track.clear_buffer()
         return generation
 
@@ -1611,6 +1699,8 @@ class RTCSession:
                 "user_turn_starts",
                 "user_turn_ends",
                 "mimi_encode_frames",
+                "text_starved_frames",
+                "text_starved_episodes",
             }
             float_fields = {
                 "pcm_dropped_ms",
@@ -1644,6 +1734,33 @@ class RTCSession:
         if len(payload) == 1:
             return
         self._control.send(json.dumps(payload))
+
+    def send_runtime_summary(
+        self,
+        summary: dict[str, object],
+        *,
+        request_id: int,
+    ) -> None:
+        """Return one bounded numeric snapshot on the event-loop thread."""
+
+        if not (self._control and self._control.readyState == "open"):
+            return
+        if (
+            isinstance(request_id, bool)
+            or not isinstance(request_id, int)
+            or request_id < 0
+            or not numeric_summary_tree(summary)
+        ):
+            return
+        self._control.send(
+            json.dumps(
+                {
+                    "type": "runtime_summary",
+                    "request_id": request_id,
+                    "summary": summary,
+                }
+            )
+        )
 
     async def diagnostics_snapshot(self) -> dict[str, int | float]:
         """Return queue health for the low-frequency stat envelope."""
@@ -1834,7 +1951,11 @@ class RTCSession:
                     # this chunk is the right thing; do it silently so
                     # the log is not flooded by ~10 s of warning spam.
                     continue
-                queued = (self._pipeline_generation, samples)
+                queued = (
+                    self._pipeline_generation,
+                    samples,
+                    self._monotonic(),
+                )
                 try:
                     self._pcm_queue.put_nowait(queued)
                     self._pcm_queue_high_water = max(
@@ -1844,7 +1965,7 @@ class RTCSession:
                 except asyncio.QueueFull:
                     dropped_samples = samples
                     try:
-                        _, dropped_samples = self._pcm_queue.get_nowait()
+                        _, dropped_samples, _ = self._pcm_queue.get_nowait()
                         self._pcm_queue.put_nowait(queued)
                     except (asyncio.QueueEmpty, asyncio.QueueFull):
                         pass
@@ -1856,6 +1977,11 @@ class RTCSession:
                     self._pcm_dropped_ms += (
                         dropped_samples.size / MIMI_SAMPLE_RATE * 1000.0
                     )
+                    if self._runtime_metrics is not None:
+                        self._runtime_metrics.note_discarded_pcm_chunk()
+                        self._runtime_metrics.note_discarded_pcm_samples(
+                            int(dropped_samples.size)
+                        )
                     now = asyncio.get_event_loop().time()
                     if now - self._last_drop_warn_at >= 1.0:
                         diagnostics = ""
@@ -1895,7 +2021,7 @@ class RTCSession:
         try:
             while not self._closed.is_set():
                 try:
-                    pcm_generation, pcm = await asyncio.wait_for(
+                    pcm_generation, pcm, pcm_arrived_at = await asyncio.wait_for(
                         self._pcm_queue.get(), timeout=0.1
                     )
                 except asyncio.TimeoutError:
@@ -1904,13 +2030,23 @@ class RTCSession:
                     self._processing_paused
                     or pcm_generation != self._pipeline_generation
                 ):
+                    if self._runtime_metrics is not None:
+                        self._runtime_metrics.note_discarded_pcm_chunk()
+                        self._runtime_metrics.note_discarded_pcm_samples(
+                            int(pcm.size)
+                        )
                     continue
                 if pcm.shape[-1] == 0:
+                    if self._runtime_metrics is not None:
+                        self._runtime_metrics.note_discarded_pcm_chunk()
                     continue
                 self._pending_pcm = (
                     pcm
                     if self._pending_pcm is None
                     else np.concatenate((self._pending_pcm, pcm))
+                )
+                self._pending_pcm_segments.append(
+                    (int(pcm.shape[-1]), pcm_arrived_at)
                 )
                 while (
                     not self._processing_paused
@@ -1919,22 +2055,35 @@ class RTCSession:
                 ):
                     chunk = self._pending_pcm[: self._frame_size]
                     self._pending_pcm = self._pending_pcm[self._frame_size :]
+                    pcm_arrival_at, frame_ready_at = (
+                        self._consume_pending_timing(self._frame_size)
+                    )
                     generation = self._pipeline_generation
                     self._process_idle.clear()
                     try:
+                        executor_submitted_at = self._monotonic()
                         in_flight = asyncio.ensure_future(
                             loop.run_in_executor(
-                                self._process_executor, self._process_fn, chunk
+                                self._process_executor,
+                                self._timed_process_frame,
+                                chunk,
                             )
                         )
                         try:
-                            results = await asyncio.shield(in_flight)
+                            (
+                                results,
+                                worker_entered_at,
+                                worker_completed_at,
+                            ) = await asyncio.shield(in_flight)
                         except asyncio.CancelledError:
+                            if self._runtime_metrics is not None:
+                                self._runtime_metrics.note_cancelled_model_frame()
                             try:
                                 await in_flight
                             except BaseException:
                                 pass
                             raise
+                        result_delivered_at = self._monotonic()
                         trimmed_ms = self._trim_standing_inbound_backlog()
                         if trimmed_ms > 0:
                             now = loop.time()
@@ -1950,19 +2099,53 @@ class RTCSession:
                             self._processing_paused
                             or generation != self._pipeline_generation
                         ):
+                            if self._runtime_metrics is not None:
+                                self._runtime_metrics.note_discarded_model_frame()
                             continue
-                        for pcm_data, text in results:
-                            frame_f32 = pcm_data.astype(np.float32)
-                            await self._output_track.push_24k_f32(frame_f32)
-                            if (
-                                self._processing_paused
-                                or generation != self._pipeline_generation
-                            ):
-                                break
-                            if self._on_pcm is not None:
-                                self._on_pcm(frame_f32)
-                            if text is not None:
-                                self.send_text(text)
+                        output_enqueued = False
+                        output_enqueued_at: float | None = None
+                        try:
+                            for pcm_data, text in results:
+                                frame_f32 = pcm_data.astype(np.float32)
+                                await self._output_track.push_24k_f32(
+                                    frame_f32
+                                )
+                                output_enqueued = True
+                                output_enqueued_at = self._monotonic()
+                                if (
+                                    self._processing_paused
+                                    or generation
+                                    != self._pipeline_generation
+                                ):
+                                    break
+                                if self._on_pcm is not None:
+                                    self._on_pcm(frame_f32)
+                                if text is not None:
+                                    self.send_text(text)
+                        except asyncio.CancelledError:
+                            if self._runtime_metrics is not None:
+                                self._runtime_metrics.note_cancelled_model_frame()
+                            raise
+                        if (
+                            self._processing_paused
+                            or generation != self._pipeline_generation
+                        ):
+                            if self._runtime_metrics is not None:
+                                self._runtime_metrics.note_discarded_model_frame()
+                            continue
+                        if self._runtime_metrics is not None:
+                            self._runtime_metrics.record_completed(
+                                FrameLifecycle(
+                                    pcm_arrival_at=pcm_arrival_at,
+                                    frame_ready_at=frame_ready_at,
+                                    executor_submitted_at=executor_submitted_at,
+                                    worker_entered_at=worker_entered_at,
+                                    worker_completed_at=worker_completed_at,
+                                    result_delivered_at=result_delivered_at,
+                                    output_enqueued_at=output_enqueued_at,
+                                ),
+                                output_enqueued=output_enqueued,
+                            )
                     finally:
                         self._process_idle.set()
         except asyncio.CancelledError:

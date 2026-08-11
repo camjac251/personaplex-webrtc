@@ -26,34 +26,45 @@
 
 import argparse
 import asyncio
+import copy
+import hashlib
+import json
+import logging
+import os
+import random
+import re
+import secrets
+import shutil
+import tempfile
+import subprocess
+import sys
+import threading
+import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from functools import wraps
-import json
-import logging
-import random
-import re
-import os
 from pathlib import Path
-import secrets
-import sys
-import threading
-import time
 from typing import Callable, Literal, Optional
+from urllib.parse import urlsplit
 
 import aiohttp
-from aiohttp import web
-from huggingface_hub import hf_hub_download
 import numpy as np
 import sentencepiece
 import sphn
 import torch
-
+from aiohttp import web
 from aiortc import RTCSessionDescription
+from huggingface_hub import hf_hub_download
 
-from .models import loaders, MimiModel, LMGen
-from .models.lm import DEFAULT_SEMANTIC_TEMPERATURE_CAP, MAX_REPETITION_CONTEXT
+from .models import LMGen, MimiModel, loaders
+from .models.lm import (
+    DEFAULT_SEMANTIC_TEMPERATURE_CAP,
+    MAX_REPETITION_CONTEXT,
+    load_audio,
+    normalize_audio,
+    trim_boundary_silence,
+)
 from .rtc_session import (
     INJECT_SILENCE_RMS_DEFAULT,
     INJECT_SILENCE_STREAK_DEFAULT,
@@ -73,14 +84,16 @@ from .rtc_session import (
     clamp_temperature,
     clamp_text_min_p,
     clamp_text_topk,
+    clamp_turn_onset_bias,
     clamp_vision_cost_limit_usd,
     reassemble_vision_chunk,
 )
+from .runtime_metrics import RuntimeMetrics
 from .utils.assets import safe_extract_tar
 from .utils.connection import create_ssl_context, get_lan_ip
-from .utils.logging import setup_logger, ColorizedLog
-from .voice_select import wavlm_embedder
-
+from .utils.logging import ColorizedLog, setup_logger
+from .voice_analysis import VoiceAnalysisError, analyze_decoded_audio
+from .voice_select import WAVLM_MODEL_ID, select_voice_window_result, wavlm_embedder
 
 logger = setup_logger(__name__)
 DeviceString = Literal["cuda"] | Literal["cpu"] #| Literal["mps"]
@@ -159,25 +172,279 @@ def _device_total_memory(device: torch.device) -> int:
     return 0
 
 
+def _device_driver_version(device: torch.device) -> str:
+    """Driver version sampled once at process startup, or ``unknown``."""
+
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return "not_applicable"
+    try:
+        import pynvml
+    except ImportError:
+        pynvml = None
+    if pynvml is not None:
+        try:
+            pynvml.nvmlInit()
+            try:
+                value = pynvml.nvmlSystemGetDriverVersion()
+            finally:
+                pynvml.nvmlShutdown()
+            if isinstance(value, bytes):
+                value = value.decode("ascii", errors="replace")
+            resolved = str(value).strip()
+            return resolved or "unknown"
+        except (pynvml.NVMLError, UnicodeError, ValueError) as exc:
+            logger.debug("NVML driver-version query failed: %s", exc)
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--id",
+                str(_cuda_device_index(device)),
+                "--query-gpu=driver_version",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        versions = {
+            line.strip()
+            for line in result.stdout.splitlines()
+            if line.strip()
+        }
+        if len(versions) == 1:
+            return versions.pop()
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        logger.debug("nvidia-smi driver-version query failed: %s", exc)
+    return "unknown"
+
+
 def _resolve_server_build() -> str:
     """Identifier for the running server build.
 
-    Prefers an explicit deploy-time env var, then the installed package
-    version, then a neutral fallback. Read once at boot.
+    Prefers an explicit deploy-time value. Otherwise uses the full commit only
+    when the checkout is clean; a dirty or unavailable checkout is not an
+    immutable build and therefore reports ``unknown``. Read once at boot.
     """
     explicit = os.environ.get("SERVER_BUILD", "").strip()
     if explicit:
-        return explicit
+        normalized = explicit.lower()
+        if re.fullmatch(r"[0-9a-f]{40,64}", normalized):
+            return normalized
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", normalized):
+            return normalized
+        return "unknown"
     try:
-        from importlib.metadata import PackageNotFoundError, version
-
-        try:
-            return version("moshi")
-        except PackageNotFoundError:
-            pass
+        repo_root = Path(__file__).resolve().parents[2]
+        status = subprocess.run(
+            [
+                "git",
+                "status",
+                "--porcelain",
+                "--untracked-files=normal",
+            ],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if status.stdout.strip():
+            return "unknown"
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout.strip()
+        if re.fullmatch(r"[0-9a-fA-F]{40,64}", revision):
+            return revision.lower()
     except Exception:
         pass
-    return "dev"
+    return "unknown"
+
+
+def _sha256_file_bytes(path: str) -> bytes:
+    """Return a content digest without exposing the file name or path."""
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.digest()
+
+
+def _resolved_asr_model_files(model_path: str) -> tuple[Path, ...]:
+    """Return the on-disk files that faster-whisper can load from a model."""
+
+    root = Path(model_path)
+    if not root.is_dir():
+        raise ValueError("resolved ASR model path is not a directory")
+    files = tuple(
+        sorted(
+            (
+                path
+                for path in root.iterdir()
+                if path.is_file()
+                and (
+                    path.name
+                    in {
+                        "config.json",
+                        "model.bin",
+                        "preprocessor_config.json",
+                        "tokenizer.json",
+                    }
+                    or path.name.startswith("vocabulary.")
+                )
+            ),
+            key=lambda path: path.name,
+        )
+    )
+    file_names = {path.name for path in files}
+    if not {"config.json", "model.bin"}.issubset(file_names):
+        raise ValueError("resolved ASR model is missing required model files")
+    return files
+
+
+def _asr_model_file_signature(
+    model_path: str,
+) -> tuple[tuple[str, int, int, int, int, int], ...]:
+    """Capture file metadata used to reject mutation while the model loads."""
+
+    return tuple(
+        (
+            path.name,
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_size,
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+        )
+        for path in _resolved_asr_model_files(model_path)
+        for stat in (path.stat(),)
+    )
+
+
+def _asr_model_files_sha256(model_path: str) -> str:
+    """Hash the resolved faster-whisper files without exposing their path."""
+
+    digest = hashlib.sha256()
+    digest.update(b"personaplex-asr-model-v1\0")
+    for path in _resolved_asr_model_files(model_path):
+        encoded_name = path.name.encode("utf-8")
+        digest.update(len(encoded_name).to_bytes(4, "big"))
+        digest.update(encoded_name)
+        digest.update(_sha256_file_bytes(str(path)))
+    return digest.hexdigest()
+
+
+def _voice_conditioning_sha256(
+    voice_prompt_path: str | None,
+    voice_prompt_b_path: str | None,
+    *,
+    blend_active: bool,
+    voice_blend_mix: float,
+    clone_strength: float,
+    uploaded_primary: bool,
+    voice_picker_available: bool,
+    selected_audio: object | None = None,
+) -> str:
+    """Hash the resolved assets and controls that build the voice prefix."""
+
+    digest = hashlib.sha256()
+    digest.update(b"personaplex-voice-conditioning-v1\0")
+
+    def add_asset(role: bytes, path: str, *, force_legacy_pt: bool) -> None:
+        digest.update(role + b"\0")
+        base, extension = os.path.splitext(path)
+        state_path = base + ".safetensors"
+        metadata_path = base + ".json"
+        if (
+            extension == ".pt"
+            and not force_legacy_pt
+            and os.path.exists(state_path)
+            and os.path.exists(metadata_path)
+        ):
+            digest.update(b"full-state\0")
+            digest.update(_sha256_file_bytes(state_path))
+            digest.update(_sha256_file_bytes(metadata_path))
+            return
+        digest.update(b"source-file\0")
+        digest.update(_sha256_file_bytes(path))
+
+    if voice_prompt_path is None:
+        digest.update(b"none\0")
+        return digest.hexdigest()
+
+    if blend_active:
+        if voice_prompt_b_path is None:
+            raise ValueError("active voice blend is missing its secondary asset")
+        digest.update(b"embedding-blend\0")
+        add_asset(b"primary", voice_prompt_path, force_legacy_pt=True)
+        add_asset(b"secondary", voice_prompt_b_path, force_legacy_pt=True)
+        digest.update(float(voice_blend_mix).hex().encode("ascii"))
+        return digest.hexdigest()
+
+    digest.update(b"single\0")
+    add_asset(b"primary", voice_prompt_path, force_legacy_pt=False)
+    if uploaded_primary:
+        digest.update(b"upload-controls\0")
+        digest.update(float(clone_strength).hex().encode("ascii"))
+        digest.update(b"\1" if voice_picker_available else b"\0")
+    if selected_audio is not None:
+        if isinstance(selected_audio, torch.Tensor):
+            selected_array = (
+                selected_audio.detach().cpu().contiguous().numpy()
+            )
+        else:
+            selected_array = np.ascontiguousarray(selected_audio)
+        digest.update(b"selected-normalized-audio\0")
+        digest.update(selected_array.dtype.str.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(
+            json.dumps(
+                list(selected_array.shape),
+                separators=(",", ":"),
+            ).encode("ascii")
+        )
+        digest.update(b"\0")
+        digest.update(memoryview(selected_array).cast("B"))
+    return digest.hexdigest()
+
+
+def _handle_runtime_summary_request(
+    session: RTCSession,
+    runtime_metrics: RuntimeMetrics,
+    message: dict,
+) -> bool:
+    """Send a bounded metrics snapshot without touching inference state."""
+
+    request_id = message.get("request_id")
+    if (
+        isinstance(request_id, bool)
+        or not isinstance(request_id, int)
+        or request_id < 0
+    ):
+        return False
+    session.send_runtime_summary(
+        runtime_metrics.snapshot(),
+        request_id=request_id,
+    )
+    return True
+
+
+def _prepare_runtime_metrics(
+    runtime_metrics: RuntimeMetrics,
+    *,
+    resuming: bool,
+) -> None:
+    """Reset measurements only for a new logical model session."""
+
+    if not resuming:
+        runtime_metrics.reset()
 
 
 def _is_fatal_cuda_error(exc: BaseException) -> bool:
@@ -433,6 +700,10 @@ VOICE_PROMPT_EXT = ".pt"
 # from a fixed name inside the resolved voice directory; absent by default.
 VOICE_METADATA_FILENAME = "voices.json"
 UPLOAD_ALLOWED_EXT = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
+UPLOAD_ID_RE = re.compile(
+    r"^upload_[A-Za-z0-9_-]{11}\.(?:wav|mp3|flac|ogg|m4a|aac|opus)$"
+)
+ENROLLMENT_SCHEMA_VERSION = 2
 # Voice cloning timbre captures inside ~10 s; longer references add
 # prosody and emotional range. 60 s is the comfortable upper bound:
 # enough room for a self-introduction or read-aloud paragraph, while
@@ -601,10 +872,20 @@ AUTO_RECOVERY_CONFIG_KEYS = (
     "repetition_penalty",
     "repetition_penalty_context",
     "padding_bonus",
+    "turn_onset_bias",
     "max_turn_text_tokens",
     "text_min_p",
     "semantic_temp_cap",
 )
+
+# Text-starved-audio shadow telemetry: non-silent decoded audio riding on
+# natural PAD/EPAD text (mumbling with no inner monologue). Stat-envelope
+# observability only; never a controller or auto-rewind input. A streak of
+# TEXT_STARVED_MIN_FRAMES qualifying frames (~2 s at 12.5 Hz) is one
+# episode. The floor is deliberately decoupled from the live-tunable
+# inject-silence RMS so tuning the inject gate never moves the baseline.
+TEXT_STARVED_MIN_FRAMES = 25
+TEXT_STARVED_RMS_FLOOR = 0.01
 
 # Fail-safe ceiling on how long the Stop latch may hold the assistant
 # mute. Release normally requires a clean user attack-then-silence
@@ -767,9 +1048,9 @@ STOP_LATCH_USER_TURN_END_SILENCE_STREAK = 7
 # to the opaque session id; this is the neutral name the browser saves.
 RECORDING_DOWNLOAD_FILENAME = "conversation-audio.wav"
 
-# Fixed text every voice preview reads. Identical across voices so the
-# samples are comparable, and a server-side constant (never user input) so
-# the cache key is just the voice id and there is no injection surface.
+# Fixed conditioning prompt for every voice preview. Identical across voices
+# so samples are comparable, and server-owned so there is no prompt-injection
+# surface. Retained artifacts use the complete content/process identity below.
 PREVIEW_SAMPLE_TEXT = (
     "Hello, this is a sample of how this voice sounds. "
     "I hope it helps you pick the right one."
@@ -779,6 +1060,86 @@ PREVIEW_SAMPLE_TEXT = (
 # enough to judge timbre, bounded so the synth holds the session lock only
 # briefly on a cache miss.
 PREVIEW_SAMPLE_SECONDS = 3.0
+PREVIEW_FIXED_CONTROLS = {
+    "use_sampling": True,
+    "text_temperature": 0.7,
+    "text_top_k": 25,
+    "text_min_p": 0.0,
+    "audio_temperature": 0.8,
+    "audio_top_k": 250,
+    "padding_bonus": 0.0,
+    "turn_onset_bias": 0.0,
+    "repetition_penalty": 1.0,
+    "repetition_penalty_context": 64,
+    "semantic_temperature_cap": DEFAULT_SEMANTIC_TEMPERATURE_CAP,
+    "cfg_gamma": 1.0,
+    "max_turn_text_tokens": 0,
+}
+PREVIEW_DEFAULT_SEED = 20260726
+VOICE_SELECTION_MIN_SECONDS = 3.0
+
+
+def _preview_identity(
+    *,
+    reference_sha256: str,
+    selection_mode: str,
+    start_sample: int,
+    end_sample: int,
+    sample_rate: int,
+    strength: float,
+    seed: int,
+    process_identity: dict,
+    topology: dict,
+) -> dict:
+    """Build complete content-bound metadata without private reference content."""
+    return {
+        "schema_version": 2,
+        "reference_sha256": reference_sha256,
+        "selection_mode": selection_mode,
+        "start_sample": int(start_sample),
+        "end_sample": int(end_sample),
+        "start_seconds": start_sample / float(sample_rate),
+        "end_seconds": end_sample / float(sample_rate),
+        "strength": float(strength),
+        "conditioning_prompt_sha256": hashlib.sha256(
+            PREVIEW_SAMPLE_TEXT.encode()
+        ).hexdigest(),
+        "seed": int(seed),
+        "fixed_controls": dict(PREVIEW_FIXED_CONTROLS),
+        "process_identity": copy.deepcopy(process_identity),
+        "topology": dict(topology),
+    }
+
+
+def _atomic_retain_preview(
+    preview_dir: Optional[Path],
+    wav_bytes: bytes,
+    identity: dict,
+) -> Optional[tuple[Path, Path]]:
+    """Atomically retain a complete WAV/metadata pair only when requested."""
+    if preview_dir is None:
+        return None
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    final_dir = preview_dir / digest
+    wav_path = final_dir / "preview.wav"
+    meta_path = final_dir / "metadata.json"
+    if wav_path.is_file() and meta_path.is_file():
+        return wav_path, meta_path
+    temp_dir = preview_dir / f".{digest}.{secrets.token_hex(4)}.tmp"
+    try:
+        temp_dir.mkdir()
+        (temp_dir / "preview.wav").write_bytes(wav_bytes)
+        (temp_dir / "metadata.json").write_text(json.dumps(identity, sort_keys=True))
+        if final_dir.exists():
+            shutil.rmtree(final_dir)
+        os.replace(temp_dir, final_dir)
+    except BaseException:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+    return wav_path, meta_path
 
 
 class _SessionRecorder:
@@ -935,9 +1296,21 @@ class _AsrEngine:
     that drives ``lm_gen``.
     """
 
-    def __init__(self, model: object, src_rate: int):
+    def __init__(
+        self,
+        model: object,
+        src_rate: int,
+        *,
+        model_sha256: str | None = None,
+    ):
         self._model = model
         self._src_rate = int(src_rate)
+        self.model_sha256 = (
+            model_sha256
+            if isinstance(model_sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", model_sha256)
+            else hashlib.sha256(b"disabled").hexdigest()
+        )
         # Guards the rolling buffer / accumulator against the close path.
         # Distinct from ServerState._infer_lock by design: ASR state must
         # never enter the lm_gen critical section.
@@ -971,6 +1344,7 @@ class _AsrEngine:
         """
         try:
             from faster_whisper import WhisperModel
+            from faster_whisper.utils import download_model
         except ImportError:
             logger.warning(
                 "ASR requested but faster-whisper is not installed; "
@@ -978,29 +1352,52 @@ class _AsrEngine:
                 "`uv pip install faster-whisper` to enable it."
             )
             return None
+        failure_stage = "device_selection"
         try:
             if device.type == "cuda" and torch.cuda.is_available():
                 whisper_device, compute_type = "cuda", "float16"
             else:
                 whisper_device, compute_type = "cpu", "int8"
+            failure_stage = "resolve"
+            model_path = (
+                model_id
+                if os.path.isdir(model_id)
+                else download_model(model_id)
+            )
+            failure_stage = "validate"
+            model_signature = _asr_model_file_signature(model_path)
+            failure_stage = "hash"
+            model_sha256 = _asr_model_files_sha256(model_path)
+            failure_stage = "hash_integrity"
+            if _asr_model_file_signature(model_path) != model_signature:
+                raise RuntimeError("ASR model files changed while hashing")
+            failure_stage = "backend_load"
             t = time.monotonic()
             model = WhisperModel(
-                model_id, device=whisper_device, compute_type=compute_type
+                model_path,
+                device=whisper_device,
+                compute_type=compute_type,
             )
+            failure_stage = "load_integrity"
+            if _asr_model_file_signature(model_path) != model_signature:
+                raise RuntimeError("ASR model files changed while loading")
             logger.info(
-                "ASR model %r loaded on %s (%s) in %.1f s",
-                model_id,
+                "ASR model loaded on %s (%s) in %.1f s",
                 whisper_device,
                 compute_type,
                 time.monotonic() - t,
             )
-            return _AsrEngine(model, src_rate)
+            return _AsrEngine(
+                model,
+                src_rate,
+                model_sha256=model_sha256,
+            )
         except Exception as exc:
             logger.warning(
-                "ASR model load failed (%s: %s); user-speech transcription "
-                "disabled",
+                "ASR model load failed stage=%s error_type=%s; "
+                "user-speech transcription disabled",
+                failure_stage,
                 type(exc).__name__,
-                exc,
             )
             return None
 
@@ -1216,7 +1613,12 @@ class ServerState:
                  model_repo: str = RL_HF_REPO,
                  model_revision: str | None = RL_HF_REVISION,
                  save_voice_prompt_embeddings: bool = False,
-                 caption_cfg: bool = False):
+                 caption_cfg: bool = False,
+                 kv_sink_frames: int = 0,
+                 voice_picker_available: bool = False,
+                 voice_window_embedder=None,
+                 cpu_offload: bool = False,
+                 asr_model_sha256: str | None = None):
         self.mimi = mimi
         self.lm_gen = lm_gen
         # Caption-CFG (context-aware decoding) mode. Fixed for the process
@@ -1227,16 +1629,36 @@ class ServerState:
         self.device = device
         self.voice_prompt_dir = voice_prompt_dir
         self.uploads_dir = uploads_dir
-        # On-disk cache of synthesized voice-preview WAVs, keyed by voice id.
-        # None disables the preview route (returns 503). Created lazily on
-        # the first cache-miss write.
+        # Optional root for explicitly retained, identity-bound preview pairs.
+        # None keeps every preview ephemeral and rejects retain=true.
         self.preview_cache_dir = preview_cache_dir
+        self._voice_window_embedder = voice_window_embedder
+        self._voice_enrollments: dict[str, dict] = {}
+        self._voice_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="personaplex-voice",
+        )
         # Optional server-side recording, off unless the operator enables
         # it at launch. recordings_dir is created at startup when set.
         self.record_sessions = record_sessions
         self.recordings_dir = recordings_dir
         self.periodic_snapshots = periodic_snapshots
         self.model_identity = _model_identity(model_repo, model_revision)
+        disabled_asr_sha256 = hashlib.sha256(b"disabled").hexdigest()
+        self.asr_model_sha256 = (
+            asr_model_sha256
+            if isinstance(asr_model_sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", asr_model_sha256)
+            else disabled_asr_sha256
+        )
+        self.process_flags = {
+            "caption_cfg": bool(caption_cfg),
+            "cpu_offload": bool(cpu_offload),
+            "kv_sink_frames": int(kv_sink_frames),
+            "periodic_snapshots": bool(periodic_snapshots),
+            "asr_available": bool(asr is not None),
+            "voice_picker_available": bool(voice_picker_available),
+        }
         # Optional user-speech recognizer (second model). None unless the
         # operator passed --enable-asr and faster-whisper imported. When
         # None the server transcribes nothing on the user side and the
@@ -1360,6 +1782,13 @@ class ServerState:
         # the observed idle floor the silence gate compares against.
         # Reported on the stat channel; reset per session.
         self._observed_idle_rms_ema: float = 0.0
+        # Text-starved-audio shadow counters (see TEXT_STARVED_MIN_FRAMES).
+        # Written in _process_audio_frame on the executor thread, read by
+        # the stat timer on the loop; cumulative per session, so transport
+        # resume must not zero them.
+        self._text_starved_streak: int = 0
+        self._text_starved_frames: int = 0
+        self._text_starved_episodes: int = 0
         # Active end-of-thought gate thresholds for this session. Defaults
         # until the config message applies cfg values; live-tunable via
         # update_config. Read in _process_audio_frame under _infer_lock;
@@ -1402,6 +1831,18 @@ class ServerState:
         # "random" resolves to a concrete value before priming so exported
         # diagnostics can reproduce the same sampling stream.
         self._active_seed: Optional[int] = None
+        self._active_voice_blend_mix: float = 0.0
+        self._active_clone_strength: float = 1.0
+        self._active_session_timeout_sec: int = 0
+        self._active_voice_conditioning_sha256 = _voice_conditioning_sha256(
+            None,
+            None,
+            blend_active=False,
+            voice_blend_mix=0.0,
+            clone_strength=1.0,
+            uploaded_primary=False,
+            voice_picker_available=bool(voice_picker_available),
+        )
         # Per-session system prompt for Gemini. Set in _run_rtc_session
         # from cfg.vision_prompt (or DEFAULT_VISION_SYSTEM_PROMPT if blank).
         self._vision_system_prompt: str = DEFAULT_VISION_SYSTEM_PROMPT
@@ -1563,7 +2004,11 @@ class ServerState:
         # vram_total is bytes (0 on CPU); the client formats to gigabytes.
         self.gpu_name: str = _device_name(self.device)
         self.vram_total: int = _device_total_memory(self.device)
+        self.driver_version: str = _device_driver_version(self.device)
+        self.torch_version: str = str(torch.__version__)
+        self.cuda_version: str = str(torch.version.cuda or "not_applicable")
         self.server_build: str = _resolve_server_build()
+        self._runtime_metrics = RuntimeMetrics()
         self.mimi.streaming_forever(1)
         # Two streaming rows in caption-CFG mode: row 0 conditions on
         # injected context, row 1 is the clean counterfactual the guidance
@@ -1738,13 +2183,28 @@ class ServerState:
         """
         voice_load_ms = 0.0
         voice_description = ""
+        voice_conditioning_sha256 = _voice_conditioning_sha256(
+            voice_prompt_path,
+            voice_prompt_b_path,
+            blend_active=blend_active,
+            voice_blend_mix=cfg.voice_blend_mix,
+            clone_strength=cfg.clone_strength,
+            uploaded_primary=cfg.voice_prompt.startswith(UPLOAD_PREFIX),
+            voice_picker_available=bool(
+                self.lm_gen.voice_window_embedder is not None
+            ),
+        )
         with self._infer_lock:
             if blend_active:
                 blend_id = (
                     f"{voice_prompt_path}+{voice_prompt_b_path}"
                     f"@{cfg.voice_blend_mix:.2f}"
                 )
-                if self.lm_gen.voice_prompt != blend_id:
+                if (
+                    self.lm_gen.voice_prompt != blend_id
+                    or voice_conditioning_sha256
+                    != self._active_voice_conditioning_sha256
+                ):
                     started = time.monotonic()
                     self.lm_gen.load_voice_prompt_blend(
                         voice_prompt_path,
@@ -1752,10 +2212,15 @@ class ServerState:
                         cfg.voice_blend_mix,
                     )
                     voice_load_ms = (time.monotonic() - started) * 1000.0
-                    voice_description = f"blend {blend_id}"
+                    voice_description = "blend"
             elif (
                 voice_prompt_path is not None
-                and self.lm_gen.voice_prompt != voice_prompt_path
+                and (
+                    not voice_prompt_path.endswith(".pt")
+                    or self.lm_gen.voice_prompt != voice_prompt_path
+                    or voice_conditioning_sha256
+                    != self._active_voice_conditioning_sha256
+                )
             ):
                 started = time.monotonic()
                 if voice_prompt_path.endswith(".pt"):
@@ -1763,7 +2228,11 @@ class ServerState:
                 else:
                     self.lm_gen.load_voice_prompt(voice_prompt_path)
                 voice_load_ms = (time.monotonic() - started) * 1000.0
-                voice_description = voice_prompt_path
+                voice_description = (
+                    "uploaded"
+                    if cfg.voice_prompt.startswith(UPLOAD_PREFIX)
+                    else "preset"
+                )
             elif not voice_prompt_path:
                 # Prompt caches persist on LMGen across sessions.  Clear every
                 # representation, including full-state sidecars, so a no-voice
@@ -1778,6 +2247,67 @@ class ServerState:
                 cfg.clone_strength
                 if cfg.voice_prompt.startswith(UPLOAD_PREFIX)
                 else 1.0
+            )
+            self.lm_gen.voice_selection_interval = None
+            if cfg.voice_prompt.startswith(UPLOAD_PREFIX):
+                upload_id = cfg.voice_prompt[len(UPLOAD_PREFIX):]
+                self.lm_gen.voice_selection_interval = (
+                    self._representative_enrollment_interval(
+                        self._get_voice_enrollment(upload_id)
+                    )
+                )
+            verified_asset_sha256 = _voice_conditioning_sha256(
+                voice_prompt_path,
+                voice_prompt_b_path,
+                blend_active=blend_active,
+                voice_blend_mix=cfg.voice_blend_mix,
+                clone_strength=cfg.clone_strength,
+                uploaded_primary=cfg.voice_prompt.startswith(UPLOAD_PREFIX),
+                voice_picker_available=bool(
+                    self.lm_gen.voice_window_embedder is not None
+                ),
+            )
+            if verified_asset_sha256 != voice_conditioning_sha256:
+                raise RuntimeError(
+                    "voice conditioning asset changed while it was loading"
+                )
+            if (
+                voice_prompt_path is not None
+                and not blend_active
+                and not voice_prompt_path.endswith(".pt")
+            ):
+                selected_audio = (
+                    self.lm_gen._strength_sliced_voice_prompt_audio()
+                )
+                voice_conditioning_sha256 = _voice_conditioning_sha256(
+                    voice_prompt_path,
+                    voice_prompt_b_path,
+                    blend_active=blend_active,
+                    voice_blend_mix=cfg.voice_blend_mix,
+                    clone_strength=cfg.clone_strength,
+                    uploaded_primary=cfg.voice_prompt.startswith(
+                        UPLOAD_PREFIX
+                    ),
+                    voice_picker_available=bool(
+                        self.lm_gen.voice_window_embedder is not None
+                    ),
+                    selected_audio=selected_audio,
+                )
+                self.lm_gen.voice_prompt_audio = selected_audio
+                self.lm_gen.voice_prompt_strength = 1.0
+            self._active_voice_conditioning_sha256 = (
+                voice_conditioning_sha256
+            )
+            self._active_voice_blend_mix = (
+                float(cfg.voice_blend_mix) if blend_active else 0.0
+            )
+            self._active_clone_strength = (
+                float(cfg.clone_strength)
+                if cfg.voice_prompt.startswith(UPLOAD_PREFIX)
+                else 1.0
+            )
+            self._active_session_timeout_sec = int(
+                cfg.session_timeout_sec
             )
             self._active_text_prompt = cfg.text_prompt or ""
             wrapped_text_prompt = (
@@ -1829,6 +2359,11 @@ class ServerState:
                 ),
             )
             self.lm_gen.padding_bonus = max(0.0, cfg.padding_bonus)
+            # Negative values are valid (they delay onset), so re-clamp with
+            # the shared helper instead of flooring at zero.
+            self.lm_gen.turn_onset_bias = clamp_turn_onset_bias(
+                cfg.turn_onset_bias
+            )
             self.lm_gen.min_p_text = max(0.0, cfg.text_min_p)
             self.lm_gen.max_turn_text_tokens = max(
                 MAX_TURN_TEXT_TOKENS_MIN, cfg.max_turn_text_tokens
@@ -1858,6 +2393,9 @@ class ServerState:
             self._user_turn_starts = 0
             self._user_turn_ends = 0
             self._mimi_encode_frames = 0
+            self._text_starved_streak = 0
+            self._text_starved_frames = 0
+            self._text_starved_episodes = 0
             self._gpu_util_last = None
             self._vram_used_last = None
             self._observed_idle_rms_ema = 0.0
@@ -1876,6 +2414,7 @@ class ServerState:
         return {
             "voice_load_ms": voice_load_ms,
             "voice_description": voice_description,
+            "voice_conditioning_sha256": voice_conditioning_sha256,
             "text_prompt_tokens": len(self.lm_gen.text_prompt_tokens),
             "audio_top_k": audio_top_k,
             "audio_top_k_changed": audio_top_k_changed,
@@ -1888,9 +2427,11 @@ class ServerState:
     def _resolve_upload_path(self, name: str) -> Optional[str]:
         """Return an absolute path inside uploads_dir, or None if unsafe/missing.
         Blocks path traversal and ensures the resolved path stays under uploads_dir."""
-        if self.uploads_dir is None or not name:
-            return None
-        if os.sep in name or (os.altsep and os.altsep in name) or name.startswith("."):
+        if (
+            self.uploads_dir is None
+            or not isinstance(name, str)
+            or UPLOAD_ID_RE.fullmatch(name) is None
+        ):
             return None
         base = os.path.realpath(self.uploads_dir)
         candidate = os.path.realpath(os.path.join(base, name))
@@ -1900,6 +2441,281 @@ class ServerState:
         except ValueError:
             return None
         return candidate
+
+    def _analyze_voice_enrollment(self, upload_path: str) -> dict:
+        """Decode, analyze, and preselect on the dedicated CPU worker."""
+        decoded = load_audio(upload_path, self.lm_gen._sample_rate)
+        report = analyze_decoded_audio(decoded, self.lm_gen._sample_rate)
+        trimmed = trim_boundary_silence(decoded, self.lm_gen._sample_rate)
+        mono = normalize_audio(trimmed, self.lm_gen._sample_rate, -24.0)
+        window_samples = min(
+            mono.shape[-1],
+            max(
+                self.frame_size,
+                round(VOICE_SELECTION_MIN_SECONDS * self.lm_gen._sample_rate),
+            ),
+        )
+        selection = select_voice_window_result(
+            mono,
+            self.lm_gen._sample_rate,
+            window_samples,
+            self._voice_window_embedder,
+            frame_samples=self.frame_size,
+            minimum_window_samples=window_samples,
+        )
+        reference_sha256 = hashlib.sha256(Path(upload_path).read_bytes()).hexdigest()
+        return {
+            "schema_version": ENROLLMENT_SCHEMA_VERSION,
+            "reference_sha256": reference_sha256,
+            "analysis": report.to_dict(),
+            "selection": selection.to_dict(),
+            "sample_rate": int(self.lm_gen._sample_rate),
+            "frame_size": int(self.frame_size),
+            "selection_identity": {
+                "schema_version": 1,
+                "server_build": self.server_build,
+                "selector": (
+                    WAVLM_MODEL_ID
+                    if self._voice_window_embedder is not None
+                    else "deterministic_tail"
+                ),
+                "sample_rate": int(self.lm_gen._sample_rate),
+                "frame_size": int(self.frame_size),
+            },
+        }
+
+    @staticmethod
+    def _enrollment_manifest_path(upload_path: str | Path) -> Path:
+        return Path(f"{upload_path}.enrollment.json")
+
+    def _publish_voice_enrollment(
+        self,
+        staged_path: Path,
+        final_path: Path,
+        enrollment: dict,
+    ) -> None:
+        """Publish source and its content-bound manifest with failure cleanup."""
+        manifest = self._enrollment_manifest_path(final_path)
+        manifest_tmp = Path(f"{manifest}.{secrets.token_hex(4)}.tmp")
+        try:
+            manifest_tmp.write_text(json.dumps(enrollment, sort_keys=True))
+            os.replace(staged_path, final_path)
+            os.replace(manifest_tmp, manifest)
+        except BaseException:
+            staged_path.unlink(missing_ok=True)
+            final_path.unlink(missing_ok=True)
+            manifest.unlink(missing_ok=True)
+            raise
+        finally:
+            manifest_tmp.unlink(missing_ok=True)
+
+    def _validate_voice_enrollment(
+        self,
+        upload_path: Path,
+        payload: object,
+        *,
+        allow_missing_source: bool = False,
+    ) -> Optional[dict]:
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("schema_version") != ENROLLMENT_SCHEMA_VERSION:
+            return None
+        if payload.get("sample_rate") != int(self.lm_gen._sample_rate):
+            return None
+        if payload.get("frame_size") != int(self.frame_size):
+            return None
+        expected_hash = payload.get("reference_sha256")
+        if not isinstance(expected_hash, str) or not re.fullmatch(
+            r"[0-9a-f]{64}",
+            expected_hash,
+        ):
+            return None
+        if upload_path.exists():
+            try:
+                actual_hash = hashlib.sha256(upload_path.read_bytes()).hexdigest()
+            except OSError:
+                return None
+            if actual_hash != expected_hash:
+                return None
+        elif not allow_missing_source:
+            return None
+        analysis = payload.get("analysis")
+        selection = payload.get("selection")
+        if not isinstance(analysis, dict) or not isinstance(selection, dict):
+            return None
+
+        validated = copy.deepcopy(payload)
+        selection_identity = payload.get("selection_identity")
+        current_identity = {
+            "schema_version": 1,
+            "server_build": self.server_build,
+            "selector": (
+                WAVLM_MODEL_ID
+                if self._voice_window_embedder is not None
+                else "deterministic_tail"
+            ),
+            "sample_rate": int(self.lm_gen._sample_rate),
+            "frame_size": int(self.frame_size),
+        }
+        representative_valid = (
+            selection.get("mode") == "representative"
+            and selection.get("fallback_reason") is None
+            and isinstance(selection.get("start_sample"), int)
+            and not isinstance(selection.get("start_sample"), bool)
+            and isinstance(selection.get("end_sample"), int)
+            and not isinstance(selection.get("end_sample"), bool)
+        )
+        if representative_valid:
+            start = selection["start_sample"]
+            end = selection["end_sample"]
+            trim_start = analysis.get("trim_start_sample")
+            trim_end = analysis.get("trim_end_sample")
+            total_samples = (
+                trim_end - trim_start
+                if isinstance(trim_start, int)
+                and not isinstance(trim_start, bool)
+                and isinstance(trim_end, int)
+                and not isinstance(trim_end, bool)
+                and trim_end >= trim_start
+                else -1
+            )
+            representative_valid = (
+                0 <= start < end <= total_samples
+                and start % self.frame_size == 0
+                and end % self.frame_size == 0
+                and selection_identity == current_identity
+            )
+        if selection.get("mode") == "representative" and not representative_valid:
+            validated["selection"] = {
+                "mode": "tail",
+                "start_sample": 0,
+                "end_sample": 0,
+                "start_seconds": 0.0,
+                "end_seconds": 0.0,
+                "fallback_reason": "stale_selection",
+            }
+        return validated
+
+    def _get_voice_enrollment(self, upload_id: str) -> Optional[dict]:
+        upload_path = self._resolve_upload_path(upload_id)
+        if upload_path is None:
+            return None
+        cached = self._voice_enrollments.get(upload_id)
+        if cached is not None:
+            validated = self._validate_voice_enrollment(Path(upload_path), cached)
+            if validated is not None:
+                return validated
+        try:
+            payload = json.loads(
+                self._enrollment_manifest_path(upload_path).read_text()
+            )
+        except (OSError, ValueError, TypeError):
+            return None
+        enrollment = self._validate_voice_enrollment(Path(upload_path), payload)
+        if enrollment is None:
+            return None
+        self._voice_enrollments[upload_id] = enrollment
+        return enrollment
+
+    def _representative_enrollment_interval(
+        self,
+        enrollment: Optional[dict],
+    ) -> Optional[tuple[int, int]]:
+        selection = (
+            enrollment.get("selection")
+            if isinstance(enrollment, dict)
+            else None
+        )
+        if (
+            not isinstance(selection, dict)
+            or selection.get("mode") != "representative"
+            or selection.get("fallback_reason") is not None
+        ):
+            return None
+        start = selection.get("start_sample")
+        end = selection.get("end_sample")
+        if (
+            not isinstance(start, int)
+            or isinstance(start, bool)
+            or not isinstance(end, int)
+            or isinstance(end, bool)
+            or not 0 <= start < end
+            or start % self.frame_size != 0
+            or end % self.frame_size != 0
+        ):
+            return None
+        return start, end
+
+    def _delete_voice_enrollment(self, upload_id: str) -> str:
+        """Delete one confined upload and only hash-proven derived artifacts."""
+        upload_path = self._resolve_upload_path(upload_id)
+        if upload_path is None:
+            return "invalid_id"
+        upload = Path(upload_path)
+        manifest = self._enrollment_manifest_path(upload)
+        if not upload.exists() and not manifest.exists():
+            return "not_found"
+        try:
+            payload = json.loads(manifest.read_text())
+        except (OSError, ValueError, TypeError):
+            return "invalid_id"
+        enrollment = self._validate_voice_enrollment(
+            upload,
+            payload,
+            allow_missing_source=True,
+        )
+        if enrollment is None:
+            return "invalid_id"
+        reference_hash = enrollment["reference_sha256"]
+
+        derived = [
+            Path(f"{upload_path}{suffix}")
+            for suffix in (
+                ".analysis.json",
+                ".selection.json",
+                ".pt",
+                ".safetensors",
+                ".json",
+            )
+        ]
+        preview_dirs: list[Path] = []
+        try:
+            if self.preview_cache_dir is not None:
+                preview_root = Path(self.preview_cache_dir)
+                if preview_root.is_dir():
+                    for meta in preview_root.glob("*/metadata.json"):
+                        try:
+                            preview_payload = json.loads(meta.read_text())
+                        except (OSError, ValueError, TypeError):
+                            continue
+                        if (
+                            isinstance(preview_payload, dict)
+                            and preview_payload.get("reference_sha256")
+                            == reference_hash
+                        ):
+                            preview_dirs.append(meta.parent)
+            for preview_dir in preview_dirs:
+                shutil.rmtree(preview_dir)
+            for path in derived:
+                path.unlink(missing_ok=True)
+            upload.unlink(missing_ok=True)
+            manifest.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("voice enrollment deletion failed (%s)", type(exc).__name__)
+            return "deletion_failed"
+        self._voice_enrollments.pop(upload_id, None)
+        return "deleted"
+
+    @staticmethod
+    def _same_origin_request(request) -> bool:
+        origin = request.headers.get("Origin")
+        if not origin:
+            return True
+        try:
+            parsed = urlsplit(origin)
+            return parsed.scheme == request.scheme and parsed.netloc == request.host
+        except (AttributeError, ValueError):
+            return False
 
     def _resolve_recording_path(self, name: str) -> Optional[str]:
         """Return an absolute path inside recordings_dir, or None if unsafe/missing.
@@ -1945,155 +2761,357 @@ class ServerState:
         )
 
     async def handle_voice_upload(self, request):
-        """Accept a multipart upload of an audio file for voice prompting.
-        Returns JSON {filename: "upload:<name>"} on success."""
+        """Stage and enroll a voice reference outside the event loop/model worker."""
+        if not self._same_origin_request(request):
+            return web.json_response({"error": "origin_rejected"}, status=403)
         if self.uploads_dir is None:
-            return web.json_response({"error": "uploads disabled on this server"}, status=503)
+            return web.json_response({"error": "uploads_disabled"}, status=503)
         if request.content_length is not None and request.content_length > UPLOAD_MAX_BYTES:
-            return web.json_response({"error": "file too large"}, status=413)
-        try:
-            reader = await request.multipart()
-        except Exception as e:
-            return web.json_response({"error": f"invalid multipart body: {e}"}, status=400)
+            return web.json_response({"error": "oversized"}, status=413)
+        staged_path: Optional[Path] = None
+        final_path: Optional[Path] = None
+        gate_held = False
 
-        field = await reader.next()
-        while field is not None and field.name != "file":
+        def cleanup() -> None:
+            for path in (staged_path, final_path):
+                if path is not None:
+                    path.unlink(missing_ok=True)
+            if final_path is not None:
+                self._enrollment_manifest_path(final_path).unlink(missing_ok=True)
+
+        try:
+            try:
+                reader = await request.multipart()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return web.json_response({"error": "invalid_request"}, status=400)
+
             field = await reader.next()
-        if field is None:
-            return web.json_response({"error": "missing 'file' field"}, status=400)
+            while field is not None and field.name != "file":
+                field = await reader.next()
+            if field is None:
+                return web.json_response({"error": "invalid_request"}, status=400)
 
-        original = field.filename or "upload"
-        ext = Path(original).suffix.lower()
-        if ext not in UPLOAD_ALLOWED_EXT:
-            return web.json_response(
-                {"error": f"unsupported extension {ext or '(none)'}; allowed: {sorted(UPLOAD_ALLOWED_EXT)}"},
-                status=400,
+            ext = Path(field.filename or "").suffix.lower()
+            if ext not in UPLOAD_ALLOWED_EXT:
+                return web.json_response({"error": "undecodable"}, status=400)
+
+            upload_id = f"upload_{secrets.token_urlsafe(8)}{ext}"
+            final_path = Path(self.uploads_dir) / upload_id
+            staged_path = (
+                Path(self.uploads_dir)
+                / f".voice-stage-{secrets.token_urlsafe(8)}{ext}"
             )
+            total = 0
+            try:
+                with open(staged_path, "wb") as output:
+                    while True:
+                        chunk = await field.read_chunk(size=64 * 1024)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > UPLOAD_MAX_BYTES:
+                            cleanup()
+                            return web.json_response(
+                                {"error": "oversized"},
+                                status=413,
+                            )
+                        output.write(chunk)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                cleanup()
+                logger.warning(
+                    "voice upload staging failed (%s)",
+                    type(exc).__name__,
+                )
+                return web.json_response({"error": "staging_failed"}, status=500)
 
-        safe_name = f"upload_{secrets.token_urlsafe(8)}{ext}"
-        out_path = Path(self.uploads_dir) / safe_name
-        total = 0
-        try:
-            with open(out_path, "wb") as f:
-                while True:
-                    chunk = await field.read_chunk(size=64 * 1024)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if total > UPLOAD_MAX_BYTES:
-                        f.close()
-                        out_path.unlink(missing_ok=True)
-                        return web.json_response({"error": "file too large"}, status=413)
-                    f.write(chunk)
-        except Exception as e:
-            out_path.unlink(missing_ok=True)
-            return web.json_response({"error": f"failed to save file: {e}"}, status=500)
+            if total == 0:
+                cleanup()
+                return web.json_response({"error": "empty"}, status=400)
+            if not await self._try_acquire_session_lock(timeout=0):
+                cleanup()
+                return web.json_response({"error": "session_busy"}, status=409)
+            gate_held = True
+            if self._resume_grant is not None:
+                cleanup()
+                return web.json_response({"error": "session_busy"}, status=409)
 
-        # Validate it decodes. sphn.read is CPU-bound; run in executor so we do not
-        # block the event loop on large files.
-        loop = asyncio.get_event_loop()
-        try:
-            sample_pcm, sample_sr = await loop.run_in_executor(
-                None, sphn.read, str(out_path)
-            )
-        except Exception as e:
-            out_path.unlink(missing_ok=True)
-            return web.json_response({"error": f"could not decode audio: {e}"}, status=400)
+            loop = asyncio.get_running_loop()
 
-        # Reject long uploads early. sphn.read returns shape (C, T); duration
-        # in seconds is T / sample_sr. See UPLOAD_MAX_VOICE_PROMPT_SECONDS.
-        try:
-            duration = float(sample_pcm.shape[-1]) / float(sample_sr)
-        except (TypeError, ZeroDivisionError, AttributeError):
-            duration = 0.0
-        if duration > UPLOAD_MAX_VOICE_PROMPT_SECONDS:
-            out_path.unlink(missing_ok=True)
+            def enroll() -> dict:
+                enrollment = self._analyze_voice_enrollment(str(staged_path))
+                self._publish_voice_enrollment(
+                    staged_path,
+                    final_path,
+                    enrollment,
+                )
+                return enrollment
+
+            enrollment_future = loop.run_in_executor(self._voice_executor, enroll)
+            try:
+                enrollment = await asyncio.shield(enrollment_future)
+            except asyncio.CancelledError:
+                try:
+                    await enrollment_future
+                except BaseException:
+                    pass
+                cleanup()
+                raise
+            except VoiceAnalysisError as exc:
+                cleanup()
+                return web.json_response({"error": exc.code}, status=400)
+            except Exception as exc:
+                cleanup()
+                logger.warning("voice enrollment failed (%s)", type(exc).__name__)
+                return web.json_response({"error": "undecodable"}, status=400)
+
+            self._voice_enrollments[upload_id] = enrollment
+            logger.info("voice enrollment ready")
             return web.json_response(
                 {
-                    "error": (
-                        f"audio too long ({duration:.1f}s); voice prompts "
-                        f"are capped at {UPLOAD_MAX_VOICE_PROMPT_SECONDS:.0f}s "
-                        "for clone quality and warmup time"
-                    )
-                },
-                status=400,
+                    "filename": f"{UPLOAD_PREFIX}{upload_id}",
+                    "analysis": enrollment["analysis"],
+                    "selection": enrollment["selection"],
+                }
             )
+        except asyncio.CancelledError:
+            cleanup()
+            raise
+        finally:
+            if gate_held:
+                self.lock.release()
 
-        logger.info(
-            f"voice upload saved: {safe_name} ({total} bytes, "
-            f"{duration:.1f}s, original={original!r})"
-        )
-        return web.json_response({"filename": f"{UPLOAD_PREFIX}{safe_name}", "bytes": total})
-
-    def _resolve_preview_cache_path(self, voice_id: str) -> Optional[str]:
-        """Return the confined cache path for a voice id, or None if unsafe.
-
-        Same realpath + commonpath containment as _resolve_upload_path so a
-        crafted voice id cannot escape the cache directory. The voice id is
-        client-supplied, so it is rejected outright if it carries a path
-        separator or a leading dot.
-        """
-        if self.preview_cache_dir is None or not voice_id:
-            return None
-        if os.sep in voice_id or (os.altsep and os.altsep in voice_id) or voice_id.startswith("."):
-            return None
-        base = os.path.realpath(self.preview_cache_dir)
-        candidate = os.path.realpath(os.path.join(base, f"{voice_id}.wav"))
+    async def handle_voice_delete(self, request):
+        """Remove an explicitly requested opaque enrollment and exact derivatives."""
+        if not self._same_origin_request(request):
+            return web.json_response({"error": "origin_rejected"}, status=403)
         try:
-            if os.path.commonpath([base, candidate]) != base:
-                return None
-        except ValueError:
-            return None
-        return candidate
+            body = await request.json()
+            upload_id = body.get("upload_id")
+        except (ValueError, AttributeError):
+            return web.json_response({"error": "invalid_request"}, status=400)
+        if not isinstance(upload_id, str):
+            return web.json_response({"error": "invalid_id"}, status=400)
+        if not await self._try_acquire_session_lock(timeout=0):
+            return web.json_response({"error": "session_busy"}, status=409)
+        if self._resume_grant is not None:
+            self.lock.release()
+            return web.json_response({"error": "session_busy"}, status=409)
+        try:
+            loop = asyncio.get_running_loop()
+            delete_future = loop.run_in_executor(
+                self._voice_executor,
+                self._delete_voice_enrollment,
+                upload_id,
+            )
+            try:
+                result = await asyncio.shield(delete_future)
+            except asyncio.CancelledError:
+                await delete_future
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "voice enrollment deletion failed (%s)",
+                    type(exc).__name__,
+                )
+                result = "deletion_failed"
+        finally:
+            self.lock.release()
+        if result == "deletion_failed":
+            return web.json_response({"error": result}, status=500)
+        status = 200 if result == "deleted" else 404 if result == "not_found" else 400
+        return web.json_response({"status": result}, status=status)
+
+    @staticmethod
+    def _clone_preview_value(value):
+        if isinstance(value, torch.Tensor):
+            return value.detach().clone()
+        if isinstance(value, np.ndarray):
+            return value.copy()
+        return copy.deepcopy(value)
+
+    def _resolve_voice_preview_reference(self, voice: str, mode: str) -> dict:
+        """Resolve and hash preview inputs on the serialized voice worker."""
+        if voice.startswith(UPLOAD_PREFIX):
+            upload_id = voice[len(UPLOAD_PREFIX):]
+            voice_prompt_path = self._resolve_upload_path(upload_id)
+            enrollment = self._get_voice_enrollment(upload_id)
+            if voice_prompt_path is None or enrollment is None:
+                return {"error": "voice_not_found"}
+            selection_interval = None
+            if mode == "representative":
+                selection_interval = self._representative_enrollment_interval(
+                    enrollment
+                )
+                if selection_interval is None:
+                    return {"error": "representative_unavailable"}
+            return {
+                "voice_prompt_path": voice_prompt_path,
+                "selection_interval": selection_interval,
+                "reference_sha256": enrollment["reference_sha256"],
+            }
+
+        if mode != "tail":
+            return {"error": "representative_unavailable"}
+        try:
+            voice_prompt_path, _ = self._resolve_voice_prompt_path(
+                f"{voice}{VOICE_PROMPT_EXT}"
+            )
+        except FileNotFoundError:
+            return {"error": "voice_not_found"}
+        if voice_prompt_path is None:
+            return {"error": "voice_not_found"}
+        return {
+            "voice_prompt_path": voice_prompt_path,
+            "selection_interval": None,
+            "reference_sha256": _voice_conditioning_sha256(
+                voice_prompt_path,
+                None,
+                blend_active=False,
+                voice_blend_mix=0.0,
+                clone_strength=1.0,
+                uploaded_primary=False,
+                voice_picker_available=False,
+            ),
+        }
 
     @torch.no_grad()
-    def _synthesize_voice_preview(self, voice_prompt_path: str, cache_path: str) -> str:
-        """Synthesize a fixed-text sample in one voice and cache it on disk.
-
-        Runs in the thread executor (never on the event loop). On a cache
-        hit it returns the path without touching the GPU. On a miss it holds
-        ``_infer_lock`` for the whole synth so it cannot interleave with any
-        other lm_gen mutation, snapshots the live streaming state, runs the
-        same prompt + step recipe as offline.py, then restores the snapshot
-        and clears the voice cache fields so the next real connect re-primes
-        from a clean state. The caller holds ``self.lock`` for the duration,
-        so no live session exists while this runs.
-        """
-        if os.path.exists(cache_path):
-            return cache_path
-
+    def _synthesize_voice_preview(
+        self,
+        voice_prompt_path: str,
+        *,
+        selection_mode: str,
+        selection_interval: Optional[tuple[int, int]],
+        clone_strength: float,
+    ) -> tuple[bytes, tuple[int, int]]:
+        """Run a fixed conditioned preview transaction and return ephemeral WAV."""
         sample_rate = self.mimi.sample_rate
         frame_count = max(1, int(round(PREVIEW_SAMPLE_SECONDS * self.mimi.frame_rate)))
         generated_frames: list[np.ndarray] = []
+        conditioned_interval = (0, 0)
 
         with self._infer_lock:
-            # Snapshot the live streaming state so the preview run is fully
-            # isolated; restored in the finally below. _flatten_streaming_state
-            # + clone mirrors _take_snapshot so the snapshot does not follow
-            # the model.
-            from .modules.streaming import _flatten_streaming_state
-
-            snap_state = self.lm_gen.get_streaming_state()
-            snap_dict: dict = {}
-            snap_meta: dict = {}
-            _flatten_streaming_state(snap_dict, snap_meta, snap_state, prefix="")
-            snapshot = {k: v.detach().clone() for k, v in snap_dict.items()}
-            snapshot.update(snap_meta)
-
-            # Preserve the voice-prompt cache fields so they can be reset to a
-            # clean (no-prompt) state afterward, matching the no-prompt connect
-            # path. Restoring the snapshot rewinds transformer state; clearing
-            # these forces the next session to reload its own voice prompt.
+            lm_attrs = (
+                "use_sampling",
+                "temp",
+                "temp_text",
+                "top_k",
+                "top_k_text",
+                "min_p_text",
+                "repetition_penalty",
+                "repetition_penalty_context",
+                "padding_bonus",
+                "turn_onset_bias",
+                "semantic_temperature_cap",
+                "max_turn_text_tokens",
+                "cfg_gamma",
+                "text_prompt_tokens",
+                "voice_prompt_strength",
+                "voice_selection_interval",
+                "_non_pad_streak",
+                "_turn_pad_streak",
+                "_pad_force_remaining",
+                "_turn_cap_token_pending",
+                "_turn_cap_token_recorded",
+            )
+            server_attrs = (
+                "_active_seed",
+                "_active_voice_blend_mix",
+                "_active_clone_strength",
+                "_active_voice_conditioning_sha256",
+            )
+            lm_values = {
+                name: self._clone_preview_value(getattr(self.lm_gen, name))
+                for name in lm_attrs
+                if hasattr(self.lm_gen, name)
+            }
+            pointer_attrs = (
+                "voice_prompt",
+                "voice_prompt_audio",
+                "voice_prompt_cache",
+                "voice_prompt_embeddings",
+                "voice_prompt_full_state",
+            )
+            pointer_values = {
+                name: getattr(self.lm_gen, name)
+                for name in pointer_attrs
+                if hasattr(self.lm_gen, name)
+            }
+            server_values = {
+                name: self._clone_preview_value(getattr(self, name))
+                for name in server_attrs
+                if hasattr(self, name)
+            }
+            control_tensors = {
+                name: getattr(self.lm_gen, name).detach().clone()
+                for name in ("_audio_temperature", "_audio_top_k")
+                if hasattr(self.lm_gen, name)
+            }
+            lm_stream = self._clone_streaming_state(self.lm_gen)
+            mimi_stream = self._clone_streaming_state(self.mimi)
+            torch_rng = torch.get_rng_state().clone()
+            cuda_rng = (
+                [state.clone() for state in torch.cuda.get_rng_state_all()]
+                if self.device.type == "cuda" and torch.cuda.is_available()
+                else None
+            )
+            python_rng = random.getstate()
+            numpy_rng = np.random.get_state()
+            generation_error: Optional[BaseException] = None
             try:
                 if voice_prompt_path.endswith(".pt"):
                     self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
+                    # Preset voices carry replay embeddings or a full LM
+                    # streaming state, not raw PCM. Window selection and
+                    # clone strength apply only to uploaded audio.
+                    self.lm_gen.voice_prompt_strength = 1.0
+                    self.lm_gen.voice_selection_interval = None
                 else:
                     self.lm_gen.load_voice_prompt(voice_prompt_path)
-                self.lm_gen.voice_prompt_strength = 1.0
+                    self.lm_gen.voice_prompt_strength = float(clone_strength)
+                    self.lm_gen.voice_selection_interval = (
+                        selection_interval
+                        if selection_mode == "representative"
+                        else None
+                    )
+                    conditioned_interval = (
+                        self.lm_gen._strength_voice_prompt_bounds()
+                    )
                 self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(
                     wrap_with_system_tags(PREVIEW_SAMPLE_TEXT)
                 )
+                self.lm_gen.use_sampling = PREVIEW_FIXED_CONTROLS["use_sampling"]
+                self.lm_gen.temp_text = PREVIEW_FIXED_CONTROLS["text_temperature"]
+                self.lm_gen.top_k_text = PREVIEW_FIXED_CONTROLS["text_top_k"]
+                self.lm_gen.min_p_text = PREVIEW_FIXED_CONTROLS["text_min_p"]
+                self.lm_gen.padding_bonus = PREVIEW_FIXED_CONTROLS["padding_bonus"]
+                self.lm_gen.turn_onset_bias = PREVIEW_FIXED_CONTROLS[
+                    "turn_onset_bias"
+                ]
+                self.lm_gen.repetition_penalty = PREVIEW_FIXED_CONTROLS[
+                    "repetition_penalty"
+                ]
+                self.lm_gen.repetition_penalty_context = PREVIEW_FIXED_CONTROLS[
+                    "repetition_penalty_context"
+                ]
+                self.lm_gen.semantic_temperature_cap = PREVIEW_FIXED_CONTROLS[
+                    "semantic_temperature_cap"
+                ]
+                self.lm_gen.cfg_gamma = PREVIEW_FIXED_CONTROLS["cfg_gamma"]
+                self.lm_gen.max_turn_text_tokens = PREVIEW_FIXED_CONTROLS[
+                    "max_turn_text_tokens"
+                ]
+                self.lm_gen.set_audio_sampling(
+                    PREVIEW_FIXED_CONTROLS["audio_temperature"],
+                    PREVIEW_FIXED_CONTROLS["audio_top_k"],
+                )
                 self.lm_gen.reset_turn_cap_tracking()
+                torch.manual_seed(PREVIEW_DEFAULT_SEED)
+                if cuda_rng is not None:
+                    torch.cuda.manual_seed(PREVIEW_DEFAULT_SEED)
 
                 self.mimi.reset_streaming()
                 self.lm_gen.reset_streaming()
@@ -2116,126 +3134,220 @@ class ServerState:
                         continue
                     pcm = self.mimi.decode(tokens[0:1, 1:9])
                     generated_frames.append(pcm.detach().cpu().numpy()[0, 0])
+            except BaseException as exc:
+                generation_error = exc
             finally:
-                # Restore the live snapshot and clear the voice cache so the
-                # next real connect re-primes cleanly. set_streaming_state_inplace
-                # pops the dict it is given, so pass a shallow copy.
-                self.lm_gen.set_streaming_state_inplace(dict(snapshot))
-                self.lm_gen.reset_turn_cap_tracking()
-                self.lm_gen.voice_prompt = None
-                self.lm_gen.voice_prompt_audio = None
-                self.lm_gen.voice_prompt_cache = None
-                self.lm_gen.voice_prompt_embeddings = None
-                self.lm_gen.voice_prompt_full_state = None
-                self.mimi.reset_streaming()
+                restore_errors: list[BaseException] = []
+
+                def attempt(operation) -> None:
+                    try:
+                        operation()
+                    except BaseException as exc:
+                        restore_errors.append(exc)
+
+                attempt(lambda: self.mimi.set_streaming_state_inplace(dict(mimi_stream)))
+                attempt(lambda: self.lm_gen.set_streaming_state_inplace(dict(lm_stream)))
+                attempt(lambda: torch.set_rng_state(torch_rng))
+                if cuda_rng is not None:
+                    attempt(lambda: torch.cuda.set_rng_state_all(cuda_rng))
+                attempt(lambda: random.setstate(python_rng))
+                attempt(lambda: np.random.set_state(numpy_rng))
+                for name, value in control_tensors.items():
+                    attempt(
+                        lambda name=name, value=value: getattr(
+                            self.lm_gen, name
+                        ).copy_(value)
+                    )
+                for name, value in lm_values.items():
+                    attempt(
+                        lambda name=name, value=value: setattr(
+                            self.lm_gen,
+                            name,
+                            self._clone_preview_value(value),
+                        )
+                    )
+                for name, value in pointer_values.items():
+                    attempt(
+                        lambda name=name, value=value: setattr(
+                            self.lm_gen,
+                            name,
+                            value,
+                        )
+                    )
+                for name, value in server_values.items():
+                    attempt(
+                        lambda name=name, value=value: setattr(
+                            self,
+                            name,
+                            self._clone_preview_value(value),
+                        )
+                    )
+                if restore_errors:
+                    logger.critical(
+                        "voice preview restoration failed (%s)",
+                        ",".join(type(exc).__name__ for exc in restore_errors),
+                    )
+                    raise RuntimeError("preview_restore_failed") from restore_errors[0]
+                if generation_error is not None:
+                    raise generation_error
 
         if not generated_frames:
-            raise RuntimeError("voice preview produced no audio frames")
+            raise RuntimeError("preview_empty")
 
         output_pcm = np.concatenate(generated_frames, axis=-1)
-        os.makedirs(self.preview_cache_dir, exist_ok=True)
-        sphn.write_wav(cache_path, output_pcm, sample_rate)
-        return cache_path
+        descriptor, temp_path = tempfile.mkstemp(suffix=".wav")
+        os.close(descriptor)
+        try:
+            sphn.write_wav(temp_path, output_pcm, sample_rate)
+            return Path(temp_path).read_bytes(), conditioned_interval
+        finally:
+            Path(temp_path).unlink(missing_ok=True)
 
     async def handle_voice_preview(self, request):
-        """Synthesize and return a short audio sample of one preset voice.
-
-        Reject-while-live: a preview touches the same GPU and lm_gen state as
-        a session, so it is only honored when ``self.lock`` is free. A live or
-        negotiating session holds the lock and the request returns 409
-        ``session_busy`` without synthesizing. The lock is held for the whole
-        synth (bounded, a few seconds) and released in finally, keeping the
-        preview mutually exclusive with a new connect. The GPU work runs in
-        the executor so the event loop stays responsive.
-        """
-        if self.preview_cache_dir is None:
-            return web.json_response(
-                {"error": "voice preview disabled on this server"}, status=503
-            )
+        """Return an ephemeral fixed conditioned sample; retention is explicit."""
+        if not self._same_origin_request(request):
+            return web.json_response({"error": "origin_rejected"}, status=403)
         try:
             body = await request.json()
-            voice_id = body["voice"]
-        except (ValueError, KeyError) as exc:
-            return web.json_response({"error": f"invalid request: {exc}"}, status=400)
-        if not isinstance(voice_id, str) or not voice_id:
-            return web.json_response(
-                {"error": "invalid request: 'voice' must be a non-empty string"},
-                status=400,
-            )
+        except (ValueError, TypeError):
+            return web.json_response({"error": "invalid_request"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "invalid_request"}, status=400)
+        voice = body.get("voice")
+        mode = body.get("mode", "tail")
+        retain = body.get("retain", False)
+        strength = body.get("clone_strength", 1.0)
+        if (
+            not isinstance(voice, str)
+            or not voice
+            or mode not in {"tail", "representative"}
+            or not isinstance(retain, bool)
+            or not isinstance(strength, (int, float))
+            or isinstance(strength, bool)
+            or not np.isfinite(strength)
+        ):
+            return web.json_response({"error": "invalid_request"}, status=400)
+        if retain and self.preview_cache_dir is None:
+            return web.json_response({"error": "retention_unavailable"}, status=503)
+        strength = max(0.0, min(1.0, float(strength)))
 
-        cache_path = self._resolve_preview_cache_path(voice_id)
-        if cache_path is None:
-            return web.json_response(
-                {"error": f"invalid request: unsafe voice id {voice_id!r}"},
-                status=400,
-            )
-
+        if not await self._try_acquire_session_lock(timeout=0):
+            return web.json_response({"error": "session_busy"}, status=409)
+        if self._resume_grant is not None:
+            self.lock.release()
+            return web.json_response({"error": "session_busy"}, status=409)
         try:
-            voice_prompt_path, _ = self._resolve_voice_prompt_path(
-                f"{voice_id}{VOICE_PROMPT_EXT}"
+            loop = asyncio.get_running_loop()
+            resolve_future = loop.run_in_executor(
+                self._voice_executor,
+                self._resolve_voice_preview_reference,
+                voice,
+                mode,
             )
-        except FileNotFoundError as exc:
-            return web.json_response(
-                {"error": f"voice_not_found: {exc}"}, status=404
-            )
-        if voice_prompt_path is None:
-            return web.json_response(
-                {"error": "voice preview disabled on this server"}, status=503
-            )
-
-        # A cache hit needs neither the GPU nor the session lock; serve it
-        # straight off disk so repeat previews are instant even mid-session.
-        if not os.path.exists(cache_path):
-            if not await self._try_acquire_session_lock(timeout=0):
-                return web.json_response({"error": "session_busy"}, status=409)
-            # The lock is free during a resume window, but the resident
-            # model state belongs to the client about to reclaim it: a
-            # preview here would hold the lock through the reconnect
-            # retries and its finally resets mimi's streaming state under
-            # the conversation. Checked after the acquire so a grant
-            # recorded by a tearing-down runner (which holds the lock
-            # while recording it) can't slip past.
-            if self._resume_grant is not None:
-                self.lock.release()
-                return web.json_response({"error": "session_busy"}, status=409)
             try:
-                loop = asyncio.get_event_loop()
+                resolved = await asyncio.shield(resolve_future)
+            except asyncio.CancelledError:
+                try:
+                    await resolve_future
+                except BaseException:
+                    pass
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "voice preview resolution failed (%s)",
+                    type(exc).__name__,
+                )
+                return web.json_response({"error": "preview_failed"}, status=500)
+            if not isinstance(resolved, dict):
+                logger.warning("voice preview resolution failed (invalid_result)")
+                return web.json_response({"error": "preview_failed"}, status=500)
+            if "error" in resolved:
+                status = 404 if resolved["error"] == "voice_not_found" else 400
+                return web.json_response({"error": resolved["error"]}, status=status)
+            try:
+                voice_prompt_path = resolved["voice_prompt_path"]
+                selection_interval = resolved["selection_interval"]
+                reference_hash = resolved["reference_sha256"]
+            except KeyError:
+                logger.warning("voice preview resolution failed (invalid_result)")
+                return web.json_response({"error": "preview_failed"}, status=500)
+            try:
                 preview_future = loop.run_in_executor(
                     self._infer_executor,
-                    self._synthesize_voice_preview,
-                    voice_prompt_path,
-                    cache_path,
+                    lambda: self._synthesize_voice_preview(
+                        voice_prompt_path,
+                        selection_mode=mode,
+                        selection_interval=selection_interval,
+                        clone_strength=strength,
+                    ),
                 )
                 try:
-                    cache_path = await asyncio.shield(preview_future)
+                    wav_bytes, actual_interval = await asyncio.shield(preview_future)
                 except asyncio.CancelledError:
-                    # Cancelling the HTTP request cannot stop the GPU worker.
-                    # Keep the session gate held until it restores model state.
                     try:
                         await preview_future
                     except BaseException:
                         pass
                     raise
             except Exception as exc:
-                logger.warning(
-                    "voice preview synth failed for %s: %s: %s",
-                    voice_id,
-                    type(exc).__name__,
-                    exc,
-                )
-                return web.json_response(
-                    {"error": f"preview_failed: {exc}"}, status=500
-                )
-            finally:
-                self.lock.release()
+                logger.warning("voice preview failed (%s)", type(exc).__name__)
+                return web.json_response({"error": "preview_failed"}, status=500)
 
-        return web.FileResponse(
-            cache_path,
-            headers={
-                "Content-Type": "audio/wav",
-                "Cache-Control": "public, max-age=86400",
-            },
-        )
+            identity = _preview_identity(
+                reference_sha256=reference_hash,
+                selection_mode=mode,
+                start_sample=actual_interval[0],
+                end_sample=actual_interval[1],
+                sample_rate=self.lm_gen._sample_rate,
+                strength=strength,
+                seed=PREVIEW_DEFAULT_SEED,
+                process_identity={
+                    "schema_version": 1,
+                    **self._process_identity(),
+                },
+                topology={
+                    "lm_batch": 2 if self.caption_cfg else 1,
+                    "mimi_batch": 1,
+                    "frame_size": self.frame_size,
+                },
+            )
+            if retain:
+                try:
+                    retain_future = loop.run_in_executor(
+                        self._voice_executor,
+                        lambda: _atomic_retain_preview(
+                            Path(self.preview_cache_dir),
+                            wav_bytes,
+                            identity,
+                        ),
+                    )
+                    try:
+                        await asyncio.shield(retain_future)
+                    except asyncio.CancelledError:
+                        try:
+                            await retain_future
+                        except BaseException:
+                            pass
+                        raise
+                except Exception as exc:
+                    logger.warning(
+                        "voice preview retention failed (%s)",
+                        type(exc).__name__,
+                    )
+                    return web.json_response(
+                        {"error": "retention_failed"},
+                        status=500,
+                    )
+
+            return web.Response(
+                body=wav_bytes,
+                headers={
+                    "Content-Type": "audio/wav",
+                    "Cache-Control": "no-store",
+                },
+            )
+        finally:
+            self.lock.release()
 
     def _update_user_turn_activity(self, chunk_rms: float) -> tuple[bool, bool]:
         """Advance lightweight speech activity; return (started, ended)."""
@@ -2709,6 +3821,11 @@ class ServerState:
                 pcm_np = main_pcm[0, 0].numpy()
                 self._set_inflight_phase("output_postprocess")
 
+                # Pre-gate RMS of the frame's natural decoded output; stays
+                # None on excluded frames (forced text or interrupt gate) so
+                # the starved-text telemetry below skips them.
+                natural_frame_rms = None
+
                 # Track how long the model's own audio has been silent so an
                 # inject only arms once the current thought has finished
                 # speaking (the pad streak alone reaches its threshold
@@ -2723,6 +3840,7 @@ class ServerState:
                         if pcm_np.size
                         else 0.0
                     )
+                    natural_frame_rms = frame_rms
                     if frame_rms < self._inject_silence_rms:
                         self._audio_silence_streak += 1
                     else:
@@ -2755,6 +3873,15 @@ class ServerState:
                         self._vision_pad_streak += 1
                     else:
                         self._vision_pad_streak = 0
+
+                # Shadow telemetry only; nothing downstream reads it.
+                # Forced-text frames (context drips and the stop latch both
+                # force text), interrupt-gated frames, and inject windows
+                # arrive here with natural_frame_rms None and reset the
+                # streak.
+                self._note_text_starved_frame(
+                    text_token, pad_id, natural_frame_rms
+                )
 
                 text = None
                 # Don't surface forced tokens in the visible transcript.
@@ -3296,6 +4423,7 @@ class ServerState:
         self._last_ambient_context_queued_at = 0.0
         self._vision_pad_streak = 0
         self._audio_silence_streak = 0
+        self._text_starved_streak = 0
         self._collapse_triggers.clear()
         self._prev_pad_force_remaining = 0
         self._post_turn_inject_holdoff = 0
@@ -4057,6 +5185,8 @@ class ServerState:
             "vision_feed_model": bool(self._vision_feed_model),
             "vision_ground_user_turns": bool(self._vision_ground_user_turns),
             "seed": self._active_seed,
+            "voice_blend_mix": float(self._active_voice_blend_mix),
+            "clone_strength": float(self._active_clone_strength),
             "text_temperature": float(self.lm_gen.temp_text),
             "audio_temperature": float(self.lm_gen.temp),
             "text_topk": int(self.lm_gen.top_k_text),
@@ -4066,9 +5196,15 @@ class ServerState:
                 self.lm_gen.repetition_penalty_context
             ),
             "padding_bonus": float(self.lm_gen.padding_bonus),
+            "turn_onset_bias": float(self.lm_gen.turn_onset_bias),
             "text_min_p": float(self.lm_gen.min_p_text),
             "semantic_temp_cap": float(self.lm_gen.semantic_temperature_cap),
             "max_turn_text_tokens": int(self.lm_gen.max_turn_text_tokens),
+            "session_timeout_sec": int(self._active_session_timeout_sec),
+            "vision_cost_limit_usd": float(self._vision_cost_limit_usd),
+            "vision_cost_per_call_usd": float(
+                self._vision_cost_per_call_usd
+            ),
             "inject_silence_rms": float(self._inject_silence_rms),
             "inject_silence_streak": int(self._inject_silence_streak),
             "caption_cfg": bool(self.caption_cfg),
@@ -4239,6 +5375,32 @@ class ServerState:
             shaped[:fade] *= _OUTBOUND_GATE_FADE_IN[:fade]
         return shaped
 
+    def _note_text_starved_frame(
+        self, text_token: int, pad_id: int, frame_rms: float | None
+    ) -> None:
+        """Account one frame of text-starved-audio shadow telemetry.
+
+        A qualifying frame pairs a naturally sampled PAD/EPAD text token
+        with pre-quantize decoded audio above TEXT_STARVED_RMS_FLOOR; a
+        streak of TEXT_STARVED_MIN_FRAMES counts one episode, once.
+        ``frame_rms`` is None on excluded frames (forced text, interrupt
+        gate); an exclusion resets the streak rather than freezing it so
+        an episode never stitches across an inject window. Observability
+        only: no controller, mitigation, or rewind logic reads these.
+        Runs under the inference lock the frame loop already holds.
+        """
+        if (
+            frame_rms is not None
+            and text_token in (0, pad_id)
+            and frame_rms > TEXT_STARVED_RMS_FLOOR
+        ):
+            self._text_starved_streak += 1
+            self._text_starved_frames += 1
+            if self._text_starved_streak == TEXT_STARVED_MIN_FRAMES:
+                self._text_starved_episodes += 1
+        else:
+            self._text_starved_streak = 0
+
     def _note_pad_force_edge(
         self, pad_force: int, now: Optional[float] = None
     ) -> None:
@@ -4382,6 +5544,7 @@ class ServerState:
         self.lm_gen.repetition_penalty = 1.15 if is_base else 1.0
         self.lm_gen.repetition_penalty_context = 64
         self.lm_gen.padding_bonus = 0.0
+        self.lm_gen.turn_onset_bias = 0.0
         self.lm_gen.min_p_text = 0.0
         self.lm_gen.max_turn_text_tokens = 120
         self.lm_gen.reset_repetition_state()
@@ -4534,16 +5697,28 @@ class ServerState:
         catalog = await loop.run_in_executor(None, self._read_voice_catalog)
         return web.json_response({"voices": catalog})
 
+    def _process_identity(self) -> dict[str, object]:
+        """Immutable source, checkpoint, runtime, and startup configuration."""
+
+        return {
+            **self.model_identity,
+            "gpu_name": self.gpu_name,
+            "vram_total": self.vram_total,
+            "driver_version": self.driver_version,
+            "torch_version": self.torch_version,
+            "cuda_version": self.cuda_version,
+            "server_build": self.server_build,
+            "asr_model_sha256": self.asr_model_sha256,
+            "process_flags": dict(self.process_flags),
+            "vision_model": GEMINI_VISION_MODEL,
+        }
+
     async def handle_server_info(self, _request):
         """Report immutable process identity before a session connects."""
         return web.json_response(
             {
-                **self.model_identity,
-                "gpu_name": self.gpu_name,
-                "vram_total": self.vram_total,
-                "server_build": self.server_build,
+                **self._process_identity(),
                 "vision_available": bool(self._gemini_api_key),
-                "vision_model": GEMINI_VISION_MODEL,
             }
         )
 
@@ -4811,6 +5986,7 @@ class ServerState:
                 ice_servers=self._ice_servers_config,
                 backpressure_status=self._backpressure_status,
                 process_executor=self._infer_executor,
+                runtime_metrics=self._runtime_metrics,
             )
             session.set_config_handler(on_config)
 
@@ -4956,17 +6132,28 @@ class ServerState:
                 self._session_bookmarks[session_id] = resume_state["bookmarks"]
                 # Fall through to the shared live-path setup below; every
                 # step between here and there is fresh-session priming.
+            _prepare_runtime_metrics(
+                self._runtime_metrics,
+                resuming=resuming,
+            )
             if not resuming:
                 cfg = config_holder["cfg"]
-                clog.log("info", f"config: voice_prompt={cfg.voice_prompt!r}")
+                voice_category = (
+                    "uploaded"
+                    if cfg.voice_prompt.startswith(UPLOAD_PREFIX)
+                    else "preset"
+                    if cfg.voice_prompt
+                    else "none"
+                )
+                clog.log("info", f"config: voice={voice_category}")
 
                 try:
                     voice_prompt_path, requested = self._resolve_voice_prompt_path(
                         cfg.voice_prompt
                     )
-                except FileNotFoundError as exc:
-                    clog.log("error", str(exc))
-                    session.send_error(f"voice_prompt_not_found: {exc}")
+                except FileNotFoundError:
+                    clog.log("error", "voice prompt not found")
+                    session.send_error("voice_prompt_not_found")
                     return
 
                 # Blend mixes two saved-embedding (.pt) voices into one prefix.
@@ -4987,9 +6174,9 @@ class ServerState:
                         voice_prompt_b_path, _ = self._resolve_voice_prompt_path(
                             cfg.voice_prompt_b
                         )
-                    except FileNotFoundError as exc:
-                        clog.log("error", str(exc))
-                        session.send_error(f"voice_prompt_b_not_found: {exc}")
+                    except FileNotFoundError:
+                        clog.log("error", "secondary voice prompt not found")
+                        session.send_error("voice_prompt_b_not_found")
                         return
                     if voice_prompt_b_path is None or not voice_prompt_b_path.endswith(".pt"):
                         blend_active = False
@@ -5040,6 +6227,7 @@ class ServerState:
                     f"repetition={self.lm_gen.repetition_penalty:.2f} "
                     f"repetition_context={self.lm_gen.repetition_penalty_context} "
                     f"padding_bonus={self.lm_gen.padding_bonus:.2f} "
+                    f"turn_onset_bias={self.lm_gen.turn_onset_bias:.2f} "
                     f"max_turn={self.lm_gen.max_turn_text_tokens}",
                 )
 
@@ -5169,7 +6357,17 @@ class ServerState:
 
             async def on_message(msg: dict):
                 mtype = msg.get("type")
-                if mtype == "rewind":
+                if mtype == "runtime_summary_request":
+                    if not _handle_runtime_summary_request(
+                        session,
+                        self._runtime_metrics,
+                        msg,
+                    ):
+                        clog.log(
+                            "warning",
+                            "runtime_summary_request missing valid request_id",
+                        )
+                elif mtype == "rewind":
                     bookmark_id = str(msg.get("id") or "")[:BOOKMARK_ID_MAX_LEN]
                     if bookmark_id:
                         # Restore-by-id: jump to a user-pinned labelled
@@ -5492,6 +6690,7 @@ class ServerState:
                         "repetition_penalty",
                         "repetition_penalty_context",
                         "padding_bonus",
+                        "turn_onset_bias",
                         "text_min_p",
                         "semantic_temp_cap",
                         "max_turn_text_tokens",
@@ -5556,6 +6755,10 @@ class ServerState:
                         if "padding_bonus" in msg:
                             updates["padding_bonus"] = clamp_padding_bonus(
                                 msg["padding_bonus"]
+                            )
+                        if "turn_onset_bias" in msg:
+                            updates["turn_onset_bias"] = clamp_turn_onset_bias(
+                                msg["turn_onset_bias"]
                             )
                         if "text_min_p" in msg:
                             updates["min_p_text"] = clamp_text_min_p(
@@ -6162,6 +7365,8 @@ class ServerState:
                                 "user_turn_starts": self._user_turn_starts,
                                 "user_turn_ends": self._user_turn_ends,
                                 "mimi_encode_frames": self._mimi_encode_frames,
+                                "text_starved_frames": self._text_starved_frames,
+                                "text_starved_episodes": self._text_starved_episodes,
                             })
                             session.send_stat(
                                 vram_used,
@@ -6387,12 +7592,22 @@ class ServerState:
                             f"recording-active notify failed: {type(exc).__name__}: {exc}",
                         )
 
+            assert cfg is not None
+            voice_request = "\0".join(
+                (
+                    cfg.voice_prompt,
+                    cfg.voice_prompt_b,
+                    f"{cfg.voice_blend_mix:.9g}",
+                )
+            )
             identity = {
-                **self.model_identity,
-                "gpu_name": self.gpu_name,
-                "vram_total": self.vram_total,
-                "server_build": self.server_build,
-                "vision_model": GEMINI_VISION_MODEL,
+                **self._process_identity(),
+                "voice_request_sha256": hashlib.sha256(
+                    voice_request.encode("utf-8")
+                ).hexdigest(),
+                "voice_conditioning_sha256": (
+                    self._active_voice_conditioning_sha256
+                ),
             }
             if resuming:
                 # Tells the client its session state survived, so it keeps
@@ -7015,7 +8230,10 @@ def main():
     if args.voice_prompt_dir is not None:
         assert os.path.exists(args.voice_prompt_dir), \
             f"Directory missing: {args.voice_prompt_dir}"
-    logger.info(f"voice_prompt_dir = {args.voice_prompt_dir}")
+    logger.info(
+        "voice_prompt_assets = %s",
+        "enabled" if args.voice_prompt_dir is not None else "disabled",
+    )
 
     # Resolve uploads_dir. Default: <voice_prompt_dir>/uploads if the preset dir
     # exists; otherwise None (upload endpoint disabled unless user passes
@@ -7024,7 +8242,10 @@ def main():
         args.uploads_dir = os.path.join(args.voice_prompt_dir, "uploads")
     if args.uploads_dir is not None:
         os.makedirs(args.uploads_dir, exist_ok=True)
-    logger.info(f"uploads_dir = {args.uploads_dir}")
+    logger.info(
+        "voice_uploads = %s",
+        "enabled" if args.uploads_dir is not None else "disabled",
+    )
 
     # Resolve recordings_dir only when recording is enabled. Default:
     # <voice_prompt_dir>/recordings, mirroring uploads. Left None when the
@@ -7056,7 +8277,10 @@ def main():
         os.makedirs(preview_cache_dir, exist_ok=True)
     else:
         preview_cache_dir = None
-    logger.info(f"preview_cache_dir = {preview_cache_dir}")
+    logger.info(
+        "voice_preview_retention = %s",
+        "enabled" if preview_cache_dir is not None else "disabled",
+    )
 
     static_path: None | str = _get_static_path(args.static)
     assert static_path is None or os.path.exists(static_path), \
@@ -7187,18 +8411,21 @@ def main():
         "asr: %s",
         "enabled" if asr_engine is not None else "disabled",
     )
+    asr_model_sha256 = (
+        asr_engine.model_sha256
+        if asr_engine is not None
+        else hashlib.sha256(b"disabled").hexdigest()
+    )
 
-    # Optional best-of-N voice reference window selection. Constructed only
-    # when PERSONAPLEX_VOICE_PICKER is enabled; wavlm_embedder itself returns
-    # None (and logs) when transformers is unavailable, so the default
-    # deployment loads nothing and priming slices the clip tail exactly as
-    # with the flag off. The embedder loads its model lazily on the first
-    # sliced priming, on the inference executor.
+    # Optional enrollment-time selection is CPU-only and owned by the
+    # dedicated voice worker. LM setup never loads or invokes the embedder.
+    voice_window_embedder = None
     if _environment_flag("PERSONAPLEX_VOICE_PICKER", False):
-        lm_gen.voice_window_embedder = wavlm_embedder(args.device)
+        voice_window_embedder = wavlm_embedder("cpu")
+    lm_gen.voice_window_embedder = None
     logger.info(
         "voice_picker: %s",
-        "enabled" if lm_gen.voice_window_embedder is not None else "disabled",
+        "enabled" if voice_window_embedder is not None else "disabled",
     )
 
     state = ServerState(
@@ -7220,7 +8447,14 @@ def main():
         ),
         model_revision=None if local_moshi_weight is not None else args.hf_revision,
         save_voice_prompt_embeddings=False,
-        caption_cfg=bool(args.caption_cfg)
+        caption_cfg=bool(args.caption_cfg),
+        kv_sink_frames=int(args.kv_sink_frames),
+        voice_picker_available=bool(
+            voice_window_embedder is not None
+        ),
+        voice_window_embedder=voice_window_embedder,
+        cpu_offload=bool(args.cpu_offload),
+        asr_model_sha256=asr_model_sha256,
     )
     logger.info("warming up the model")
     t = time.monotonic()
@@ -7243,6 +8477,7 @@ def main():
     app.router.add_get("/api/rtc/ice-servers", state.handle_ice_servers)
     app.router.add_post("/api/voice-upload", state.handle_voice_upload)
     app.router.add_post("/api/voice-preview", state.handle_voice_preview)
+    app.router.add_post("/api/voice-delete", state.handle_voice_delete)
     app.router.add_get("/api/recording/{session_id}", state.handle_recording_download)
     app.router.add_get("/api/info", state.handle_server_info)
     app.router.add_get("/voices", state.handle_voices)
@@ -7314,6 +8549,9 @@ def main():
                 )
         if state.asr is not None:
             state.asr.shutdown()
+        if state._voice_window_embedder is not None:
+            state._voice_window_embedder.unload()
+        await asyncio.to_thread(state._voice_executor.shutdown, True)
         await asyncio.to_thread(state._infer_executor.shutdown, True)
     app.on_cleanup.append(_close_http_session)
 

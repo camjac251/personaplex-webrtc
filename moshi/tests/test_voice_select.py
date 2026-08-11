@@ -8,6 +8,9 @@ network access and no speaker model are involved.
 
 from __future__ import annotations
 
+import builtins
+import io
+import logging
 import sys
 
 import numpy as np
@@ -15,9 +18,17 @@ import torch
 
 sys.path.insert(0, "moshi")
 
-from moshi.models.lm import LMGen  # noqa: E402
-from moshi.voice_select import select_voice_window  # noqa: E402
-
+from moshi.models.lm import LMGen
+from moshi.voice_select import (
+    WAVLM_MODEL_ID,
+    SelectionResult,
+    _WavLMEmbedder,
+    select_voice_window,
+    select_voice_window_result,
+)
+from moshi.voice_select import (
+    logger as voice_select_logger,
+)
 
 SAMPLE_RATE = 1_000
 
@@ -128,6 +139,115 @@ def test_short_clip_passes_through_without_embedding() -> None:
     shorter = np.ones(500, dtype=np.float32)
     assert select_voice_window(shorter, SAMPLE_RATE, 1_000, recording_embed) == 0
     assert calls == []
+
+
+def test_selection_result_is_aligned_and_exposes_no_vector() -> None:
+    clip = np.arange(4_321, dtype=np.float32)
+    result = select_voice_window_result(
+        clip,
+        SAMPLE_RATE,
+        1_005,
+        _mix_embed,
+        frame_samples=100,
+    )
+    assert isinstance(result, SelectionResult)
+    assert result.start_sample % 100 == 0
+    assert result.end_sample % 100 == 0
+    assert result.end_sample <= clip.size
+    assert set(result.to_dict()) == {
+        "mode",
+        "start_sample",
+        "end_sample",
+        "start_seconds",
+        "end_seconds",
+        "fallback_reason",
+    }
+
+
+def test_deterministic_fallback_reasons_and_minimum_window() -> None:
+    clip = np.ones(2_500, dtype=np.float32)
+    result = select_voice_window_result(
+        clip,
+        SAMPLE_RATE,
+        100,
+        None,
+        frame_samples=100,
+        minimum_window_samples=1_000,
+    )
+    assert result.mode == "tail"
+    assert result.fallback_reason == "embedder_unavailable"
+    assert result.end_sample - result.start_sample == 1_000
+
+    whole = select_voice_window_result(
+        clip[:500],
+        SAMPLE_RATE,
+        100,
+        _mix_embed,
+        frame_samples=100,
+        minimum_window_samples=1_000,
+    )
+    assert whole.start_sample == 0
+    assert whole.end_sample == 500
+    assert whole.fallback_reason == "whole_clip_shorter_than_minimum"
+
+
+def test_wavlm_defaults_to_cpu_and_unloads() -> None:
+    embedder = _WavLMEmbedder()
+    assert str(embedder.requested_device) == "cpu"
+    embedder._model = object()
+    embedder._extractor = object()
+    embedder._device = object()
+    embedder.unload()
+    assert embedder._model is None
+    assert embedder._extractor is None
+    assert embedder._device is None
+
+
+def test_wavlm_load_failure_log_excludes_exception_text() -> None:
+    secret = "/private/cache/model.bin"
+    original_import = builtins.__import__
+
+    def blocked_import(name, *args, **kwargs):
+        if name == "transformers":
+            raise RuntimeError(secret)
+        return original_import(name, *args, **kwargs)
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    voice_select_logger.addHandler(handler)
+    builtins.__import__ = blocked_import
+    try:
+        try:
+            _WavLMEmbedder()._ensure_loaded()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("load failure was not surfaced")
+    finally:
+        builtins.__import__ = original_import
+        voice_select_logger.removeHandler(handler)
+    logged = stream.getvalue()
+    assert WAVLM_MODEL_ID in logged
+    assert "RuntimeError" in logged
+    assert secret not in logged
+
+
+def test_tail_and_representative_keep_identical_frame_aligned_lengths() -> None:
+    lm_gen = LMGen.__new__(LMGen)
+    lm_gen.voice_prompt_audio = np.arange(4_321, dtype=np.float32)[None, :]
+    lm_gen.voice_prompt_strength = 0.55
+    lm_gen._frame_size = 100
+    lm_gen._sample_rate = SAMPLE_RATE
+    lm_gen.voice_window_embedder = None
+
+    lm_gen.voice_selection_interval = None
+    tail_start, tail_end = lm_gen._strength_voice_prompt_bounds()
+    lm_gen.voice_selection_interval = (1_000, 2_000)
+    rep_start, rep_end = lm_gen._strength_voice_prompt_bounds()
+
+    assert tail_end - tail_start == rep_end - rep_start
+    assert tail_start % 100 == 0
+    assert rep_start % 100 == 0
 
 
 def test_priming_slice_uses_selected_window() -> None:
@@ -250,6 +370,11 @@ if __name__ == "__main__":
         test_degenerate_scores_fall_back_to_tail,
         test_tied_scores_fall_back_to_tail,
         test_short_clip_passes_through_without_embedding,
+        test_selection_result_is_aligned_and_exposes_no_vector,
+        test_deterministic_fallback_reasons_and_minimum_window,
+        test_wavlm_defaults_to_cpu_and_unloads,
+        test_wavlm_load_failure_log_excludes_exception_text,
+        test_tail_and_representative_keep_identical_frame_aligned_lengths,
         test_priming_slice_uses_selected_window,
         test_full_strength_and_empty_keep_never_embed,
         test_voice_prompt_count_is_zero_without_a_prompt,

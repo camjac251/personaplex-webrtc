@@ -333,11 +333,132 @@ def test_boundary_silence_trim_keeps_quiet_valid_clip() -> None:
     assert trimmed.shape[-1] == 4 * sample_rate
 
 
+def _bias_lm_gen() -> LMGen:
+    lm_gen = LMGen.__new__(LMGen)
+    # EPAD=0 / PAD=3 mirror the deployed tokenizer's `token in (0, pad_id)`
+    # idiom used by the turn accounting.
+    lm_gen.lm_model = SimpleNamespace(
+        text_padding_token_id=3, end_of_text_padding_id=0
+    )
+    lm_gen.padding_bonus = 0.0
+    lm_gen.turn_onset_bias = 0.0
+    lm_gen.max_turn_text_tokens = 120
+    lm_gen._non_pad_streak = 0
+    lm_gen._forced_text_recent = False
+    return lm_gen
+
+
+def test_turn_onset_bias_lands_on_epad_logit() -> None:
+    lm_gen = _bias_lm_gen()
+    logits = torch.zeros((1, 1, 1, 5), dtype=torch.float32)
+
+    # Zero bias is a strict no-op: same tensor object, no allocation.
+    out = lm_gen._apply_text_logit_biases(logits, logits)
+    assert out is logits
+
+    lm_gen.turn_onset_bias = -2.5
+    out = lm_gen._apply_text_logit_biases(logits, logits)
+    assert out[0, 0, 0, 0].item() == -2.5
+    assert torch.all(out[..., 1:] == 0.0)
+
+
+def test_padding_bonus_is_continuation_only() -> None:
+    lm_gen = _bias_lm_gen()
+    lm_gen.padding_bonus = 1.5
+    logits = torch.zeros((1, 1, 1, 5), dtype=torch.float32)
+
+    # Onset (no text underway per the previous frame's accounting): PAD
+    # keeps its natural logit so the bonus cannot outbid EPAD at the moment
+    # speech would start.
+    lm_gen._non_pad_streak = 0
+    out = lm_gen._apply_text_logit_biases(logits, logits)
+    assert out is logits
+    assert torch.all(logits == 0.0)
+
+    # Mid-turn the bonus applies to PAD and leaves EPAD untouched.
+    lm_gen._non_pad_streak = 4
+    out = lm_gen._apply_text_logit_biases(logits, logits)
+    assert out[0, 0, 0, 3].item() == 1.5
+    assert out[0, 0, 0, 0].item() == 0.0
+
+
+def test_padding_bonus_ungated_when_turn_cap_disabled() -> None:
+    # max_turn_text_tokens <= 0 zeroes the streak every frame, so the gate
+    # falls back to the always-on behavior for server-constructed configs.
+    lm_gen = _bias_lm_gen()
+    lm_gen.padding_bonus = 1.0
+    lm_gen.max_turn_text_tokens = 0
+    lm_gen._non_pad_streak = 0
+    logits = torch.zeros((1, 1, 1, 5), dtype=torch.float32)
+    out = lm_gen._apply_text_logit_biases(logits, logits)
+    assert out[0, 0, 0, 3].item() == 1.0
+
+
+def test_padding_bonus_waits_for_natural_text_after_forced_window() -> None:
+    # A context drip freezes _non_pad_streak while forcing text, so the
+    # frozen positive streak alone must not re-arm the bonus at the reply
+    # onset that follows the window.
+    lm_gen = _bias_lm_gen()
+    lm_gen.padding_bonus = 1.0
+    lm_gen._non_pad_streak = 4
+    lm_gen._turn_pad_streak = 0
+    lm_gen._pad_force_remaining = 0
+    logits = torch.zeros((1, 1, 1, 5), dtype=torch.float32)
+
+    def account(token: int, *, forced_text: bool = False) -> None:
+        lm_gen._update_turn_cap(
+            torch.tensor([token], dtype=torch.long),
+            3,
+            text_was_forced=forced_text,
+            turn_pad_forced=False,
+        )
+
+    account(21, forced_text=True)
+    assert lm_gen._non_pad_streak == 4
+    out = lm_gen._apply_text_logit_biases(logits, logits)
+    assert out is logits
+
+    # Post-window natural PADs keep the hold; only sampled text releases it.
+    account(3)
+    out = lm_gen._apply_text_logit_biases(logits, logits)
+    assert out is logits
+    assert torch.all(logits == 0.0)
+
+    account(22)
+    out = lm_gen._apply_text_logit_biases(logits, logits)
+    assert out[0, 0, 0, 3].item() == 1.0
+
+
+def test_bias_writes_never_mutate_aliased_logits() -> None:
+    lm_gen = _bias_lm_gen()
+    lm_gen.turn_onset_bias = 1.0
+    lm_gen.padding_bonus = 2.0
+    lm_gen._non_pad_streak = 3
+    logits = torch.zeros((1, 1, 1, 5), dtype=torch.float32)
+
+    # float() of a float32 tensor aliases the source storage, mirroring the
+    # CUDA-graph captured buffer: the helper must clone before either write.
+    aliased = logits.float()
+    assert aliased.data_ptr() == logits.data_ptr()
+    out = lm_gen._apply_text_logit_biases(aliased, logits)
+    assert out.data_ptr() != logits.data_ptr()
+    assert torch.all(logits == 0.0)
+    assert out[0, 0, 0, 0].item() == 1.0
+    assert out[0, 0, 0, 3].item() == 2.0
+
+    # An already-copied tensor (repetition penalty or CFG produced it) is
+    # mutated in place with no second allocation.
+    fresh = logits.clone()
+    out = lm_gen._apply_text_logit_biases(fresh, logits)
+    assert out is fresh
+
+
 def test_turn_cap_reset_clears_pending_copy_bookkeeping() -> None:
     lm_gen = LMGen.__new__(LMGen)
     lm_gen._non_pad_streak = 7
     lm_gen._turn_pad_streak = 5
     lm_gen._pad_force_remaining = 3
+    lm_gen._forced_text_recent = True
     lm_gen._turn_cap_token_pending = True
     lm_gen._turn_cap_token_recorded = True
     lm_gen._turn_cap_token_host = torch.tensor([99], dtype=torch.long)
@@ -347,6 +468,7 @@ def test_turn_cap_reset_clears_pending_copy_bookkeeping() -> None:
     assert lm_gen._non_pad_streak == 0
     assert lm_gen._turn_pad_streak == 0
     assert lm_gen._pad_force_remaining == 0
+    assert lm_gen._forced_text_recent is False
     assert lm_gen._turn_cap_token_pending is False
     assert lm_gen._turn_cap_token_recorded is False
 
@@ -380,6 +502,11 @@ if __name__ == "__main__":
         test_new_turn_clears_history_before_penalty,
         test_interrupt_force_window_works_with_turn_cap_disabled,
         test_turn_cap_counts_across_short_natural_pauses,
+        test_turn_onset_bias_lands_on_epad_logit,
+        test_padding_bonus_is_continuation_only,
+        test_padding_bonus_ungated_when_turn_cap_disabled,
+        test_padding_bonus_waits_for_natural_text_after_forced_window,
+        test_bias_writes_never_mutate_aliased_logits,
         test_boundary_silence_trim_keeps_guarded_speech,
         test_boundary_silence_trim_preserves_internal_pause,
         test_boundary_silence_trim_keeps_all_silence,

@@ -1,0 +1,74 @@
+vars: {
+  d2-config: {
+    layout-engine: elk
+    theme-id: 0
+    dark-theme-id: 200
+  }
+}
+
+direction: right
+
+classes: {
+  boundary: {
+    style.border-radius: 6
+    style.shadow: true
+  }
+  decision: {
+    shape: diamond
+  }
+}
+
+browser: Browser dashboard {
+  class: boundary
+  live: Live session
+  stopping: Stopping
+  ended: Ended, Start available
+  start: Fresh Start
+  trace: Privacy-safe lifecycle trace
+}
+
+server: Single-session server {
+  class: boundary
+  lock: ServerState.lock
+  teardown: Old runner finalization
+  fresh: Fresh runner reset and priming
+  ready: Ready, resumed=false
+}
+
+model: Resident inference allocation {
+  class: boundary
+  reset: Reset LM and Mimi streaming state
+  prime: Voice, silence, text, silence
+  sink: Ring KV sink=8
+}
+
+browser.live -> browser.stopping: Stop, send goodbye
+browser.stopping -> server.teardown: close old transport after guarded delay
+server.teardown -> server.lock: release after finalization
+browser.stopping -> browser.ended: cleanup complete
+browser.ended -> browser.start: user starts again
+browser.start -> server.lock: fresh offer, no resume ID
+server.lock -> server.fresh: acquired
+server.fresh -> model.reset
+model.reset -> model.prime
+model.prime -> model.sink: overwrite startup anchors
+model.sink -> server.ready
+server.ready -> browser.live
+browser.live -> browser.trace: config, priming, audio, cap events
+server.ready -> browser.trace: lifecycle receipt
+
+race: Current defect {
+  class: boundary
+  premature: ended exposed before cleanup
+  timer: stale 150 ms callback
+  busy: 250 ms fresh lock timeout
+  premature -> timer: immediate Start can replace refs
+  timer -> busy: closes new refs or collides with finalization
+}
+
+browser.live -> race.premature: current Stop path {
+  style.stroke-dash: 4
+}
+race.busy -> browser.ended: 409 or phase corruption {
+  style.stroke-dash: 4
+}

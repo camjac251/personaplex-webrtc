@@ -5,18 +5,13 @@ the clip, the slice position is a free choice. ``select_voice_window``
 scores every candidate window against the whole clip and returns the start
 of the most speaker-representative one; the exact tail window is always a
 candidate, and ties or scoring failures fall back to it, so the selector
-can never do worse than the plain tail slice.
+always preserves the deterministic plain-tail fallback.
 
 The bundled embedder wraps the ``microsoft/wavlm-base-plus-sv`` speaker-
-verification model from ``transformers``. transformers is an optional
-dependency, deliberately absent from the project manifest: the embedder
-activates only when the package is installed in the environment
-(``uv pip install transformers``), and ``wavlm_embedder`` returns ``None``
-otherwise so callers degrade to tail behavior. The model itself loads
-lazily on the first embedding call, on the same device policy the ASR
-engine uses (CUDA when the requested device is CUDA and available, else
-CPU), and any load or inference failure logs one warning and degrades the
-selection to the tail window.
+verification model from ``transformers``. It is exposed through the optional
+``voice-selection`` dependency extra; default installs remain unaffected.
+The model loads lazily on CPU only, can be explicitly unloaded, and any load
+or inference failure degrades selection to the deterministic tail window.
 """
 
 from __future__ import annotations
@@ -24,11 +19,11 @@ from __future__ import annotations
 import importlib.util
 import logging
 import time
-from typing import Callable, Optional
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
 
 import numpy as np
 import torch
-
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +33,21 @@ WAVLM_MODEL_ID = "microsoft/wavlm-base-plus-sv"
 WAVLM_SAMPLE_RATE = 16_000
 
 EmbedFn = Callable[[np.ndarray, int], np.ndarray]
+
+
+@dataclass(frozen=True)
+class SelectionResult:
+    """Observable selection interval without scores or embeddings."""
+
+    mode: str
+    start_sample: int
+    end_sample: int
+    start_seconds: float
+    end_seconds: float
+    fallback_reason: str | None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
 def _resample_linear(audio: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
@@ -51,7 +61,7 @@ def _resample_linear(audio: np.ndarray, src_rate: int, dst_rate: int) -> np.ndar
     if src_rate == dst_rate or audio.size == 0:
         return audio
     duration = audio.shape[-1] / float(src_rate)
-    dst_len = int(round(duration * dst_rate))
+    dst_len = round(duration * dst_rate)
     if dst_len <= 0:
         return np.zeros(0, dtype=np.float32)
     src_idx = np.linspace(0.0, audio.shape[-1] - 1, num=dst_len, dtype=np.float64)
@@ -86,48 +96,90 @@ def select_voice_window(
     returns the tail start instead. Clips no longer than the window return
     start 0 without embedding anything.
     """
+    return select_voice_window_result(
+        wav,
+        sample_rate,
+        window_samples,
+        embed_fn,
+        frame_samples=1,
+        minimum_window_samples=0,
+    ).start_sample
+
+
+def select_voice_window_result(
+    wav: np.ndarray,
+    sample_rate: int,
+    window_samples: int,
+    embed_fn: EmbedFn | None,
+    *,
+    frame_samples: int,
+    minimum_window_samples: int = 0,
+) -> SelectionResult:
+    """Select a frame-aligned representative interval with deterministic fallback."""
     mono = np.asarray(wav).reshape(-1)
     total = int(mono.shape[-1])
-    window = int(window_samples)
-    if window <= 0 or total <= window:
-        return 0
+    frame = max(1, int(frame_samples))
+    minimum = max(0, int(minimum_window_samples))
+    requested = max(int(window_samples), minimum)
+    window = min(total, max(frame, -(-requested // frame) * frame))
+    if total <= window:
+        reason = "whole_clip_shorter_than_minimum" if total < minimum else "whole_clip"
+        return SelectionResult("tail", 0, total, 0.0, total / sample_rate, reason)
 
-    tail_start = total - window
+    tail_start = max(0, ((total - window) // frame) * frame)
     hop = max(1, window // 2)
+    hop = max(frame, (hop // frame) * frame)
     starts = list(range(0, tail_start + 1, hop))
     if starts[-1] != tail_start:
         starts.append(tail_start)
 
-    try:
-        reference = np.asarray(embed_fn(mono, sample_rate), dtype=np.float64)
-        reference = reference.reshape(-1)
-        scores = np.asarray(
-            [
-                _cosine_similarity(
-                    reference,
-                    np.asarray(
-                        embed_fn(mono[start : start + window], sample_rate),
-                        dtype=np.float64,
-                    ).reshape(-1),
-                )
-                for start in starts
-            ]
-        )
-    except Exception as exc:
-        logger.warning(
-            "voice window scoring failed (%s: %s); keeping the tail slice",
-            type(exc).__name__,
-            exc,
-        )
-        return tail_start
+    fallback_reason: str | None = None
+    winner_start = tail_start
+    if embed_fn is None:
+        fallback_reason = "embedder_unavailable"
+    else:
+        try:
+            reference = np.asarray(embed_fn(mono, sample_rate), dtype=np.float64)
+            reference = reference.reshape(-1)
+            scores = np.asarray(
+                [
+                    _cosine_similarity(
+                        reference,
+                        np.asarray(
+                            embed_fn(mono[start : start + window], sample_rate),
+                            dtype=np.float64,
+                        ).reshape(-1),
+                    )
+                    for start in starts
+                ]
+            )
+        except Exception as exc:  # noqa: BLE001 -- optional embedder boundary
+            logger.warning(
+                "voice window scoring failed (%s); keeping the tail slice",
+                type(exc).__name__,
+            )
+            fallback_reason = "scoring_failed"
+        else:
+            if not np.all(np.isfinite(scores)):
+                fallback_reason = "non_finite_score"
+            else:
+                best = float(scores.max())
+                winners = np.flatnonzero(scores == best)
+                if winners.size != 1:
+                    fallback_reason = "score_tie"
+                else:
+                    winner_start = int(starts[int(winners[0])])
 
-    if not np.all(np.isfinite(scores)):
-        return tail_start
-    best = float(scores.max())
-    winners = np.flatnonzero(scores == best)
-    if winners.size != 1:
-        return tail_start
-    return int(starts[int(winners[0])])
+    mode = "representative" if fallback_reason is None else "tail"
+    end = min(total, winner_start + window)
+    return SelectionResult(
+        mode,
+        winner_start,
+        end,
+        winner_start / sample_rate,
+        end / sample_rate,
+        fallback_reason,
+    )
 
 
 class _WavLMEmbedder:
@@ -139,11 +191,22 @@ class _WavLMEmbedder:
     ``select_voice_window`` observe as the tail fallback.
     """
 
-    def __init__(self, device: str | torch.device):
+    def __init__(self, device: str | torch.device = "cpu"):
         self._requested_device = device
         self._model = None
         self._extractor = None
-        self._device: Optional[torch.device] = None
+        self._device: torch.device | None = None
+        self._load_failed = False
+
+    @property
+    def requested_device(self) -> torch.device:
+        return torch.device(self._requested_device)
+
+    def unload(self) -> None:
+        """Release the optional CPU model and extractor explicitly."""
+        self._model = None
+        self._extractor = None
+        self._device = None
         self._load_failed = False
 
     def _ensure_loaded(self) -> None:
@@ -155,10 +218,9 @@ class _WavLMEmbedder:
             from transformers import AutoFeatureExtractor, WavLMForXVector
 
             requested = torch.device(self._requested_device)
-            if requested.type == "cuda" and torch.cuda.is_available():
-                target = torch.device("cuda")
-            else:
-                target = torch.device("cpu")
+            if requested.type != "cpu":
+                raise ValueError("voice selection supports CPU only")
+            target = torch.device("cpu")
             t = time.monotonic()
             extractor = AutoFeatureExtractor.from_pretrained(WAVLM_MODEL_ID)
             model = WavLMForXVector.from_pretrained(WAVLM_MODEL_ID)
@@ -176,11 +238,10 @@ class _WavLMEmbedder:
         except Exception as exc:
             self._load_failed = True
             logger.warning(
-                "voice-picker embedder %r failed to load (%s: %s); voice "
+                "voice-picker embedder %r failed to load (%s); voice "
                 "window selection keeps the tail slice",
                 WAVLM_MODEL_ID,
                 type(exc).__name__,
-                exc,
             )
             raise
 
@@ -197,7 +258,7 @@ class _WavLMEmbedder:
         return embeddings[0].detach().cpu().numpy()
 
 
-def wavlm_embedder(device: str | torch.device) -> Optional[_WavLMEmbedder]:
+def wavlm_embedder(device: str | torch.device = "cpu") -> _WavLMEmbedder | None:
     """Return a lazy WavLM embedder, or None when transformers is absent.
 
     Mirrors the guarded ``faster_whisper`` pattern: the availability probe

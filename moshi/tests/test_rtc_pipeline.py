@@ -9,13 +9,16 @@ import asyncio
 import json
 import sys
 import threading
+import time
+from collections import deque
+from concurrent.futures import Executor, Future
 from unittest.mock import patch
 
 import numpy as np
 
 sys.path.insert(0, "moshi")
 
-from moshi.rtc_session import (  # noqa: E402
+from moshi.rtc_session import (
     OUTBOUND_FRAME_SAMPLES,
     OUTBOUND_PREBUFFER_DECAY_RECVS,
     OUTBOUND_PREBUFFER_MAX_SAMPLES,
@@ -26,8 +29,15 @@ from moshi.rtc_session import (  # noqa: E402
     MimiOutputTrack,
     RTCSession,
 )
-import moshi.rtc_opus as rtc_opus  # noqa: E402
-from moshi.server import ServerState, _new_lifecycle_receipt  # noqa: E402
+from moshi.runtime_metrics import RuntimeMetrics
+from moshi.server import (
+    TEXT_STARVED_MIN_FRAMES,
+    TEXT_STARVED_RMS_FLOOR,
+    ServerState,
+    _new_lifecycle_receipt,
+)
+
+from moshi import rtc_opus
 
 
 class _OutputTrack:
@@ -54,12 +64,15 @@ def _bare_session(process_fn) -> RTCSession:
     session._frame_size = 4
     session._process_fn = process_fn
     session._process_executor = None
+    session._runtime_metrics = RuntimeMetrics()
+    session._monotonic = time.monotonic
     session._log = lambda _level, _text: None
     session._pcm_queue = asyncio.Queue(maxsize=10)
     session._processing_started = True
     session._processing_paused = False
     session._pipeline_generation = 2
     session._pending_pcm = None
+    session._pending_pcm_segments = deque()
     session._process_idle = asyncio.Event()
     session._process_idle.set()
     session._output_track = _OutputTrack()
@@ -78,6 +91,22 @@ def _bare_session(process_fn) -> RTCSession:
     return session
 
 
+def _queue_pcm(
+    session: RTCSession,
+    generation: int,
+    samples: np.ndarray,
+    *,
+    arrived_at: float | None = None,
+) -> None:
+    session._pcm_queue.put_nowait(
+        (
+            generation,
+            samples,
+            time.monotonic() if arrived_at is None else arrived_at,
+        )
+    )
+
+
 async def _wait_until(predicate, timeout: float = 1.0) -> None:
     deadline = asyncio.get_event_loop().time() + timeout
     while not predicate():
@@ -94,10 +123,16 @@ async def _stop_loop(session: RTCSession, task: asyncio.Task) -> None:
 async def test_stale_queued_generation_is_discarded() -> None:
     session = _bare_session(lambda chunk: [(chunk, None)])
     task = asyncio.create_task(session._process_loop())
-    session._pcm_queue.put_nowait((1, np.ones(4, dtype=np.float32)))
-    session._pcm_queue.put_nowait((2, np.full(4, 2.0, dtype=np.float32)))
+    _queue_pcm(session, 1, np.ones(4, dtype=np.float32))
+    _queue_pcm(session, 2, np.full(4, 2.0, dtype=np.float32))
     await _wait_until(lambda: len(session._output_track.pushed) == 1)
     assert np.all(session._output_track.pushed[0] == 2.0)
+    summary = session._runtime_metrics.snapshot()
+    assert summary["discarded_pcm_chunks"] == 1
+    assert summary["completed_frames"] == 1
+    assert all(
+        item["count"] == 1 for item in summary["lifecycle"].values()
+    )
     await _stop_loop(session, task)
 
 
@@ -114,7 +149,7 @@ async def test_in_flight_result_is_discarded_across_pause() -> None:
     session = _bare_session(process)
     session._pipeline_generation = 0
     task = asyncio.create_task(session._process_loop())
-    session._pcm_queue.put_nowait((0, np.ones(4, dtype=np.float32)))
+    _queue_pcm(session, 0, np.ones(4, dtype=np.float32))
     assert await asyncio.to_thread(started.wait, 1.0)
     pause_task = asyncio.create_task(session.pause_and_flush_audio())
     await _wait_until(lambda: session._pipeline_generation == 1)
@@ -123,6 +158,9 @@ async def test_in_flight_result_is_discarded_across_pause() -> None:
     assert generation == 1
     assert session._output_track.pushed == []
     assert session._output_track.clear_count == 1
+    summary = session._runtime_metrics.snapshot()
+    assert summary["discarded_model_frames"] == 1
+    assert summary["completed_frames"] == 0
     session.resume_audio(generation)
     assert session._processing_paused is False
     await _stop_loop(session, task)
@@ -140,7 +178,7 @@ async def test_stop_processing_freezes_and_drains_in_flight_model_work() -> None
 
     session = _bare_session(process)
     session._process_task = asyncio.create_task(session._process_loop())
-    session._pcm_queue.put_nowait((2, np.ones(4, dtype=np.float32)))
+    _queue_pcm(session, 2, np.ones(4, dtype=np.float32))
     assert await asyncio.to_thread(started.wait, 1.0)
 
     stop_task = asyncio.create_task(session.stop_processing())
@@ -153,6 +191,173 @@ async def test_stop_processing_freezes_and_drains_in_flight_model_work() -> None
     assert session._processing_paused is True
     assert session._output_track.pushed == []
     assert session._process_task.done()
+    summary = session._runtime_metrics.snapshot()
+    assert summary["cancelled_model_frames"] == 1
+    assert summary["completed_frames"] == 0
+
+
+async def test_stop_processing_accounts_for_cancelled_output_enqueue() -> None:
+    push_started = asyncio.Event()
+
+    async def blocked_push(_samples: np.ndarray) -> None:
+        push_started.set()
+        await asyncio.Event().wait()
+
+    session = _bare_session(lambda chunk: [(chunk, None)])
+    session._output_track.push_24k_f32 = blocked_push
+    session._process_task = asyncio.create_task(session._process_loop())
+    _queue_pcm(session, 2, np.ones(4, dtype=np.float32))
+    await asyncio.wait_for(push_started.wait(), timeout=1.0)
+
+    await asyncio.wait_for(session.stop_processing(), timeout=1.0)
+
+    summary = session._runtime_metrics.snapshot()
+    assert summary["completed_frames"] == 0
+    assert summary["discarded_model_frames"] == 0
+    assert summary["cancelled_model_frames"] == 1
+
+
+async def test_multichunk_pcm_provenance_survives_partial_segment() -> None:
+    session = _bare_session(lambda chunk: [(chunk, None)])
+    observed_timing: list[tuple[float, float]] = []
+    consume_timing = session._consume_pending_timing
+
+    def capture_timing(sample_count: int) -> tuple[float, float]:
+        timing = consume_timing(sample_count)
+        observed_timing.append(timing)
+        return timing
+
+    session._consume_pending_timing = capture_timing
+    task = asyncio.create_task(session._process_loop())
+    now = time.monotonic()
+    t0 = now - 0.020
+    t1 = now - 0.010
+    _queue_pcm(
+        session,
+        2,
+        np.arange(6, dtype=np.float32),
+        arrived_at=t0,
+    )
+    _queue_pcm(
+        session,
+        2,
+        np.arange(6, 8, dtype=np.float32),
+        arrived_at=t1,
+    )
+
+    await _wait_until(lambda: len(session._output_track.pushed) == 2)
+    assert np.array_equal(
+        session._output_track.pushed[0],
+        np.arange(4, dtype=np.float32),
+    )
+    assert np.array_equal(
+        session._output_track.pushed[1],
+        np.arange(4, 8, dtype=np.float32),
+    )
+    assert observed_timing == [(t0, t0), (t0, t1)]
+    assert session._runtime_metrics.snapshot()["completed_frames"] == 2
+    await _stop_loop(session, task)
+
+
+async def test_executor_delay_is_attributed_to_executor_wait() -> None:
+    class _Clock:
+        def __init__(self) -> None:
+            self.value = 1.0
+
+        def __call__(self) -> float:
+            return self.value
+
+        def advance(self, seconds: float) -> None:
+            self.value += seconds
+
+    class _DelayExecutor(Executor):
+        def __init__(self, clock: _Clock) -> None:
+            self.clock = clock
+
+        def submit(self, fn, /, *args, **kwargs):
+            future: Future = Future()
+            self.clock.advance(0.500)
+            try:
+                future.set_result(fn(*args, **kwargs))
+            except Exception as exc:  # noqa: BLE001
+                future.set_exception(exc)
+            return future
+
+    clock = _Clock()
+
+    def process(chunk: np.ndarray):
+        clock.advance(0.040)
+        return [(chunk, None)]
+
+    session = _bare_session(process)
+    session._monotonic = clock
+    session._process_executor = _DelayExecutor(clock)
+    original_push = session._output_track.push_24k_f32
+
+    async def delayed_push(samples: np.ndarray) -> None:
+        clock.advance(0.005)
+        await original_push(samples)
+
+    session._output_track.push_24k_f32 = delayed_push
+    task = asyncio.create_task(session._process_loop())
+    _queue_pcm(
+        session,
+        2,
+        np.ones(4, dtype=np.float32),
+        arrived_at=0.990,
+    )
+    await _wait_until(lambda: len(session._output_track.pushed) == 1)
+    lifecycle = session._runtime_metrics.snapshot()["lifecycle"]
+    assert abs(lifecycle["executor_wait_ms"]["p50"] - 500.0) <= 0.25
+    assert abs(lifecycle["worker_process_ms"]["p50"] - 40.0) <= 0.25
+    assert abs(lifecycle["output_enqueue_ms"]["p50"] - 5.0) <= 0.25
+    assert lifecycle["result_delivery_ms"]["p50"] == 0.0
+    assert all(
+        value == 0
+        for key, value in session._runtime_metrics.snapshot()[
+            "availability"
+        ].items()
+        if key.endswith("_available")
+    )
+    await _stop_loop(session, task)
+
+
+def test_runtime_summary_sender_accepts_only_numeric_payloads() -> None:
+    class _Control:
+        readyState = "open"
+
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+            self.thread_ids: list[int] = []
+
+        def send(self, payload: str) -> None:
+            self.thread_ids.append(threading.get_ident())
+            self.sent.append(payload)
+
+    session = RTCSession.__new__(RTCSession)
+    session._control = _Control()
+    caller_thread = threading.get_ident()
+    summary = RuntimeMetrics().snapshot()
+
+    session.send_runtime_summary(summary, request_id=7)
+    session.send_runtime_summary({"value": float("nan")}, request_id=8)
+    session.send_runtime_summary({"value": True}, request_id=9)
+    session.send_runtime_summary({"value": [1]}, request_id=10)
+    session.send_runtime_summary(
+        {"private_path": "/private/secret"},
+        request_id=11,
+    )
+    session.send_runtime_summary(summary, request_id=True)
+    session.send_runtime_summary(summary, request_id=-1)
+
+    assert len(session._control.sent) == 1
+    payload = json.loads(session._control.sent[0])
+    assert payload == {
+        "type": "runtime_summary",
+        "request_id": 7,
+        "summary": summary,
+    }
+    assert session._control.thread_ids == [caller_thread]
 
 
 def test_standing_inbound_backlog_is_trimmed_to_one_frame() -> None:
@@ -162,19 +367,25 @@ def test_standing_inbound_backlog_is_trimmed_to_one_frame() -> None:
     session._pcm_queue = asyncio.Queue(maxsize=10)
     session._pcm_drop_events = 0
     session._pcm_dropped_ms = 0.0
+    session._runtime_metrics = RuntimeMetrics()
     for value in range(8):
         session._pcm_queue.put_nowait(
-            (7, np.full(1, value, dtype=np.float32))
+            (
+                7,
+                np.full(1, value, dtype=np.float32),
+                time.monotonic(),
+            )
         )
 
     dropped_ms = session._trim_standing_inbound_backlog()
     kept = []
     while not session._pcm_queue.empty():
-        _, samples = session._pcm_queue.get_nowait()
+        _, samples, _ = session._pcm_queue.get_nowait()
         kept.append(int(samples[0]))
     assert kept == [4, 5, 6, 7], kept
     assert dropped_ms > 0
     assert session._pcm_drop_events == 1
+    assert session._runtime_metrics.snapshot()["discarded_pcm_chunks"] == 4
 
 
 async def test_transport_diagnostics_expose_counts_without_audio() -> None:
@@ -182,7 +393,7 @@ async def test_transport_diagnostics_expose_counts_without_audio() -> None:
     session._pcm_queue_high_water = 7
     session._pcm_drop_events = 3
     session._pcm_dropped_ms = 240.0
-    session._pcm_queue.put_nowait((2, np.ones(4, dtype=np.float32)))
+    _queue_pcm(session, 2, np.ones(4, dtype=np.float32))
 
     snapshot = await session.diagnostics_snapshot()
 
@@ -350,6 +561,8 @@ def test_stat_envelope_only_forwards_numeric_diagnostics() -> None:
             "user_turn_starts": 1,
             "user_turn_ends": 1,
             "mimi_encode_frames": 11,
+            "text_starved_frames": 30,
+            "text_starved_episodes": 1,
             "pcm_drop_events": True,
             "outbound_buffer_ms": float("nan"),
             "private_path": "/private/secret",
@@ -369,7 +582,54 @@ def test_stat_envelope_only_forwards_numeric_diagnostics() -> None:
         "user_turn_starts": 1,
         "user_turn_ends": 1,
         "mimi_encode_frames": 11,
+        "text_starved_frames": 30,
+        "text_starved_episodes": 1,
     }
+
+
+def test_text_starved_telemetry_counts_episodes_once() -> None:
+    state = ServerState.__new__(ServerState)
+    state._text_starved_streak = 0
+    state._text_starved_frames = 0
+    state._text_starved_episodes = 0
+    pad_id = 3
+    loud = TEXT_STARVED_RMS_FLOOR * 10
+
+    # Below threshold: qualifying frames accumulate, no episode yet.
+    for _ in range(TEXT_STARVED_MIN_FRAMES - 1):
+        state._note_text_starved_frame(pad_id, pad_id, loud)
+    assert state._text_starved_frames == TEXT_STARVED_MIN_FRAMES - 1
+    assert state._text_starved_episodes == 0
+
+    # Crossing the threshold (EPAD qualifies like PAD) counts the episode
+    # exactly once; the continuing streak never re-counts it.
+    state._note_text_starved_frame(0, pad_id, loud)
+    assert state._text_starved_episodes == 1
+    for _ in range(10):
+        state._note_text_starved_frame(pad_id, pad_id, loud)
+    assert state._text_starved_episodes == 1
+    assert state._text_starved_frames == TEXT_STARVED_MIN_FRAMES + 10
+
+    # Natural non-PAD text resets the streak without touching totals.
+    state._note_text_starved_frame(42, pad_id, loud)
+    assert state._text_starved_streak == 0
+    assert state._text_starved_frames == TEXT_STARVED_MIN_FRAMES + 10
+
+    # Audio at or below the floor does not qualify (strict greater-than).
+    state._note_text_starved_frame(pad_id, pad_id, loud)
+    state._note_text_starved_frame(pad_id, pad_id, TEXT_STARVED_RMS_FLOOR)
+    assert state._text_starved_streak == 0
+
+    # An excluded frame (forced text or interrupt gate arrives as None)
+    # resets rather than freezes, so two sub-threshold runs split by an
+    # inject window never stitch into one episode.
+    for _ in range(TEXT_STARVED_MIN_FRAMES - 1):
+        state._note_text_starved_frame(pad_id, pad_id, loud)
+    state._note_text_starved_frame(pad_id, pad_id, None)
+    assert state._text_starved_streak == 0
+    for _ in range(TEXT_STARVED_MIN_FRAMES - 1):
+        state._note_text_starved_frame(pad_id, pad_id, loud)
+    assert state._text_starved_episodes == 1
 
 
 def test_lifecycle_receipt_emits_only_typed_privacy_safe_fields() -> None:
@@ -781,6 +1041,10 @@ if __name__ == "__main__":
         test_stale_queued_generation_is_discarded,
         test_in_flight_result_is_discarded_across_pause,
         test_stop_processing_freezes_and_drains_in_flight_model_work,
+        test_stop_processing_accounts_for_cancelled_output_enqueue,
+        test_multichunk_pcm_provenance_survives_partial_segment,
+        test_executor_delay_is_attributed_to_executor_wait,
+        test_runtime_summary_sender_accepts_only_numeric_payloads,
         test_standing_inbound_backlog_is_trimmed_to_one_frame,
         test_transport_diagnostics_expose_counts_without_audio,
         test_outbound_underrun_fades_and_reprimes,
@@ -788,6 +1052,7 @@ if __name__ == "__main__":
         test_outbound_shed_prefers_silence_and_crossfades,
         test_outbound_diagnostics_separate_flush_from_backlog_drop,
         test_stat_envelope_only_forwards_numeric_diagnostics,
+        test_text_starved_telemetry_counts_episodes_once,
         test_lifecycle_receipt_emits_only_typed_privacy_safe_fields,
         test_lifecycle_receipt_starts_with_fixed_empty_priming_state,
         test_lifecycle_receipt_rejects_incomplete_startup,

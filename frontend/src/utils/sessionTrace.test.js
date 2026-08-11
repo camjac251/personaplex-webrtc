@@ -128,6 +128,29 @@ describe("session trace privacy", () => {
     expect(report.privacy.content_included).toBe(true);
   });
 
+  test("voice enrollment and preview private surfaces never enter exports", async () => {
+    const trace = createSessionTrace({ clock: deterministicClock() });
+    const privateVoice = {
+      upload_id: "opaque-upload-id",
+      uploaded_voice_filename: "private-reference.wav",
+      reference_audio: "raw-reference-audio",
+      preview_audio: "raw-preview-audio",
+      embedding: [0.1, 0.2],
+      similarity_score: 0.98,
+      reference_sha256: "private-derived-content-hash",
+    };
+    trace.setRequestedConfig(privateVoice);
+    trace.record("voice.preview", privateVoice);
+    for (const includeContent of [false, true]) {
+      const serialized = JSON.stringify(
+        await trace.toReportAsync({ includeContent }),
+      );
+      for (const secret of Object.values(privateVoice).flat()) {
+        expect(serialized).not.toContain(String(secret));
+      }
+    }
+  });
+
   test("unknown fields are denied and diagnostic strings are scrubbed", () => {
     const sanitized = sanitizeTraceData({
       arbitrary: "must-not-pass",

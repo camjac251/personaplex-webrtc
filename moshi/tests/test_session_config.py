@@ -39,6 +39,8 @@ from moshi.rtc_session import (  # noqa: E402
     TEXT_MIN_P_MIN,
     TEXT_TOPK_MAX,
     TEXT_TOPK_MIN,
+    TURN_ONSET_BIAS_MAX,
+    TURN_ONSET_BIAS_MIN,
     VISION_COST_LIMIT_USD_MAX,
     VISION_COST_LIMIT_USD_MIN,
     VISION_COST_PER_CALL_USD_MAX,
@@ -57,6 +59,7 @@ from moshi.rtc_session import (  # noqa: E402
     clamp_temperature,
     clamp_text_min_p,
     clamp_text_topk,
+    clamp_turn_onset_bias,
     clamp_vision_cost_limit_usd,
     clamp_vision_cost_per_call_usd,
     parse_session_config,
@@ -116,6 +119,7 @@ def test_defaults_match_stable_conversation_tuning() -> None:
     assert defaults.repetition_penalty == 1.0
     assert defaults.repetition_penalty_context == 64
     assert defaults.padding_bonus == 0.0
+    assert defaults.turn_onset_bias == 0.0
     assert defaults.max_turn_text_tokens == 120
 
 
@@ -153,6 +157,12 @@ def test_all_numeric_hard_bounds() -> None:
     assert clamp_repetition_penalty_context(10_000) == REPETITION_PENALTY_CONTEXT_MAX
     assert clamp_padding_bonus(-1) == PADDING_BONUS_MIN
     assert clamp_padding_bonus(10) == PADDING_BONUS_MAX
+    # The onset bias is the one signed clamp: negatives inside the band
+    # survive, only the extremes pin.
+    assert clamp_turn_onset_bias(-10) == TURN_ONSET_BIAS_MIN
+    assert clamp_turn_onset_bias(10) == TURN_ONSET_BIAS_MAX
+    assert clamp_turn_onset_bias(-1.5) == -1.5
+    assert clamp_turn_onset_bias(0.0) == 0.0
     assert clamp_max_turn_text_tokens(-1) == MAX_TURN_TEXT_TOKENS_MIN
     assert clamp_max_turn_text_tokens(10_000) == MAX_TURN_TEXT_TOKENS_MAX
     assert clamp_session_timeout_sec(-1) == SESSION_TIMEOUT_SEC_MIN
@@ -185,6 +195,7 @@ def test_parse_session_config_clamps_finite_values() -> None:
             "repetition_penalty": -3,
             "repetition_penalty_context": 9999,
             "padding_bonus": 99,
+            "turn_onset_bias": -99,
             "max_turn_text_tokens": -1,
             "session_timeout_sec": 99999,
             "vision_cost_limit_usd": -1,
@@ -202,6 +213,7 @@ def test_parse_session_config_clamps_finite_values() -> None:
     assert cfg.repetition_penalty == REPETITION_PENALTY_MIN
     assert cfg.repetition_penalty_context == REPETITION_PENALTY_CONTEXT_MAX
     assert cfg.padding_bonus == PADDING_BONUS_MAX
+    assert cfg.turn_onset_bias == TURN_ONSET_BIAS_MIN
     assert cfg.max_turn_text_tokens == MAX_TURN_TEXT_TOKENS_MIN
     assert cfg.session_timeout_sec == SESSION_TIMEOUT_SEC_MAX
     assert cfg.vision_cost_limit_usd == VISION_COST_LIMIT_USD_MIN
@@ -219,6 +231,7 @@ def test_parse_session_config_rejects_non_finite_values() -> None:
         "text_temperature",
         "repetition_penalty",
         "padding_bonus",
+        "turn_onset_bias",
         "text_min_p",
         "semantic_temp_cap",
         "vision_cost_limit_usd",
@@ -277,6 +290,7 @@ def test_parse_session_config_preserves_valid_wire_values() -> None:
             "repetition_penalty": "1.08",
             "repetition_penalty_context": "128",
             "padding_bonus": "0.5",
+            "turn_onset_bias": "-1.5",
             "max_turn_text_tokens": "240",
             "session_timeout_sec": "3600",
             "vision_cost_limit_usd": "2.5",
@@ -295,6 +309,7 @@ def test_parse_session_config_preserves_valid_wire_values() -> None:
     assert cfg.repetition_penalty == 1.08
     assert cfg.repetition_penalty_context == 128
     assert cfg.padding_bonus == 0.5
+    assert cfg.turn_onset_bias == -1.5
     assert cfg.max_turn_text_tokens == 240
     assert cfg.session_timeout_sec == 3600
     assert cfg.vision_cost_limit_usd == 2.5

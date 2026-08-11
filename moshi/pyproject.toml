@@ -30,6 +30,9 @@ readme = "README.md"
 # with `uv pip install faster-whisper` (or `pip install moshi-personaplex[asr]`)
 # only on hosts with the GPU headroom for a second model.
 asr = ["faster-whisper>=1.0"]
+# Optional CPU-only WavLM enrollment selector. The default install and
+# `uv sync --frozen` do not install or download this model.
+voice-selection = ["transformers>=4.43,<4.44"]
 
 [project.scripts]
 moshi-server = "moshi.server:main"
