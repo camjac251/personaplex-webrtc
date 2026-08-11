@@ -814,6 +814,8 @@ function App() {
     text_temperature: Number(textTemp),
     audio_temperature: Number(audioTemp),
     text_topk: Number.parseInt(textTopk, 10),
+    text_min_p: Number(textMinP),
+    semantic_temp_cap: Number(semanticTempCap),
     audio_topk: Number.parseInt(audioTopk, 10),
     caption_cfg_gamma: Number(captionCfgGamma),
     repetition_penalty: Number(repPenalty),
