@@ -214,7 +214,7 @@ export const INFERENCE_RANGES = {
     audioTopk: { min: 8, max: 2048, step: 1, integer: true },
     semanticTempCap: { min: 0.1, max: 1.5, step: 0.05 },
     captionCfgGamma: { min: 1, max: 4, step: 0.1 },
-    repPenalty: { min: 1, max: 1.5, step: 0.05 },
+    repPenalty: { min: 1, max: 2, step: 0.05 },
     repContext: { min: 0, max: 256, step: 8, integer: true },
     padBonus: { min: 0, max: 2, step: 0.1 },
     turnOnsetBias: { min: -4, max: 4, step: 0.1 },
@@ -456,7 +456,10 @@ export const PARAM_INFO = {
         history clears at each natural turn boundary, so it never punishes the
         next turn's opening words. <b>1.0</b> disables it and preserves the RL
         model's learned text policy. Raise toward <b>1.15</b> only as an
-        anti-loop fallback.
+        anti-loop fallback. The penalty applies once per token no matter how
+        often it recurs, so a hard loop needs a higher value rather than more
+        time; Expert reaches <b>2.0</b>, past which only the tax on ordinary
+        function words keeps growing.
       </>
     ),
   },

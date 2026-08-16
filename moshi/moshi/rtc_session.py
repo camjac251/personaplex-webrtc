@@ -454,10 +454,11 @@ TEXT_MIN_P_MAX = 0.5
 AUDIO_TOPK_MIN = 8
 AUDIO_TOPK_MAX = 2048
 REPETITION_PENALTY_MIN = 1.0
-# The CTRL-style penalty divides positive logits, so 1.5 already cuts a
-# recent token's score by a third; hotter values suppress natural
-# function words faster than they kill loops.
-REPETITION_PENALTY_MAX = 1.5
+# The penalty divides a logit once per token, not once per occurrence, so
+# its value is the only lever against a tightening loop. 2.0 makes a
+# confident repeat ~3500x less likely at text temperature 0.7; past that
+# the tax on legitimately recurring function words is all that grows.
+REPETITION_PENALTY_MAX = 2.0
 REPETITION_PENALTY_CONTEXT_MIN = 0
 REPETITION_PENALTY_CONTEXT_MAX = 256
 PADDING_BONUS_MIN = 0.0
