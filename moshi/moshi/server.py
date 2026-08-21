@@ -59,6 +59,7 @@ from huggingface_hub import hf_hub_download
 
 from .models import LMGen, MimiModel, loaders
 from .models.lm import (
+    AUDIO_TOKENS_PER_STREAM,
     DEFAULT_SEMANTIC_TEMPERATURE_CAP,
     MAX_REPETITION_CONTEXT,
     load_audio,
@@ -88,7 +89,11 @@ from .rtc_session import (
     clamp_vision_cost_limit_usd,
     reassemble_vision_chunk,
 )
-from .runtime_metrics import RuntimeMetrics
+from .runtime_metrics import (
+    SNAPSHOT_FAILURE_BUDGET,
+    SNAPSHOT_FAILURE_CAPTURE,
+    RuntimeMetrics,
+)
 from .utils.assets import safe_extract_tar
 from .utils.connection import create_ssl_context, get_lan_ip
 from .utils.logging import ColorizedLog, setup_logger
@@ -502,6 +507,22 @@ def _sample_device_stats(device: torch.device) -> tuple[Optional[int], Optional[
     return vram_used, gpu_util
 
 
+def _available_host_memory_bytes() -> int | None:
+    """Return Linux MemAvailable without a process-inspection dependency."""
+
+    try:
+        lines = Path("/proc/meminfo").read_text(encoding="utf-8").splitlines()
+        for line in lines:
+            if not line.startswith("MemAvailable:"):
+                continue
+            fields = line.split()
+            if len(fields) >= 2:
+                return int(fields[1]) * 1024
+    except (OSError, ValueError):
+        return None
+    return None
+
+
 def seed_all(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -896,6 +917,19 @@ STOP_LATCH_MAX_HOLD_SEC = 12.0
 
 class SnapshotDeferred(RuntimeError):
     """Snapshot capture was postponed until a context drip completes."""
+
+
+class SnapshotCapacityError(RuntimeError):
+    """Snapshot capture was rejected without mutating live state."""
+
+
+GIB = 1024**3
+DEFAULT_SNAPSHOT_GPU_BUDGET_BYTES = 6 * GIB
+DEFAULT_SNAPSHOT_GPU_FREE_FLOOR_BYTES = 2 * GIB
+DEFAULT_SNAPSHOT_HOST_BUDGET_BYTES = 24 * GIB
+DEFAULT_SNAPSHOT_HOST_FREE_FLOOR_BYTES = 4 * GIB
+SNAPSHOT_RESIDENCY_CPU = 1
+SNAPSHOT_RESIDENCY_GPU = 2
 
 # Max user-pinned labelled snapshots per session. Each is a full
 # streaming-state clone, independent of the auto-rewind ring, so keep the
@@ -1618,7 +1652,12 @@ class ServerState:
                  voice_picker_available: bool = False,
                  voice_window_embedder=None,
                  cpu_offload: bool = False,
-                 asr_model_sha256: str | None = None):
+                 asr_model_sha256: str | None = None,
+                 depformer_early_exit: int = 0,
+                 snapshot_gpu_budget_bytes: int = DEFAULT_SNAPSHOT_GPU_BUDGET_BYTES,
+                 snapshot_gpu_free_floor_bytes: int = DEFAULT_SNAPSHOT_GPU_FREE_FLOOR_BYTES,
+                 snapshot_host_budget_bytes: int = DEFAULT_SNAPSHOT_HOST_BUDGET_BYTES,
+                 snapshot_host_free_floor_bytes: int = DEFAULT_SNAPSHOT_HOST_FREE_FLOOR_BYTES):
         self.mimi = mimi
         self.lm_gen = lm_gen
         # Caption-CFG (context-aware decoding) mode. Fixed for the process
@@ -1643,6 +1682,14 @@ class ServerState:
         self.record_sessions = record_sessions
         self.recordings_dir = recordings_dir
         self.periodic_snapshots = periodic_snapshots
+        self._snapshot_gpu_budget_bytes = max(0, int(snapshot_gpu_budget_bytes))
+        self._snapshot_gpu_free_floor_bytes = max(
+            0, int(snapshot_gpu_free_floor_bytes)
+        )
+        self._snapshot_host_budget_bytes = max(0, int(snapshot_host_budget_bytes))
+        self._snapshot_host_free_floor_bytes = max(
+            0, int(snapshot_host_free_floor_bytes)
+        )
         self.model_identity = _model_identity(model_repo, model_revision)
         disabled_asr_sha256 = hashlib.sha256(b"disabled").hexdigest()
         self.asr_model_sha256 = (
@@ -1658,6 +1705,12 @@ class ServerState:
             "periodic_snapshots": bool(periodic_snapshots),
             "asr_available": bool(asr is not None),
             "voice_picker_available": bool(voice_picker_available),
+            "snapshot_cpu_tiering": True,
+            "snapshot_gpu_budget_bytes": self._snapshot_gpu_budget_bytes,
+            "snapshot_gpu_free_floor_bytes": self._snapshot_gpu_free_floor_bytes,
+            "snapshot_host_budget_bytes": self._snapshot_host_budget_bytes,
+            "snapshot_host_free_floor_bytes": self._snapshot_host_free_floor_bytes,
+            "depformer_early_exit": int(depformer_early_exit),
         }
         # Optional user-speech recognizer (second model). None unless the
         # operator passed --enable-asr and faster-whisper imported. When
@@ -3050,8 +3103,14 @@ class ServerState:
                 for name in ("_audio_temperature", "_audio_top_k")
                 if hasattr(self.lm_gen, name)
             }
-            lm_stream = self._clone_streaming_state(self.lm_gen)
-            mimi_stream = self._clone_streaming_state(self.mimi)
+            lm_stream = self._clone_streaming_state(
+                self.lm_gen,
+                residency="cpu",
+            )
+            mimi_stream = self._clone_streaming_state(
+                self.mimi,
+                residency="cpu",
+            )
             torch_rng = torch.get_rng_state().clone()
             cuda_rng = (
                 [state.clone() for state in torch.cuda.get_rng_state_all()]
@@ -3145,8 +3204,19 @@ class ServerState:
                     except BaseException as exc:
                         restore_errors.append(exc)
 
-                attempt(lambda: self.mimi.set_streaming_state_inplace(dict(mimi_stream)))
-                attempt(lambda: self.lm_gen.set_streaming_state_inplace(dict(lm_stream)))
+                attempt(lambda: self.mimi.validate_streaming_state(dict(mimi_stream)))
+                attempt(lambda: self.lm_gen.validate_streaming_state(dict(lm_stream)))
+                if not restore_errors:
+                    attempt(
+                        lambda: self.mimi.set_streaming_state_inplace(
+                            dict(mimi_stream)
+                        )
+                    )
+                    attempt(
+                        lambda: self.lm_gen.set_streaming_state_inplace(
+                            dict(lm_stream)
+                        )
+                    )
                 attempt(lambda: torch.set_rng_state(torch_rng))
                 if cuda_rng is not None:
                     attempt(lambda: torch.cuda.set_rng_state_all(cuda_rng))
@@ -4319,16 +4389,187 @@ class ServerState:
             return
 
     @staticmethod
-    def _clone_streaming_state(module) -> dict:
+    def _flatten_live_streaming_state(module) -> tuple[dict, dict]:
         from .modules.streaming import _flatten_streaming_state
 
         state = module.get_streaming_state()
         tensors: dict = {}
         metadata: dict = {}
         _flatten_streaming_state(tensors, metadata, state, prefix="")
-        snapshot = {key: value.detach().clone() for key, value in tensors.items()}
+        return tensors, metadata
+
+    @staticmethod
+    def _clone_flattened_streaming_state(
+        tensors: dict,
+        metadata: dict,
+        *,
+        residency: str,
+    ) -> dict:
+        if residency == "cpu":
+            snapshot = {
+                key: value.detach().to(device="cpu", copy=True)
+                for key, value in tensors.items()
+            }
+        elif residency == "gpu":
+            snapshot = {
+                key: value.detach().clone() for key, value in tensors.items()
+            }
+        else:
+            raise ValueError(f"unsupported snapshot residency {residency!r}")
         snapshot.update(metadata)
         return snapshot
+
+    @classmethod
+    def _clone_streaming_state(
+        cls,
+        module,
+        *,
+        residency: str = "gpu",
+    ) -> dict:
+        tensors, metadata = cls._flatten_live_streaming_state(module)
+        return cls._clone_flattened_streaming_state(
+            tensors,
+            metadata,
+            residency=residency,
+        )
+
+    @staticmethod
+    def _snapshot_payload_stats(snapshot: dict) -> tuple[str, int]:
+        residency = str(snapshot.get("residency") or "")
+        tensor_bytes = snapshot.get("tensor_bytes")
+        if residency in {"cpu", "gpu"} and isinstance(tensor_bytes, int):
+            return residency, max(0, tensor_bytes)
+
+        inferred_residency = "cpu"
+        inferred_bytes = 0
+        for module_state in (snapshot.get("lm", {}), snapshot.get("mimi", {})):
+            if not isinstance(module_state, dict):
+                continue
+            for value in module_state.values():
+                if not isinstance(value, torch.Tensor):
+                    continue
+                inferred_bytes += value.numel() * value.element_size()
+                if value.device.type == "cuda":
+                    inferred_residency = "gpu"
+        return inferred_residency, inferred_bytes
+
+    def _retained_snapshot_inventory(self) -> dict[str, int]:
+        snapshots: list[dict] = []
+        for history in getattr(self, "_session_snapshots", {}).values():
+            snapshots.extend(
+                snapshot for _captured_at, snapshot in history
+                if isinstance(snapshot, dict)
+            )
+        for _captured_at, snapshot in getattr(
+            self, "_session_baselines", {}
+        ).values():
+            if isinstance(snapshot, dict):
+                snapshots.append(snapshot)
+        for bookmarks in getattr(self, "_session_bookmarks", {}).values():
+            snapshots.extend(
+                bookmark["state"]
+                for bookmark in bookmarks
+                if isinstance(bookmark, dict)
+                and isinstance(bookmark.get("state"), dict)
+            )
+        grant = getattr(self, "_resume_grant", None)
+        if isinstance(grant, dict):
+            snapshots.extend(
+                snapshot
+                for _captured_at, snapshot in grant.get("snapshots", [])
+                if isinstance(snapshot, dict)
+            )
+            snapshots.extend(
+                bookmark["state"]
+                for bookmark in grant.get("bookmarks", [])
+                if isinstance(bookmark, dict)
+                and isinstance(bookmark.get("state"), dict)
+            )
+
+        inventory = {
+            "cpu_count": 0,
+            "cpu_bytes": 0,
+            "gpu_count": 0,
+            "gpu_bytes": 0,
+        }
+        seen: set[int] = set()
+        for snapshot in snapshots:
+            identity = id(snapshot)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            residency, tensor_bytes = self._snapshot_payload_stats(snapshot)
+            inventory[f"{residency}_count"] += 1
+            inventory[f"{residency}_bytes"] += tensor_bytes
+        return inventory
+
+    def _refresh_snapshot_inventory_metrics(self) -> None:
+        metrics = getattr(self, "_runtime_metrics", None)
+        if metrics is None:
+            return
+        metrics.set_snapshot_inventory(**self._retained_snapshot_inventory())
+
+    def _snapshot_free_bytes(self, residency: str) -> int | None:
+        if residency == "cpu":
+            return _available_host_memory_bytes()
+        if self.device.type != "cuda" or not torch.cuda.is_available():
+            return None
+        try:
+            free, _total = torch.cuda.mem_get_info(
+                _cuda_device_index(self.device)
+            )
+            reusable = max(
+                0,
+                int(torch.cuda.memory_reserved(self.device))
+                - int(torch.cuda.memory_allocated(self.device)),
+            )
+        except RuntimeError:
+            return None
+        return int(free) + reusable
+
+    def _admit_snapshot(self, residency: str, tensor_bytes: int) -> int:
+        inventory = self._retained_snapshot_inventory()
+        if residency == "cpu":
+            retained = inventory["cpu_bytes"]
+            budget = getattr(
+                self,
+                "_snapshot_host_budget_bytes",
+                DEFAULT_SNAPSHOT_HOST_BUDGET_BYTES,
+            )
+            floor = getattr(
+                self,
+                "_snapshot_host_free_floor_bytes",
+                DEFAULT_SNAPSHOT_HOST_FREE_FLOOR_BYTES,
+            )
+            budget_name = "host snapshot budget"
+        else:
+            retained = inventory["gpu_bytes"]
+            budget = getattr(
+                self,
+                "_snapshot_gpu_budget_bytes",
+                DEFAULT_SNAPSHOT_GPU_BUDGET_BYTES,
+            )
+            floor = getattr(
+                self,
+                "_snapshot_gpu_free_floor_bytes",
+                DEFAULT_SNAPSHOT_GPU_FREE_FLOOR_BYTES,
+            )
+            budget_name = "GPU snapshot budget"
+
+        if retained + tensor_bytes > budget:
+            raise SnapshotCapacityError(
+                f"{budget_name} rejected a {tensor_bytes}-byte capture"
+            )
+        free_before = self._snapshot_free_bytes(residency)
+        if free_before is None:
+            raise SnapshotCapacityError(
+                f"{budget_name} cannot verify current free memory"
+            )
+        if free_before < tensor_bytes + floor:
+            raise SnapshotCapacityError(
+                f"{budget_name} cannot preserve its configured free-memory floor"
+            )
+        return free_before
 
     def _take_snapshot(self, kind: str = "manual") -> dict:
         """Atomically clone LM, Mimi, RNG, and turn-safety state."""
@@ -4336,72 +4577,188 @@ class ServerState:
         lock_acquired_at = started_at
         clone_submitted_at = started_at
         sync_ms = 0.0
-        with self._infer_lock:
-            lock_acquired_at = time.perf_counter()
-            if (
-                getattr(self, "_inject_active", False)
-                or getattr(self, "_vision_active", ())
-                or getattr(self, "_reinforce_pending", ())
-                or getattr(self, "_reinforce_active", ())
-                or getattr(self, "_reinforce_seal_pending", False)
-            ):
-                raise SnapshotDeferred(
-                    "context injection is active; retry at the next boundary"
-                )
-            snapshot = {
-                "version": 2,
-                "captured_at": time.monotonic(),
-                "lm": self._clone_streaming_state(self.lm_gen),
-                "mimi": self._clone_streaming_state(self.mimi),
-                "rng_cpu": torch.get_rng_state().clone(),
-                "rng_cuda": None,
-            }
-            if self.device.type == "cuda" and torch.cuda.is_available():
-                snapshot["rng_cuda"] = torch.cuda.get_rng_state(
-                    _cuda_device_index(self.device)
-                ).clone()
-            clone_submitted_at = time.perf_counter()
-            if self.device.type == "cuda" and torch.cuda.is_available():
-                sync_started_at = time.perf_counter()
-                torch.cuda.synchronize(_cuda_device_index(self.device))
-                sync_ms = (time.perf_counter() - sync_started_at) * 1000.0
-
-        tensor_count = 0
-        tensor_bytes = 0
-        for state in (snapshot["lm"], snapshot["mimi"]):
-            for value in state.values():
-                if isinstance(value, torch.Tensor):
-                    tensor_count += 1
-                    tensor_bytes += value.numel() * value.element_size()
-        finished_at = time.perf_counter()
-        logger.info(
-            "snapshot capture session=%s kind=%s lock_wait_ms=%.1f "
-            "clone_submit_ms=%.1f sync_ms=%.1f total_ms=%.1f "
-            "tensors=%d bytes=%d",
-            getattr(self, "_active_session_id", None) or "-",
-            kind,
-            (lock_acquired_at - started_at) * 1000.0,
-            (clone_submitted_at - lock_acquired_at) * 1000.0,
-            sync_ms,
-            (finished_at - started_at) * 1000.0,
-            tensor_count,
-            tensor_bytes,
+        snapshot_device = torch.device(getattr(self, "device", "cpu"))
+        residency = (
+            "cpu"
+            if kind in {"baseline", "bookmark"} or snapshot_device.type != "cuda"
+            else "gpu"
         )
-        return snapshot
+        metrics = getattr(self, "_runtime_metrics", None)
+        try:
+            with self._infer_lock:
+                lock_acquired_at = time.perf_counter()
+                if (
+                    getattr(self, "_inject_active", False)
+                    or getattr(self, "_vision_active", ())
+                    or getattr(self, "_reinforce_pending", ())
+                    or getattr(self, "_reinforce_active", ())
+                    or getattr(self, "_reinforce_seal_pending", False)
+                ):
+                    raise SnapshotDeferred(
+                        "context injection is active; retry at the next boundary"
+                    )
+                lm_tensors, lm_metadata = self._flatten_live_streaming_state(
+                    self.lm_gen
+                )
+                mimi_tensors, mimi_metadata = self._flatten_live_streaming_state(
+                    self.mimi
+                )
+                tensor_values = tuple(lm_tensors.values()) + tuple(
+                    mimi_tensors.values()
+                )
+                tensor_count = len(tensor_values)
+                tensor_bytes = sum(
+                    value.numel() * value.element_size()
+                    for value in tensor_values
+                )
+                free_before = self._admit_snapshot(residency, tensor_bytes)
+                snapshot = {
+                    "version": 2,
+                    "captured_at": time.monotonic(),
+                    "residency": residency,
+                    "tensor_count": tensor_count,
+                    "tensor_bytes": tensor_bytes,
+                    "lm": self._clone_flattened_streaming_state(
+                        lm_tensors,
+                        lm_metadata,
+                        residency=residency,
+                    ),
+                    "mimi": self._clone_flattened_streaming_state(
+                        mimi_tensors,
+                        mimi_metadata,
+                        residency=residency,
+                    ),
+                    "rng_cpu": torch.get_rng_state().clone(),
+                    "rng_cuda": None,
+                }
+                if self.device.type == "cuda" and torch.cuda.is_available():
+                    snapshot["rng_cuda"] = torch.cuda.get_rng_state(
+                        _cuda_device_index(self.device)
+                    ).clone()
+                clone_submitted_at = time.perf_counter()
+                if self.device.type == "cuda" and torch.cuda.is_available():
+                    sync_started_at = time.perf_counter()
+                    torch.cuda.synchronize(_cuda_device_index(self.device))
+                    sync_ms = (time.perf_counter() - sync_started_at) * 1000.0
+                free_after = self._snapshot_free_bytes(residency)
+                floor = (
+                    getattr(
+                        self,
+                        "_snapshot_host_free_floor_bytes",
+                        DEFAULT_SNAPSHOT_HOST_FREE_FLOOR_BYTES,
+                    )
+                    if residency == "cpu"
+                    else getattr(
+                        self,
+                        "_snapshot_gpu_free_floor_bytes",
+                        DEFAULT_SNAPSHOT_GPU_FREE_FLOOR_BYTES,
+                    )
+                )
+                if free_after is None or free_after < floor:
+                    raise SnapshotCapacityError(
+                        "snapshot capture could not preserve its configured "
+                        "free-memory floor"
+                    )
+
+            finished_at = time.perf_counter()
+            clone_ms = (clone_submitted_at - lock_acquired_at) * 1000.0
+            total_ms = (finished_at - started_at) * 1000.0
+            if metrics is not None:
+                metrics.record_snapshot_capture(
+                    tensor_count=tensor_count,
+                    tensor_bytes=tensor_bytes,
+                    total_ms=total_ms,
+                    clone_ms=clone_ms,
+                    sync_ms=sync_ms,
+                    residency_code=(
+                        SNAPSHOT_RESIDENCY_CPU
+                        if residency == "cpu"
+                        else SNAPSHOT_RESIDENCY_GPU
+                    ),
+                    free_before_bytes=free_before,
+                    free_after_bytes=free_after,
+                )
+            logger.info(
+                "snapshot capture session=%s kind=%s residency=%s "
+                "lock_wait_ms=%.1f clone_ms=%.1f sync_ms=%.1f "
+                "total_ms=%.1f tensors=%d bytes=%d free_before=%d "
+                "free_after=%d",
+                getattr(self, "_active_session_id", None) or "-",
+                kind,
+                residency,
+                (lock_acquired_at - started_at) * 1000.0,
+                clone_ms,
+                sync_ms,
+                total_ms,
+                tensor_count,
+                tensor_bytes,
+                free_before,
+                free_after,
+            )
+            return snapshot
+        except SnapshotDeferred:
+            raise
+        except Exception as exc:
+            if metrics is not None:
+                metrics.note_snapshot_failure(
+                    reason_code=(
+                        SNAPSHOT_FAILURE_BUDGET
+                        if isinstance(exc, SnapshotCapacityError)
+                        else SNAPSHOT_FAILURE_CAPTURE
+                    ),
+                    admission_rejected=isinstance(exc, SnapshotCapacityError),
+                )
+            raise
+
+    def _capture_bookmark_snapshot(self) -> tuple[dict | None, str]:
+        """Contain optional bookmark failures inside the inference worker."""
+
+        try:
+            return self._take_snapshot("bookmark"), "stored"
+        except SnapshotDeferred:
+            return None, "deferred"
+        except Exception as exc:
+            logger.exception(
+                "bookmark snapshot rejected nonfatally: %s",
+                type(exc).__name__,
+            )
+            return None, "rejected"
 
     def _restore_snapshot_locked(self, snapshot: dict) -> None:
         """Restore a versioned snapshot while _infer_lock is held."""
+        if not isinstance(snapshot, dict):
+            raise TypeError("session snapshot must be a dictionary")
         if snapshot.get("version") != 2:
             raise ValueError("unsupported session snapshot version")
-        # Mimi first because its optional convolution buffers exercise the
-        # stricter restore path. Both dictionaries are copied because restore
-        # consumes entries by popping them.
-        self.mimi.set_streaming_state_inplace(dict(snapshot["mimi"]))
-        self.lm_gen.set_streaming_state_inplace(dict(snapshot["lm"]))
-        torch.set_rng_state(snapshot["rng_cpu"])
-        if snapshot.get("rng_cuda") is not None:
+        mimi_state = snapshot.get("mimi")
+        lm_state = snapshot.get("lm")
+        if not isinstance(mimi_state, dict) or not isinstance(lm_state, dict):
+            raise TypeError("session snapshot LM and Mimi states must be dictionaries")
+
+        rng_cpu = snapshot.get("rng_cpu")
+        current_rng_cpu = torch.get_rng_state()
+        self._validate_snapshot_rng("rng_cpu", rng_cpu, current_rng_cpu)
+        rng_cuda = snapshot.get("rng_cuda")
+        if rng_cuda is not None:
+            if self.device.type != "cuda" or not torch.cuda.is_available():
+                raise RuntimeError("CUDA RNG state cannot be restored without CUDA")
+            current_rng_cuda = torch.cuda.get_rng_state(
+                _cuda_device_index(self.device)
+            )
+            self._validate_snapshot_rng("rng_cuda", rng_cuda, current_rng_cuda)
+
+        # Preflight the complete logical recovery point before either module
+        # or RNG stream changes. The apply calls still copy into existing
+        # graph-owned tensors and consume only their shallow dictionary copy.
+        self.mimi.validate_streaming_state(dict(mimi_state))
+        self.lm_gen.validate_streaming_state(dict(lm_state))
+
+        self.mimi.set_streaming_state_inplace(dict(mimi_state))
+        self.lm_gen.set_streaming_state_inplace(dict(lm_state))
+        torch.set_rng_state(rng_cpu)
+        if rng_cuda is not None:
             torch.cuda.set_rng_state(
-                snapshot["rng_cuda"], device=_cuda_device_index(self.device)
+                rng_cuda, device=_cuda_device_index(self.device)
             )
         if self.device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.synchronize(_cuda_device_index(self.device))
@@ -4439,6 +4796,24 @@ class ServerState:
         self._asr_assistant_silent = False
         self._inject_active = False
         self._inject_end_status = "complete"
+
+    @staticmethod
+    def _validate_snapshot_rng(
+        name: str,
+        candidate: object,
+        reference: torch.Tensor,
+    ) -> None:
+        if not isinstance(candidate, torch.Tensor):
+            raise TypeError(f"session snapshot {name} must be a tensor")
+        if (
+            candidate.device.type != "cpu"
+            or candidate.dtype != reference.dtype
+            or tuple(candidate.shape) != tuple(reference.shape)
+        ):
+            raise ValueError(
+                f"session snapshot {name} must have shape "
+                f"{tuple(reference.shape)}, dtype {reference.dtype}, on CPU"
+            )
 
     async def _restore_session_snapshot(
         self,
@@ -6527,22 +6902,83 @@ class ServerState:
                     except (TypeError, ValueError):
                         at_sec = 0.0
                     clog.log("info", f"bookmarking snapshot {label!r}")
-                    # Reuse the lock-correct clone path off the event loop.
                     try:
-                        snap = await loop.run_in_executor(
-                            self._infer_executor,
-                            self._take_snapshot,
-                            "bookmark",
-                        )
-                    except SnapshotDeferred:
                         session.send_event(
                             "bookmark",
-                            "Bookmark deferred; context is still injecting",
-                            "warn",
+                            f"Bookmark '{label}' is pending",
+                            "info",
+                            {
+                                "id": bm_id,
+                                "label": label,
+                                "at_sec": at_sec,
+                                "status": "pending",
+                            },
                         )
-                        session.send_notice(
-                            "Wait for context injection to finish, then bookmark"
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "bookmark pending notify failed: %s: %s",
+                            type(exc).__name__,
+                            exc,
                         )
+                    # Capture and CPU-tier the candidate off the event loop.
+                    # The worker wrapper contains optional allocation errors
+                    # so they never reach RTCSession._control_task_done.
+                    try:
+                        snap, capture_status = await loop.run_in_executor(
+                            self._infer_executor,
+                            self._capture_bookmark_snapshot,
+                        )
+                    except RuntimeError as exc:
+                        logger.exception(
+                            "bookmark executor failed nonfatally: %s",
+                            type(exc).__name__,
+                        )
+                        snap, capture_status = None, "rejected"
+                    if capture_status == "deferred":
+                        try:
+                            session.send_event(
+                                "bookmark",
+                                "Bookmark deferred; context is still injecting",
+                                "warn",
+                                {
+                                    "id": bm_id,
+                                    "label": label,
+                                    "at_sec": at_sec,
+                                    "status": "rejected",
+                                },
+                            )
+                            session.send_notice(
+                                "Wait for context injection to finish, then bookmark"
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "bookmark deferred notify failed: %s: %s",
+                                type(exc).__name__,
+                                exc,
+                            )
+                        return
+                    if snap is None:
+                        try:
+                            session.send_event(
+                                "bookmark",
+                                "Bookmark was not stored; the conversation is unchanged",
+                                "warn",
+                                {
+                                    "id": bm_id,
+                                    "label": label,
+                                    "at_sec": at_sec,
+                                    "status": "rejected",
+                                },
+                            )
+                            session.send_notice(
+                                "Bookmark could not be stored; existing rewind points are safe"
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "bookmark rejected notify failed: %s: %s",
+                                type(exc).__name__,
+                                exc,
+                            )
                         return
                     marks = self._session_bookmarks.get(session_id)
                     if (
@@ -6566,14 +7002,26 @@ class ServerState:
                     # Evict oldest on overflow so the server store mirrors the
                     # client's newest-first capped list and the two stay in
                     # sync; otherwise a jump to an evicted id hits not-found.
+                    evicted = None
                     while len(marks) > MAX_BOOKMARKS:
-                        marks.pop(0)
+                        evicted = marks.pop(0)
+                    self._refresh_snapshot_inventory_metrics()
                     try:
+                        event_data = {
+                            "id": bm_id,
+                            "label": label,
+                            "at_sec": at_sec,
+                            "status": "stored",
+                            "residency": snap["residency"],
+                            "bytes": snap["tensor_bytes"],
+                        }
+                        if evicted is not None:
+                            event_data["evicted_id"] = evicted["id"]
                         session.send_event(
                             "bookmark",
                             f"Bookmarked snapshot '{label}'",
                             "ok",
-                            {"id": bm_id, "label": label},
+                            event_data,
                         )
                         session.send_notice(f"Bookmarked snapshot '{label}'")
                     except Exception as exc:
@@ -7282,6 +7730,7 @@ class ServerState:
                         if history is None:
                             break
                         history[:] = [(time.monotonic(), snap)]
+                        self._refresh_snapshot_inventory_metrics()
                 except asyncio.CancelledError:
                     if snapshot_future is not None and not snapshot_future.done():
                         try:
@@ -7502,6 +7951,7 @@ class ServerState:
                         baseline_ts,
                         baseline,
                     )
+                    self._refresh_snapshot_inventory_metrics()
                     clog.log("info", "baseline snapshot captured")
                 except Exception as exc:
                     clog.log(
@@ -7807,6 +8257,7 @@ class ServerState:
                 # exactly like the auto-rewind ring above.
                 self._session_bookmarks.pop(session_id, None)
                 self._session_baselines.pop(session_id, None)
+                self._refresh_snapshot_inventory_metrics()
                 # Drain in-flight Gemini calls before the next session can
                 # acquire the lock. A stale handle_vision_frame still
                 # awaiting a response would otherwise overwrite the next
@@ -8092,11 +8543,52 @@ def main():
             "Rewind restore a recent state instead of the session-start "
             "baseline. Off by default: the session keeps only the baseline "
             "and explicit bookmarks, and auto-rewind can fire only while the "
-            "baseline is younger than its 90 s freshness limit. The first "
-            "~1.6 GB snapshot allocation occurs before the session becomes "
-            "ready; later captures usually fit inside one 80 ms frame on a "
-            "modern GPU."
+            "baseline is younger than its 90 s freshness limit. Baselines "
+            "and bookmarks tier to CPU; periodic recovery retains one GPU "
+            "snapshot. A measured two-row Caption-CFG capture is 2.945 GiB "
+            "and about 416 ms on an RTX 6000 Ada, so periodic capture remains "
+            "an explicitly qualified deployment choice."
         ),
+    )
+    parser.add_argument(
+        "--depformer-early-exit",
+        type=int,
+        default=_environment_int("PERSONAPLEX_DEPFORMER_EARLY_EXIT", 0),
+        help=(
+            "Experimental: generate only this many leading depformer "
+            "codebooks and reuse the provided user-audio tail. 0 disables "
+            "the shortcut (default). Values 8-16 require GPU/quality "
+            "qualification before deployment; skipped supplied codebooks "
+            "still consume the stock sampler's RNG progression."
+        ),
+    )
+    parser.add_argument(
+        "--snapshot-gpu-budget-gib",
+        type=float,
+        default=_environment_float("PERSONAPLEX_SNAPSHOT_GPU_BUDGET_GIB", 6.0),
+        help="Maximum retained GPU snapshot bytes in GiB (default 6).",
+    )
+    parser.add_argument(
+        "--snapshot-gpu-free-floor-gib",
+        type=float,
+        default=_environment_float(
+            "PERSONAPLEX_SNAPSHOT_GPU_FREE_FLOOR_GIB", 2.0
+        ),
+        help="Free VRAM preserved across GPU snapshot capture in GiB (default 2).",
+    )
+    parser.add_argument(
+        "--snapshot-host-budget-gib",
+        type=float,
+        default=_environment_float("PERSONAPLEX_SNAPSHOT_HOST_BUDGET_GIB", 24.0),
+        help="Maximum retained CPU snapshot bytes in GiB (default 24).",
+    )
+    parser.add_argument(
+        "--snapshot-host-free-floor-gib",
+        type=float,
+        default=_environment_float(
+            "PERSONAPLEX_SNAPSHOT_HOST_FREE_FLOOR_GIB", 4.0
+        ),
+        help="Available host RAM preserved across capture in GiB (default 4).",
     )
     parser.add_argument("--gradio-tunnel", action='store_true', help='Activate a gradio tunnel.')
     parser.add_argument("--gradio-tunnel-token",
@@ -8200,6 +8692,19 @@ def main():
     )
 
     args = parser.parse_args()
+    if args.depformer_early_exit != 0 and not (
+        AUDIO_TOKENS_PER_STREAM <= args.depformer_early_exit <= 16
+    ):
+        parser.error("--depformer-early-exit must be 0 or between 8 and 16")
+    for option in (
+        "snapshot_gpu_budget_gib",
+        "snapshot_gpu_free_floor_gib",
+        "snapshot_host_budget_gib",
+        "snapshot_host_free_floor_gib",
+    ):
+        value = float(getattr(args, option))
+        if not np.isfinite(value) or value < 0.0:
+            parser.error(f"--{option.replace('_', '-')} must be finite and non-negative")
     local_moshi_weight = args.moshi_weight
     # Resolve the checkpoint from CLI flags, else the PERSONAPLEX_MODEL /
     # PERSONAPLEX_HF_REPO / PERSONAPLEX_HF_REVISION env vars, so selecting
@@ -8391,10 +8896,16 @@ def main():
                             "PERSONAPLEX_SEMANTIC_TEMP_CAP",
                             DEFAULT_SEMANTIC_TEMPERATURE_CAP,
                         ),
-                        caption_cfg=bool(args.caption_cfg))
+                        caption_cfg=bool(args.caption_cfg),
+                        depformer_early_exit=args.depformer_early_exit)
     if args.caption_cfg:
         logger.info(
             "caption-cfg enabled: two streaming rows, guided text sampling"
+        )
+    if args.depformer_early_exit:
+        logger.warning(
+            "experimental depformer early exit enabled: %d of 16 codebooks",
+            args.depformer_early_exit,
         )
 
     # Optional second model for user-speech transcription. Constructed only
@@ -8455,6 +8966,15 @@ def main():
         voice_window_embedder=voice_window_embedder,
         cpu_offload=bool(args.cpu_offload),
         asr_model_sha256=asr_model_sha256,
+        depformer_early_exit=int(args.depformer_early_exit),
+        snapshot_gpu_budget_bytes=int(args.snapshot_gpu_budget_gib * GIB),
+        snapshot_gpu_free_floor_bytes=int(
+            args.snapshot_gpu_free_floor_gib * GIB
+        ),
+        snapshot_host_budget_bytes=int(args.snapshot_host_budget_gib * GIB),
+        snapshot_host_free_floor_bytes=int(
+            args.snapshot_host_free_floor_gib * GIB
+        ),
     )
     logger.info("warming up the model")
     t = time.monotonic()

@@ -61,6 +61,7 @@ def _cfg_lm_gen(depth_rows: torch.Tensor) -> LMGen:
     lm_gen.repetition_penalty = 1.0
     lm_gen.repetition_penalty_context = 8
     lm_gen.padding_bonus = 0.0
+    lm_gen.turn_onset_bias = 0.0
     lm_gen.max_turn_text_tokens = 0
     lm_gen._non_pad_streak = 0
     lm_gen._turn_pad_streak = 0

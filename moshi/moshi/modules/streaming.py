@@ -109,7 +109,7 @@ def _restore_streaming_state_pt(
         )
     _validate_tensor_restore(value, restored_value, name)
     if apply:
-        value.copy_(restored_value.to(value.device))
+        value.copy_(restored_value)
 
 
 def _set_streaming_state_inplace(
@@ -232,9 +232,7 @@ def _restore_streaming_state_from_keys(
                         existing_value, restored_value, full_key
                     )
                     if apply:
-                        existing_value.copy_(
-                            restored_value.to(existing_value.device)
-                        )
+                        existing_value.copy_(restored_value)
                 elif apply:
                     # .to(device) may return the snapshot tensor itself. Clone
                     # so subsequent live mutations cannot corrupt a reusable
@@ -515,33 +513,65 @@ class StreamingModule(abc.ABC, torch.nn.Module, Generic[State]):
         with open(metadata_save_path, "wt", encoding="utf-8") as fout:
             json.dump(state_dict_metadata, fout)
 
+    def _restore_streaming_state(
+        self,
+        state: StreamingStateDict,
+        *,
+        apply: bool,
+    ) -> None:
+        live_tensors: StreamingStateDict = {}
+        live_metadata: StreamingStateDict = {}
+        _flatten_streaming_state(
+            live_tensors,
+            live_metadata,
+            self.get_streaming_state(),
+            prefix="",
+        )
+        live_devices = [
+            value.device
+            for value in live_tensors.values()
+            if isinstance(value, torch.Tensor) and value.device.type != "meta"
+        ]
+        if live_devices:
+            device = next(
+                (candidate for candidate in live_devices if candidate.type != "cpu"),
+                live_devices[0],
+            )
+        else:
+            device = next(self.parameters()).device
+        if device.type == "meta":
+            raise RuntimeError(
+                "cannot restore streaming tensors without a concrete live-state device"
+            )
+
+        def _set(name: str, module: StreamingModule):
+            _set_streaming_state_inplace(
+                module._streaming_state,
+                state,
+                prefix=name,
+                device=device,
+                apply=apply,
+            )
+
+        self._apply_named_streaming(_set)
+        if state:
+            raise RuntimeError(
+                f"Some states were not consumed: {list(state.keys())}"
+            )
+
+    def validate_streaming_state(self, state: StreamingStateDict) -> None:
+        """Validate a flattened restore payload without mutating live state."""
+
+        self._restore_streaming_state(dict(state), apply=False)
+
     def set_streaming_state_inplace(self, state: StreamingStateDict):
         """
         Set the streaming state in-place, including that of
         sub-modules using a flattened-state dict.
         """
-        device = next(self.parameters()).device
 
-        def _restore(
-            state_dict: StreamingStateDict, *, apply: bool
-        ) -> None:
-            def _set(name: str, module: StreamingModule):
-                _set_streaming_state_inplace(
-                    module._streaming_state,
-                    state_dict,
-                    prefix=name,
-                    device=device,
-                    apply=apply,
-                )
-
-            self._apply_named_streaming(_set)
-            if state_dict:
-                raise RuntimeError(
-                    f"Some states were not consumed: {list(state_dict.keys())}"
-                )
-
-        _restore(dict(state), apply=False)
-        _restore(state, apply=True)
+        self.validate_streaming_state(state)
+        self._restore_streaming_state(state, apply=True)
 
     def set_streaming_state(self, state: dict[str, Any]):
         """Set the streaming state, including that of sub-modules."""

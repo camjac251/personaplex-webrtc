@@ -145,10 +145,16 @@ def validate_manifest(payload: Any, *, source: str = "manifest") -> dict[str, An
             )
             if deadline_ms <= 0:
                 raise ScenarioValidationError(f"{field}.deadline_ms must be > 0")
+            required = item.get("required", True)
+            if not isinstance(required, bool):
+                raise ScenarioValidationError(
+                    f"{field}.required must be a boolean"
+                )
             normalized.update(
                 event_kind=event_kind,
                 at_ms=at_ms,
                 deadline_ms=deadline_ms,
+                required=required,
             )
         normalized_expectations.append(normalized)
 
@@ -583,6 +589,7 @@ def analyze_scenario(
                 )
             turn_results.append(result)
         else:
+            required = expectation.get("required", True)
             window_start = expectation["at_ms"]
             window_end = window_start + expectation["deadline_ms"]
             match = next(
@@ -605,10 +612,12 @@ def analyze_scenario(
                         round(observed_ms, 1) if observed_ms is not None else None
                     ),
                     "observed": match is not None,
+                    "required": required,
                 }
             )
             if match is None:
-                required_failures.append(
+                failures = required_failures if required else threshold_failures
+                failures.append(
                     f"event {label!r}: {expectation['event_kind']!r} not observed "
                     "within deadline"
                 )
@@ -697,9 +706,9 @@ def analyze_scenario(
         "scenario_id": manifest["id"],
         "passed": not failures and not errors,
         "failures": failures,
-        # Keep hard requirements distinct from numeric quality limits so the
-        # live runner's --no-fail-on-thresholds switch can never hide a
-        # missing turn, cap event, Stop acknowledgement, or server error.
+        # Keep hard requirements distinct from quality limits so the live
+        # runner's --no-fail-on-thresholds switch can never hide a missing
+        # turn, required event, Stop acknowledgement, or server error.
         "required_failures": required_failures,
         "threshold_failures": threshold_failures,
         "errors": [_message(event) for event in errors],

@@ -44,6 +44,25 @@ class _RestoreModule(StreamingModule[_RestoreState]):
         )
 
 
+@dataclass
+class _OptionalRestoreState:
+    cache: torch.Tensor
+    optional: torch.Tensor | None = None
+
+    def reset(self) -> None:
+        self.cache.zero_()
+        self.optional = None
+
+
+class _MetaParameterRestoreModule(StreamingModule[_OptionalRestoreState]):
+    def __init__(self) -> None:
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.empty((), device="meta"))
+
+    def _init_streaming_state(self, batch_size: int) -> _OptionalRestoreState:
+        return _OptionalRestoreState(cache=torch.zeros(batch_size, 1))
+
+
 def restore_error(module, payload: dict) -> str:
     try:
         module.set_streaming_state_inplace(payload)
@@ -97,6 +116,18 @@ def test_restore_tensor_over_none_without_aliasing() -> None:
 
         conv.set_streaming_state_inplace(dict(saved))
         torch.testing.assert_close(conv._streaming_state.previous, expected)
+
+
+def test_restore_tensor_over_none_uses_live_state_device() -> None:
+    module = _MetaParameterRestoreModule()
+    with module.streaming(1):
+        payload = snapshot(module)
+        payload[".optional"] = torch.ones(1)
+
+        module.set_streaming_state_inplace(payload)
+
+        assert module._streaming_state.optional is not None
+        assert module._streaming_state.optional.device.type == "cpu"
 
 
 def test_restore_rejects_invalid_broadcast_shapes() -> None:
@@ -209,6 +240,7 @@ if __name__ == "__main__":
     tests = (
         test_restore_none_over_tensor,
         test_restore_tensor_over_none_without_aliasing,
+        test_restore_tensor_over_none_uses_live_state_device,
         test_restore_rejects_invalid_broadcast_shapes,
         test_restore_rejects_dtype_mismatch,
         test_restore_missing_late_key_is_atomic,

@@ -97,6 +97,12 @@ def _process_identity() -> dict:
             "periodic_snapshots": False,
             "asr_available": False,
             "voice_picker_available": True,
+            "snapshot_cpu_tiering": True,
+            "snapshot_gpu_budget_bytes": 6 * 1024**3,
+            "snapshot_gpu_free_floor_bytes": 2 * 1024**3,
+            "snapshot_host_budget_bytes": 24 * 1024**3,
+            "snapshot_host_free_floor_bytes": 4 * 1024**3,
+            "depformer_early_exit": 0,
         },
     }
 
@@ -151,6 +157,24 @@ def test_manifest_rejects_ambiguous_action_schedule() -> None:
         assert "exactly one" in str(exc)
     else:
         raise AssertionError("ambiguous action schedule was accepted")
+
+
+def test_manifest_rejects_non_boolean_event_required() -> None:
+    payload = _manifest(
+        expectations=[
+            {
+                "kind": "event",
+                "event_kind": "turn_cap",
+                "required": "false",
+            }
+        ]
+    )
+    try:
+        validate_manifest(payload)
+    except ScenarioValidationError as exc:
+        assert ".required must be a boolean" in str(exc)
+    else:
+        raise AssertionError("non-boolean event required flag was accepted")
 
 
 def test_runner_rejects_expectation_windows_past_capture_end() -> None:
@@ -369,6 +393,34 @@ def test_required_and_threshold_failures_are_distinct() -> None:
     assert metrics["failures"] == [
         *metrics["required_failures"],
         *metrics["threshold_failures"],
+    ]
+
+
+def test_advisory_event_gap_is_a_threshold_failure() -> None:
+    manifest = _manifest(
+        expectations=[
+            {
+                "kind": "event",
+                "label": "advisory cap",
+                "event_kind": "turn_cap",
+                "deadline_ms": 500,
+                "required": False,
+            }
+        ]
+    )
+    metrics = analyze_scenario(manifest, np.zeros(1, dtype=np.float32), [])
+    assert metrics["required_failures"] == []
+    assert metrics["threshold_failures"] == [
+        "event 'advisory cap': 'turn_cap' not observed within deadline"
+    ]
+    assert metrics["event"] == [
+        {
+            "label": "advisory cap",
+            "event_kind": "turn_cap",
+            "observed_ms": None,
+            "observed": False,
+            "required": False,
+        }
     ]
 
 
@@ -930,6 +982,7 @@ if __name__ == "__main__":
         test_checked_in_manifests_validate_without_bundled_audio,
         test_long_session_soak_turns_fit_generated_wav_timeline,
         test_manifest_rejects_ambiguous_action_schedule,
+        test_manifest_rejects_non_boolean_event_required,
         test_runner_rejects_expectation_windows_past_capture_end,
         test_wav_validation_and_twenty_ms_framing,
         test_vad_attack_release_segments_speech,
@@ -939,6 +992,7 @@ if __name__ == "__main__":
         test_event_and_stop_limits_are_enforced,
         test_clipping_and_transcript_runaway_are_reported,
         test_required_and_threshold_failures_are_distinct,
+        test_advisory_event_gap_is_a_threshold_failure,
         test_runner_verifies_replay_config_and_concrete_seed,
         test_runner_treats_actions_and_transport_errors_as_operational,
         test_ignore_thresholds_never_masks_operational_failures,

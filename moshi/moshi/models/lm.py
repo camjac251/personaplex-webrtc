@@ -522,6 +522,9 @@ class LMModel(StreamingContainer):
 
     @property
     def device(self):
+        execution_device = getattr(self, "_execution_device_override", None)
+        if execution_device is not None:
+            return torch.device(execution_device)
         first_param = next(iter(self.parameters()))
         return first_param.device
 
@@ -540,7 +543,7 @@ class LMModel(StreamingContainer):
     def _get_initial_token(self) -> torch.Tensor:
         # Returns the initial token that will be fed to the model to predict the very first timestep.
         # The output shape will be [B, K, 1].
-        device = next(iter(self.parameters())).device
+        device = self.device
         zero = torch.full(
             [1, 1, 1], self.zero_token_id, device=device, dtype=torch.long
         )
@@ -806,6 +809,7 @@ class LMGen(StreamingModule[_LMGenState]):
         max_turn_text_tokens: int = 0,
         semantic_temperature_cap: float = DEFAULT_SEMANTIC_TEMPERATURE_CAP,
         caption_cfg: bool = False,
+        depformer_early_exit: int | None = None,
     ):
         assert not lm_model.training, "generation shouldn't be used in training mode."
         super().__init__()
@@ -835,6 +839,16 @@ class LMGen(StreamingModule[_LMGenState]):
         # context-window text and the emitted timeline never carries it.
         # Requires entering streaming with batch size 2.
         self.caption_cfg = bool(caption_cfg)
+        self.depformer_early_exit = (
+            lm_model.dep_q
+            if depformer_early_exit in (None, 0)
+            else int(depformer_early_exit)
+        )
+        if not AUDIO_TOKENS_PER_STREAM <= self.depformer_early_exit <= lm_model.dep_q:
+            raise ValueError(
+                "depformer early exit must be 0 (disabled) or between "
+                f"{AUDIO_TOKENS_PER_STREAM} and {lm_model.dep_q}"
+            )
         # Guidance strength. 1.0 reproduces the conditional branch exactly
         # (context in attention at natural strength); higher values amplify
         # the context delta. Plain Python float mutated live by the server
@@ -902,6 +916,8 @@ class LMGen(StreamingModule[_LMGenState]):
         if report_loss:
             return_logits = True
         self.return_logits = return_logits
+        if self.depformer_early_exit < lm_model.dep_q and self.return_logits:
+            raise ValueError("depformer early exit is incompatible with logits/loss reporting")
         self.max_delay = max(
             lm_model.delays
         )  # with delays, we need to generate a few more time steps.
@@ -960,7 +976,10 @@ class LMGen(StreamingModule[_LMGenState]):
             dtype=torch.bool
         )
 
-        disable = lm_model.device.type != 'cuda'
+        disable = (
+            lm_model.device.type != 'cuda'
+            or bool(getattr(lm_model, "_cpu_offload_enabled", False))
+        )
         # disable = True # DEBUG
         graphed_main = CUDAGraphed(lm_model.forward_codes, disable=disable)
         graphed_embeddings = CUDAGraphed(lm_model.forward_embeddings, disable=disable)
@@ -1085,6 +1104,10 @@ class LMGen(StreamingModule[_LMGenState]):
         -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         state = self._streaming_state
         lm_model = self.lm_model
+        if self.depformer_early_exit < lm_model.dep_q and input_tokens is None:
+            raise RuntimeError(
+                "depformer early exit requires provided user-audio codebooks"
+            )
         prepared_inputs = self.prepare_step_input(
             input_tokens, moshi_tokens, text_token,
         )
@@ -1898,7 +1921,7 @@ class LMGen(StreamingModule[_LMGenState]):
         depformer_logits: list[torch.Tensor] = []
         assert not lm_model.depformer.is_streaming
         with lm_model.depformer.streaming(B):
-            for cb_index in range(lm_model.dep_q):
+            for cb_index in range(self.depformer_early_exit):
                 input_ = prev_token[:, None, None]
                 logits = lm_model.forward_depformer(cb_index, input_, transformer_out)
                 if self.return_logits:
@@ -1923,6 +1946,24 @@ class LMGen(StreamingModule[_LMGenState]):
                     next_token,
                 )
                 depformer_tokens.append(next_token)
+
+        if self.depformer_early_exit < lm_model.dep_q:
+            if self.use_sampling:
+                # The stock path samples every supplied user codebook even
+                # though torch.where discards those values. Consume the same
+                # exponential variates as multinomial() so later assistant
+                # frames see the same generator state after skipping the
+                # unnecessary depformer layers.
+                for _ in range(self.depformer_early_exit, lm_model.dep_q):
+                    torch.empty(
+                        (B, lm_model.card),
+                        device=audio_tokens.device,
+                        dtype=torch.float32,
+                    ).exponential_(1)
+            depformer_tokens.extend(
+                audio_tokens[:, cb_index]
+                for cb_index in range(self.depformer_early_exit, lm_model.dep_q)
+            )
 
         assert len(depformer_tokens) == lm_model.dep_q, (
             len(depformer_tokens),

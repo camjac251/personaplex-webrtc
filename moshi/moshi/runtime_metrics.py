@@ -22,6 +22,9 @@ HISTOGRAM_BIN_WIDTH_MS = 0.25
 HISTOGRAM_MAX_MS = 4096.0
 HISTOGRAM_BIN_COUNT = int(HISTOGRAM_MAX_MS / HISTOGRAM_BIN_WIDTH_MS)
 UNAVAILABLE_NOT_IMPLEMENTED = 1
+SNAPSHOT_FAILURE_NONE = 0
+SNAPSHOT_FAILURE_BUDGET = 2
+SNAPSHOT_FAILURE_CAPTURE = 3
 
 LIFECYCLE_METRICS = (
     "pcm_queue_residence_ms",
@@ -209,6 +212,23 @@ class RuntimeMetrics:
             self._discarded_pending_samples = 0
             self._cancelled_model_frames = 0
             self._frames_without_output = 0
+            self._snapshot_capture_count = 0
+            self._snapshot_failure_count = 0
+            self._snapshot_admission_rejection_count = 0
+            self._snapshot_last_failure_reason_code = SNAPSHOT_FAILURE_NONE
+            self._snapshot_last_tensor_count = 0
+            self._snapshot_last_tensor_bytes = 0
+            self._snapshot_peak_tensor_bytes = 0
+            self._snapshot_last_total_ms = 0.0
+            self._snapshot_last_clone_ms = 0.0
+            self._snapshot_last_sync_ms = 0.0
+            self._snapshot_last_residency_code = 0
+            self._snapshot_last_free_before_bytes = 0
+            self._snapshot_last_free_after_bytes = 0
+            self._snapshot_cpu_resident_count = 0
+            self._snapshot_cpu_resident_bytes = 0
+            self._snapshot_gpu_resident_count = 0
+            self._snapshot_gpu_resident_bytes = 0
 
     def record_completed(
         self,
@@ -256,6 +276,62 @@ class RuntimeMetrics:
         with self._lock:
             self._cancelled_model_frames += max(0, int(count))
 
+    def record_snapshot_capture(
+        self,
+        *,
+        tensor_count: int,
+        tensor_bytes: int,
+        total_ms: float,
+        clone_ms: float,
+        sync_ms: float,
+        residency_code: int,
+        free_before_bytes: int,
+        free_after_bytes: int,
+    ) -> None:
+        with self._lock:
+            self._snapshot_capture_count += 1
+            self._snapshot_last_tensor_count = max(0, int(tensor_count))
+            self._snapshot_last_tensor_bytes = max(0, int(tensor_bytes))
+            self._snapshot_peak_tensor_bytes = max(
+                self._snapshot_peak_tensor_bytes,
+                self._snapshot_last_tensor_bytes,
+            )
+            self._snapshot_last_total_ms = max(0.0, float(total_ms))
+            self._snapshot_last_clone_ms = max(0.0, float(clone_ms))
+            self._snapshot_last_sync_ms = max(0.0, float(sync_ms))
+            self._snapshot_last_residency_code = max(0, int(residency_code))
+            self._snapshot_last_free_before_bytes = max(
+                0, int(free_before_bytes)
+            )
+            self._snapshot_last_free_after_bytes = max(
+                0, int(free_after_bytes)
+            )
+
+    def note_snapshot_failure(
+        self,
+        *,
+        reason_code: int,
+        admission_rejected: bool,
+    ) -> None:
+        with self._lock:
+            self._snapshot_failure_count += 1
+            self._snapshot_admission_rejection_count += int(admission_rejected)
+            self._snapshot_last_failure_reason_code = max(0, int(reason_code))
+
+    def set_snapshot_inventory(
+        self,
+        *,
+        cpu_count: int,
+        cpu_bytes: int,
+        gpu_count: int,
+        gpu_bytes: int,
+    ) -> None:
+        with self._lock:
+            self._snapshot_cpu_resident_count = max(0, int(cpu_count))
+            self._snapshot_cpu_resident_bytes = max(0, int(cpu_bytes))
+            self._snapshot_gpu_resident_count = max(0, int(gpu_count))
+            self._snapshot_gpu_resident_bytes = max(0, int(gpu_bytes))
+
     def snapshot(self) -> dict[str, object]:
         with self._lock:
             lifecycle = {
@@ -270,6 +346,16 @@ class RuntimeMetrics:
                     f"{name}_reason_code": UNAVAILABLE_NOT_IMPLEMENTED
                     for name in DEFERRED_AVAILABILITY
                 }
+            )
+            snapshot_available = int(
+                self._snapshot_capture_count > 0
+                or self._snapshot_failure_count > 0
+                or self._snapshot_cpu_resident_count > 0
+                or self._snapshot_gpu_resident_count > 0
+            )
+            availability["snapshot_accounting_available"] = snapshot_available
+            availability["snapshot_accounting_reason_code"] = (
+                0 if snapshot_available else UNAVAILABLE_NOT_IMPLEMENTED
             )
             return {
                 "schema_version": RUNTIME_SUMMARY_SCHEMA_VERSION,
@@ -289,6 +375,33 @@ class RuntimeMetrics:
                 "cancelled_model_frames": self._cancelled_model_frames,
                 "frames_without_output": self._frames_without_output,
                 "lifecycle": lifecycle,
+                "snapshot_accounting": {
+                    "capture_count": self._snapshot_capture_count,
+                    "failure_count": self._snapshot_failure_count,
+                    "admission_rejection_count": (
+                        self._snapshot_admission_rejection_count
+                    ),
+                    "last_failure_reason_code": (
+                        self._snapshot_last_failure_reason_code
+                    ),
+                    "last_tensor_count": self._snapshot_last_tensor_count,
+                    "last_tensor_bytes": self._snapshot_last_tensor_bytes,
+                    "peak_tensor_bytes": self._snapshot_peak_tensor_bytes,
+                    "last_total_ms": round(self._snapshot_last_total_ms, 3),
+                    "last_clone_ms": round(self._snapshot_last_clone_ms, 3),
+                    "last_sync_ms": round(self._snapshot_last_sync_ms, 3),
+                    "last_residency_code": self._snapshot_last_residency_code,
+                    "last_free_before_bytes": (
+                        self._snapshot_last_free_before_bytes
+                    ),
+                    "last_free_after_bytes": (
+                        self._snapshot_last_free_after_bytes
+                    ),
+                    "cpu_resident_count": self._snapshot_cpu_resident_count,
+                    "cpu_resident_bytes": self._snapshot_cpu_resident_bytes,
+                    "gpu_resident_count": self._snapshot_gpu_resident_count,
+                    "gpu_resident_bytes": self._snapshot_gpu_resident_bytes,
+                },
                 "availability": availability,
             }
 

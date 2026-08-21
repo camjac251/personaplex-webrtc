@@ -362,6 +362,9 @@ class _FakeLM:
         self.stream_content = snapshot["state"].clone()
         self.restored_stream_content = self.stream_content.clone()
 
+    def validate_streaming_state(self, _snapshot):
+        return None
+
 
 class _FakeMimi:
     sample_rate = 1_000
@@ -386,6 +389,9 @@ class _FakeMimi:
         if self.fail_restore:
             raise RuntimeError("poisoned restore detail")
 
+    def validate_streaming_state(self, _snapshot):
+        return None
+
 
 def _preview_state(*, fail_generation: bool, fail_restore: bool = False):
     state = ServerState.__new__(ServerState)
@@ -398,7 +404,7 @@ def _preview_state(*, fail_generation: bool, fail_restore: bool = False):
     state._active_voice_blend_mix = 0.2
     state._active_clone_strength = 0.6
     state._active_voice_conditioning_sha256 = "a" * 64
-    state._clone_streaming_state = lambda module: {
+    state._clone_streaming_state = lambda module, **_kwargs: {
         "state": module.stream_content.clone()
     }
     return state

@@ -6,6 +6,7 @@ Run directly: ``uv run python moshi/tests/test_lm_controls.py``.
 from __future__ import annotations
 
 import sys
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import numpy as np
@@ -490,6 +491,95 @@ def test_turn_cap_pending_without_fresh_event_uses_current_token() -> None:
     assert lm_gen._turn_cap_token_pending is False
 
 
+def test_depformer_early_exit_reuses_provided_tail_codebooks() -> None:
+    class _Depth:
+        is_streaming = False
+
+        @contextmanager
+        def streaming(self, batch_size: int):
+            assert batch_size == 1
+            yield
+
+    class _Lm:
+        dep_q = 16
+        card = 32
+        zero_token_id = -1
+        depformer = _Depth()
+
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+
+        def forward_depformer(self, index, _input, _transformer_out):
+            self.calls.append(index)
+            logits = torch.zeros(1, 1, 1, self.card)
+            logits[..., index + 1] = 1.0
+            return logits
+
+    lm_gen = LMGen.__new__(LMGen)
+    lm_gen.lm_model = _Lm()
+    lm_gen.depformer_early_exit = 8
+    lm_gen.return_logits = False
+    lm_gen.use_sampling = False
+    provided_tail = torch.arange(100, 116, dtype=torch.long).view(1, 16)
+
+    tokens = lm_gen.depformer_step(
+        torch.tensor([7]),
+        torch.zeros(1, 1, 4),
+        provided_tail,
+        torch.ones(1, 16, dtype=torch.bool),
+        torch.ones(16),
+        torch.tensor(32),
+    )
+
+    assert lm_gen.lm_model.calls == list(range(8))
+    assert tokens[0, :8].tolist() == list(range(1, 9))
+    assert tokens[0, 8:].tolist() == provided_tail[0, 8:].tolist()
+
+
+def test_depformer_early_exit_preserves_sampling_rng_progression() -> None:
+    class _Depth:
+        is_streaming = False
+
+        @contextmanager
+        def streaming(self, batch_size: int):
+            assert batch_size == 1
+            yield
+
+    class _Lm:
+        dep_q = 16
+        card = 32
+        zero_token_id = -1
+        depformer = _Depth()
+
+        def forward_depformer(self, index, _input, _transformer_out):
+            logits = torch.zeros(1, 1, 1, self.card)
+            logits[..., index + 1] = 1.0
+            return logits
+
+    def run(early_exit: int) -> tuple[torch.Tensor, torch.Tensor]:
+        lm_gen = LMGen.__new__(LMGen)
+        lm_gen.lm_model = _Lm()
+        lm_gen.depformer_early_exit = early_exit
+        lm_gen.return_logits = False
+        lm_gen.use_sampling = True
+        torch.manual_seed(1234)
+        tokens = lm_gen.depformer_step(
+            torch.tensor([7]),
+            torch.zeros(1, 1, 4),
+            torch.arange(16, dtype=torch.long).view(1, 16),
+            torch.ones(1, 16, dtype=torch.bool),
+            torch.ones(16),
+            torch.tensor(32),
+        )
+        return tokens, torch.get_rng_state().clone()
+
+    full_tokens, full_rng = run(16)
+    early_tokens, early_rng = run(8)
+
+    assert torch.equal(early_tokens[:, :8], full_tokens[:, :8])
+    assert torch.equal(early_rng, full_rng)
+
+
 if __name__ == "__main__":
     tests = [
         test_temperature_updates_graph_input_without_reset,
@@ -513,6 +603,8 @@ if __name__ == "__main__":
         test_boundary_silence_trim_keeps_quiet_valid_clip,
         test_turn_cap_reset_clears_pending_copy_bookkeeping,
         test_turn_cap_pending_without_fresh_event_uses_current_token,
+        test_depformer_early_exit_reuses_provided_tail_codebooks,
+        test_depformer_early_exit_preserves_sampling_rng_progression,
     ]
     for test in tests:
         print(f"{test.__name__} ...")

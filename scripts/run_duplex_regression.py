@@ -151,6 +151,12 @@ REQUIRED_PROCESS_FLAGS = {
     "periodic_snapshots": bool,
     "asr_available": bool,
     "voice_picker_available": bool,
+    "snapshot_cpu_tiering": bool,
+    "snapshot_gpu_budget_bytes": int,
+    "snapshot_gpu_free_floor_bytes": int,
+    "snapshot_host_budget_bytes": int,
+    "snapshot_host_free_floor_bytes": int,
+    "depformer_early_exit": int,
 }
 IMMUTABLE_BUILD_RE = re.compile(
     r"(?:[0-9a-f]{40,64}|sha256:[0-9a-f]{64})"
@@ -656,11 +662,9 @@ def _identity_failures(
                 failures.append(
                     f"server process flag {key!r} has the wrong type"
                 )
-        if (
-            type(process_flags.get("kv_sink_frames")) is int
-            and process_flags["kv_sink_frames"] < 0
-        ):
-            failures.append("server process flag 'kv_sink_frames' is negative")
+        for key, expected_type in REQUIRED_PROCESS_FLAGS.items():
+            if expected_type is int and process_flags[key] < 0:
+                failures.append(f"server process flag {key!r} is negative")
     if ready.get("voice_request_sha256") != expected_voice_sha256:
         failures.append("ready voice request identity does not match config")
     voice_conditioning_sha256 = ready.get(

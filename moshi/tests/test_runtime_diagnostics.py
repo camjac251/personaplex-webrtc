@@ -32,6 +32,7 @@ from moshi.server import (
     RL_HF_REPO,
     STOP_LATCH_MAX_HOLD_SEC,
     ServerState,
+    SnapshotCapacityError,
     SnapshotDeferred,
     _asr_model_files_sha256,
     _AsrEngine,
@@ -575,27 +576,43 @@ def test_failed_input_transfer_clears_inflight_frame() -> None:
 
 
 def test_snapshot_waits_for_cuda_copy_completion() -> None:
+    class _SnapshotModule:
+        def get_streaming_state(self) -> dict:
+            return {"state": torch.zeros(4, dtype=torch.float32)}
+
     state = ServerState.__new__(ServerState)
     state.device = torch.device("cuda:0")
     state._infer_lock = threading.Lock()
-    state.lm_gen = object()
-    state.mimi = object()
-    state._clone_streaming_state = lambda _module: {
-        "state": torch.zeros(4, dtype=torch.float32)
-    }
+    state.lm_gen = _SnapshotModule()
+    state.mimi = _SnapshotModule()
+    state._snapshot_gpu_budget_bytes = 1024
+    state._snapshot_gpu_free_floor_bytes = 0
+    state._session_snapshots = {}
+    state._session_bookmarks = {}
+    state._session_baselines = {}
+    state._resume_grant = None
 
     original_is_available = torch.cuda.is_available
     original_get_rng_state = torch.cuda.get_rng_state
+    original_mem_get_info = torch.cuda.mem_get_info
+    original_memory_reserved = torch.cuda.memory_reserved
+    original_memory_allocated = torch.cuda.memory_allocated
     original_synchronize = torch.cuda.synchronize
     sync_calls: list[int | None] = []
     try:
         torch.cuda.is_available = lambda: True
         torch.cuda.get_rng_state = lambda _device=None: torch.zeros(4, dtype=torch.uint8)
+        torch.cuda.mem_get_info = lambda _device=None: (1024, 2048)
+        torch.cuda.memory_reserved = lambda _device=None: 0
+        torch.cuda.memory_allocated = lambda _device=None: 0
         torch.cuda.synchronize = lambda device=None: sync_calls.append(device)
         state._take_snapshot()
     finally:
         torch.cuda.is_available = original_is_available
         torch.cuda.get_rng_state = original_get_rng_state
+        torch.cuda.mem_get_info = original_mem_get_info
+        torch.cuda.memory_reserved = original_memory_reserved
+        torch.cuda.memory_allocated = original_memory_allocated
         torch.cuda.synchronize = original_synchronize
 
     assert sync_calls == [0]
@@ -615,8 +632,79 @@ def test_snapshot_defers_mid_context_injection() -> None:
         raise AssertionError("mid-inject snapshot was not deferred")
 
 
+def _snapshot_test_state(*, host_budget_bytes: int) -> ServerState:
+    class _SnapshotModule:
+        def __init__(self, value: float) -> None:
+            self.value = value
+
+        def get_streaming_state(self) -> dict:
+            return {"state": torch.full((4,), self.value)}
+
+    state = ServerState.__new__(ServerState)
+    state.device = torch.device("cpu")
+    state._infer_lock = threading.Lock()
+    state.lm_gen = _SnapshotModule(1.0)
+    state.mimi = _SnapshotModule(2.0)
+    state._snapshot_host_budget_bytes = host_budget_bytes
+    state._snapshot_host_free_floor_bytes = 0
+    state._snapshot_gpu_budget_bytes = 0
+    state._snapshot_gpu_free_floor_bytes = 0
+    state._session_snapshots = {}
+    state._session_bookmarks = {}
+    state._session_baselines = {}
+    state._resume_grant = None
+    state._runtime_metrics = RuntimeMetrics()
+    return state
+
+
+def test_baseline_and_bookmark_snapshots_are_cpu_resident_and_accounted() -> None:
+    state = _snapshot_test_state(host_budget_bytes=1024)
+
+    snapshot = state._take_snapshot("bookmark")
+
+    assert snapshot["residency"] == "cpu"
+    assert snapshot["tensor_count"] == 2
+    assert snapshot["tensor_bytes"] == 32
+    for module_state in (snapshot["lm"], snapshot["mimi"]):
+        assert module_state["state"].device.type == "cpu"
+    accounting = state._runtime_metrics.snapshot()["snapshot_accounting"]
+    assert accounting["capture_count"] == 1
+    assert accounting["last_tensor_bytes"] == 32
+    assert accounting["last_residency_code"] == 1
+
+
+def test_bookmark_budget_rejection_is_nonfatal_and_keeps_prior_points() -> None:
+    state = _snapshot_test_state(host_budget_bytes=16)
+    prior = {"version": 2, "residency": "cpu", "tensor_bytes": 8}
+    state._session_baselines = {"session": (1.0, prior)}
+    state._session_snapshots = {"session": [(1.0, prior)]}
+
+    snapshot, status = state._capture_bookmark_snapshot()
+
+    assert snapshot is None
+    assert status == "rejected"
+    assert state._session_baselines["session"][1] is prior
+    assert state._session_snapshots["session"][0][1] is prior
+    accounting = state._runtime_metrics.snapshot()["snapshot_accounting"]
+    assert accounting["failure_count"] == 1
+    assert accounting["admission_rejection_count"] == 1
+
+
+def test_snapshot_capacity_error_is_specific() -> None:
+    state = _snapshot_test_state(host_budget_bytes=16)
+    try:
+        state._take_snapshot("bookmark")
+    except SnapshotCapacityError as exc:
+        assert "host snapshot budget" in str(exc)
+    else:
+        raise AssertionError("over-budget snapshot should be rejected")
+
+
 def test_restore_waits_for_cuda_copy_completion() -> None:
     class _RestoreModule:
+        def validate_streaming_state(self, _state: dict) -> None:
+            return None
+
         def set_streaming_state_inplace(self, _state: dict) -> None:
             return None
 
@@ -652,6 +740,56 @@ def test_restore_waits_for_cuda_copy_completion() -> None:
         torch.cuda.synchronize = original_synchronize
 
     assert sync_calls == [0]
+
+
+def test_restore_preflights_both_modules_and_rng_before_any_apply() -> None:
+    class _RestoreModule:
+        def __init__(self, *, fail_validation: bool = False) -> None:
+            self.fail_validation = fail_validation
+            self.apply_calls = 0
+
+        def validate_streaming_state(self, _state: dict) -> None:
+            if self.fail_validation:
+                raise RuntimeError("late LM schema mismatch")
+
+        def set_streaming_state_inplace(self, _state: dict) -> None:
+            self.apply_calls += 1
+
+    state = ServerState.__new__(ServerState)
+    state.device = torch.device("cpu")
+    state.mimi = _RestoreModule()
+    state.lm_gen = _RestoreModule(fail_validation=True)
+    before_rng = torch.get_rng_state().clone()
+    snapshot = {
+        "version": 2,
+        "lm": {},
+        "mimi": {},
+        "rng_cpu": before_rng.clone(),
+        "rng_cuda": None,
+    }
+
+    try:
+        state._restore_snapshot_locked(snapshot)
+    except RuntimeError as exc:
+        assert "late LM schema mismatch" in str(exc)
+    else:
+        raise AssertionError("invalid LM schema should reject the whole restore")
+
+    assert state.mimi.apply_calls == 0
+    assert state.lm_gen.apply_calls == 0
+    assert torch.equal(torch.get_rng_state(), before_rng)
+
+    state.lm_gen.fail_validation = False
+    snapshot["rng_cpu"] = torch.zeros(3, dtype=torch.uint8)
+    try:
+        state._restore_snapshot_locked(snapshot)
+    except ValueError as exc:
+        assert "rng_cpu" in str(exc)
+    else:
+        raise AssertionError("invalid RNG state should reject the whole restore")
+    assert state.mimi.apply_calls == 0
+    assert state.lm_gen.apply_calls == 0
+    assert torch.equal(torch.get_rng_state(), before_rng)
 
 
 def test_short_noise_burst_does_not_complete_user_turn() -> None:
@@ -1044,7 +1182,11 @@ if __name__ == "__main__":
         test_failed_input_transfer_clears_inflight_frame,
         test_snapshot_waits_for_cuda_copy_completion,
         test_snapshot_defers_mid_context_injection,
+        test_baseline_and_bookmark_snapshots_are_cpu_resident_and_accounted,
+        test_bookmark_budget_rejection_is_nonfatal_and_keeps_prior_points,
+        test_snapshot_capacity_error_is_specific,
         test_restore_waits_for_cuda_copy_completion,
+        test_restore_preflights_both_modules_and_rng_before_any_apply,
         test_short_noise_burst_does_not_complete_user_turn,
         test_short_reply_releases_stop_without_weakening_general_vad,
         test_single_frame_noise_does_not_release_stop_latch,

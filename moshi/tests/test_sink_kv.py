@@ -76,6 +76,46 @@ def test_sink_positions_are_absolute_and_visible() -> None:
         )
 
 
+def test_reported_positions_match_the_values_stored_in_each_slot() -> None:
+    """Position metadata must identify the value occupying the same slot.
+
+    The first write at exactly ``capacity`` is the sharp edge: slot zero has
+    just been replaced, while the pre-fix ``delta <= 0`` branch reported the
+    evicted position for that slot. Exercise both the plain ring and a sink
+    ring, including multi-token writes that cross the same boundary.
+    """
+
+    for sink in (0, 2):
+        cache = RingKVCache(
+            1,
+            1,
+            1,
+            8,
+            device="cpu",
+            dtype=torch.float32,
+            sink=sink,
+        )
+        step = 0
+        for chunk in (1, 2, 4, 1, 3, 5, 2):
+            values = torch.arange(
+                step,
+                step + chunk,
+                dtype=torch.float32,
+            ).view(1, 1, chunk, 1)
+            keys, _values, positions = cache.complete(values, values.clone())
+            stored = keys.reshape(-1)
+            reported = positions.reshape(-1)
+            valid = reported >= 0
+            torch.testing.assert_close(
+                stored[valid],
+                reported[valid].to(dtype=stored.dtype),
+                msg=f"sink={sink} step={step} chunk={chunk}",
+            )
+            if step + chunk >= cache.capacity:
+                assert int(valid.sum()) == cache.capacity
+            step += chunk
+
+
 def test_sink_multi_token_write_freezes_anchor() -> None:
     capacity = 8
     sink = 3
@@ -126,6 +166,7 @@ if __name__ == "__main__":
         test_sink_zero_matches_plain_ring,
         test_sink_slots_never_evicted,
         test_sink_positions_are_absolute_and_visible,
+        test_reported_positions_match_the_values_stored_in_each_slot,
         test_sink_multi_token_write_freezes_anchor,
         test_sink_survives_snapshot_restore,
         test_sink_out_of_range_raises,

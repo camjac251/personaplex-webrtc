@@ -28,6 +28,12 @@ REQUIRED_PROCESS_FLAGS = {
     "periodic_snapshots": bool,
     "asr_available": bool,
     "voice_picker_available": bool,
+    "snapshot_cpu_tiering": bool,
+    "snapshot_gpu_budget_bytes": int,
+    "snapshot_gpu_free_floor_bytes": int,
+    "snapshot_host_budget_bytes": int,
+    "snapshot_host_free_floor_bytes": int,
+    "depformer_early_exit": int,
 }
 REQUIRED_MEASUREMENT_PATHS = (
     "runtime.rtf_ema_p95",
@@ -221,10 +227,11 @@ def _process_flags(value: object) -> dict[str, Any]:
             raise QualificationError(
                 f"server_info.process_flags.{key} has the wrong type"
             )
-    if flags["kv_sink_frames"] < 0:
-        raise QualificationError(
-            "server_info.process_flags.kv_sink_frames must be nonnegative"
-        )
+    for key, expected_type in REQUIRED_PROCESS_FLAGS.items():
+        if expected_type is int and flags[key] < 0:
+            raise QualificationError(
+                f"server_info.process_flags.{key} must be nonnegative"
+            )
     return flags
 
 

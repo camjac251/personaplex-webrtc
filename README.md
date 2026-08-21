@@ -14,7 +14,8 @@ PersonaPlex is a real-time, full-duplex speech-to-speech model with persona cont
 
 ## Requirements
 
-- An NVIDIA GPU with at least 24 GB VRAM for the resident model plus its baseline rewind snapshot (RTX 4090, RTX 6000 Ada, A6000, and L40S all work). Lower-memory cards require CPU offload and have substantially higher latency.
+- An NVIDIA GPU with at least 24 GB VRAM for the resident model (RTX 4090, RTX 6000 Ada, A6000, and L40S all work). Baseline and bookmark snapshots are retained in pageable host RAM; Caption-CFG and opt-in periodic GPU snapshots need additional VRAM headroom. Lower-memory cards can use CPU offload, with substantially higher latency.
+- Enough host RAM for recovery points. A measured two-row Caption-CFG snapshot is 3,162,118,280 bytes (2.945 GiB); the default 24 GiB host budget and 4 GiB free-memory floor reject captures before the process exhausts RAM.
 - A host with a **public IP and open UDP**, reachable from the browsers that will connect. WebRTC media is UDP, and the server connects peers directly (see [Networking](#networking)).
 - Linux with a recent CUDA driver, plus [`uv`](https://docs.astral.sh/uv/) and [`bun`](https://bun.sh/).
 
@@ -81,19 +82,26 @@ If you deploy behind NAT and need STUN to discover a server-reflexive candidate,
 | `PERSONAPLEX_HF_REPO` | Custom model repository override (optional) |
 | `PERSONAPLEX_HF_REVISION` | Override the pinned model revision (optional; required with a custom repo) |
 | `PERSONAPLEX_PERIODIC_SNAPSHOTS` | `0` by default; set `1` to enable 60 s snapshot refreshes for long-session auto-rewind |
+| `PERSONAPLEX_CAPTION_CFG` | `0` by default; set `1` for two-row caption guidance (roughly doubles temporal-LM compute) |
+| `PERSONAPLEX_KV_SINK_FRAMES` | `0` by default; the production profile uses `8` startup-time anchor frames |
+| `PERSONAPLEX_SNAPSHOT_GPU_BUDGET_GIB` | GPU snapshot budget, `6` by default |
+| `PERSONAPLEX_SNAPSHOT_GPU_FREE_FLOOR_GIB` | VRAM preserved across a GPU snapshot capture, `2` by default |
+| `PERSONAPLEX_SNAPSHOT_HOST_BUDGET_GIB` | CPU snapshot budget, `24` by default |
+| `PERSONAPLEX_SNAPSHOT_HOST_FREE_FLOOR_GIB` | Available host RAM preserved across capture, `4` by default |
+| `PERSONAPLEX_DEPFORMER_EARLY_EXIT` | Experimental codebook shortcut, `0` (off) by default; do not deploy without quality qualification |
 | `PERSONAPLEX_VOICE_PICKER` | `0` by default; set `1` with the `voice-selection` extra to enable CPU-only representative-window selection |
 | `SERVER_BUILD` | Optional immutable deployment identity: a full 40-64 character commit digest or `sha256:<64 hex>`; invalid labels report as `unknown` |
 | `WEBRTC_STUN_URLS` | Optional comma-separated STUN URLs for NAT'd hosts; empty means fully direct |
 
 The launcher defaults to the pinned Seamless RL checkpoint. Set `PERSONAPLEX_MODEL=base` to roll back to the pinned NVIDIA base checkpoint. Both aliases select a matching immutable revision automatically, so restarting an unchanged environment cannot silently pick up different assets. A custom `PERSONAPLEX_HF_REPO` must be paired with `PERSONAPLEX_HF_REVISION`.
 
-Periodic full-state snapshots are off by default: each fresh session keeps one baseline snapshot for manual Rewind, and explicit bookmarks capture on demand. Set `PERSONAPLEX_PERIODIC_SNAPSHOTS=1` to refresh a snapshot every 60 s, which keeps manual Rewind recent and powers long-session auto-rewind (each capture is a ~1.6 GB in-VRAM copy, usually inside one 80 ms frame on a modern GPU).
+Periodic full-state snapshots are off by default. Each fresh session keeps one CPU-resident baseline for manual Rewind, and confirmed bookmarks are CPU-resident as well. Captures are admitted against measured tensor bytes, a retained-byte budget, and a free-memory floor; rejection is nonfatal and never replaces an existing recovery point. The measured two-row Caption-CFG state is 2.945 GiB and took about 416 ms to capture on an RTX 6000 Ada, so bookmark storage is server-authoritative and the dashboard waits for a `stored` receipt. Set `PERSONAPLEX_PERIODIC_SNAPSHOTS=1` to keep one recent GPU-resident recovery point for long-session auto-rewind; periodic capture remains opt-in because its latency needs live qualification.
 
 ## Profiles and diagnostics
 
 The dashboard includes checkpoint-aware **Balanced**, **Concise**, and **Expressive** profiles. Expressive uses the tested VARF4 voice and selects Native duplex only for the aligned checkpoint; Base and unknown checkpoints use Assisted overlap handling. Raw sampling controls remain available under Advanced.
 
-The diagnostics rail reports model/build identity, RTF, WebRTC jitter/loss, input queue pressure, discarded buffered audio, reconnects, confirmed interrupts, and auto-recoveries. **Export bug report** downloads a bounded JSON trace with the applied seed, numeric configuration, prompt hashes, timing, and structured events. It deliberately excludes transcript text, prompt text, audio, images, SDP/ICE addresses, session/device IDs, URLs, and credentials.
+The diagnostics rail reports model/build identity, RTF, WebRTC jitter/loss, input queue pressure, discarded buffered audio, reconnects, confirmed interrupts, and auto-recoveries. Runtime summaries also expose bounded numeric snapshot capture time, bytes, failures, admission rejections, and CPU/GPU residency inventory. **Export bug report** downloads a bounded JSON trace with the applied seed, numeric configuration, prompt hashes, timing, and structured events. It deliberately excludes transcript text, prompt text, audio, images, SDP/ICE addresses, session/device IDs, URLs, and credentials.
 
 To inspect connectivity while a session is live, open `chrome://webrtc-internals` in another tab. The active pair under `selectedCandidatePairId` should show a `host` candidate over UDP pointing at the server's public address.
 

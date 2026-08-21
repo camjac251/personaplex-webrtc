@@ -45,7 +45,7 @@ MIMI_NAME = 'tokenizer-e351c8d8-checkpoint125.safetensors'
 DEFAULT_REPO = 'kyutai/personaplex-rl-seamless'
 DEFAULT_REVISION = '3fa800309a4b743a8a6d764253eb45def0334afc'
 BASE_REPO = 'nvidia/personaplex-7b-v1'
-BASE_REVISION = 'fdaf4090a61cb315c138a1faee287ffd6c716309f'
+BASE_REVISION = 'fdaf4090a61cb315c138a1faee287ffd6c716309'
 
 
 def resolve_model_selection(
@@ -160,6 +160,66 @@ _lm_kwargs = {
 
 def _is_safetensors(path: Path | str) -> bool:
     return Path(path).suffix in (".safetensors", ".sft", ".sfts")
+
+
+def _load_state_dict_complete(
+    model: torch.nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    *,
+    device: torch.device | None = None,
+    dtype: torch.dtype | None = None,
+) -> None:
+    """Validate a checkpoint completely before assigning any parameter.
+
+    Meta initialization makes a permissive load especially dangerous: a
+    missing key has no valid backing storage. Reject missing, unexpected, and
+    shape-incompatible tensors before ``load_state_dict`` can mutate the
+    module; compatibility expansion belongs before this boundary.
+    """
+
+    expected = model.state_dict()
+    expected_keys = set(expected)
+    actual_keys = set(state_dict)
+    missing = sorted(expected_keys - actual_keys)
+    unexpected = sorted(actual_keys - expected_keys)
+    non_tensor = sorted(
+        name
+        for name in actual_keys
+        if not isinstance(state_dict[name], torch.Tensor)
+    )
+    if non_tensor:
+        raise TypeError(
+            "checkpoint values must be tensors: " + ", ".join(non_tensor)
+        )
+    mismatched = sorted(
+        name
+        for name in expected_keys & actual_keys
+        if tuple(expected[name].shape) != tuple(state_dict[name].shape)
+    )
+    problems: list[str] = []
+    if missing:
+        problems.append(f"missing keys: {', '.join(missing)}")
+    if unexpected:
+        problems.append(f"unexpected keys: {', '.join(unexpected)}")
+    if mismatched:
+        details = ", ".join(
+            f"{name} expected {tuple(expected[name].shape)} got "
+            f"{tuple(state_dict[name].shape)}"
+            for name in mismatched
+        )
+        problems.append(f"shape mismatches: {details}")
+    if problems:
+        raise RuntimeError("incompatible checkpoint; " + "; ".join(problems))
+
+    for name, tensor in state_dict.items():
+        target_dtype = (
+            dtype if dtype is not None and tensor.is_floating_point() else tensor.dtype
+        )
+        state_dict[name] = tensor.to(
+            device=device if device is not None else tensor.device,
+            dtype=target_dtype,
+        )
+    model.load_state_dict(state_dict, strict=True, assign=True)
 
 
 def get_mimi(filename: str | Path,
@@ -290,28 +350,8 @@ def get_moshi_lm(
             if not replaced:
                 logger.debug(f"Missing weight in checkpoint: {name}")
 
-    # Assign weights to target device
     dev = torch.device(device) if isinstance(device, str) else device
-    for key in state_dict:
-        state_dict[key] = state_dict[key].to(device=dev, dtype=dtype)
-    
-    model.load_state_dict(state_dict, strict=False, assign=True)
-    
-    # Handle any remaining meta tensors (weights not in state_dict)
-    # These need to be materialized on the target device
-    def materialize_meta_tensors(module, target_device, target_dtype):
-        for name, param in list(module.named_parameters(recurse=False)):
-            if param.device.type == "meta":
-                # Create a new parameter with zeros on the target device
-                new_param = torch.nn.Parameter(
-                    torch.zeros(param.shape, device=target_device, dtype=target_dtype)
-                )
-                setattr(module, name, new_param)
-                logger.warning(f"Initialized missing weight '{name}' with zeros")
-        for child in module.children():
-            materialize_meta_tensors(child, target_device, target_dtype)
-    
-    materialize_meta_tensors(model, dev, dtype)
+    _load_state_dict_complete(model, state_dict, device=dev, dtype=dtype)
     model.eval()
     return model
 
@@ -384,7 +424,7 @@ def _get_moshi_lm_with_offload(
             if not replaced:
                 logger.warning(f"Missing {name}")
 
-    model.load_state_dict(state_dict, strict=False, assign=True)
+    _load_state_dict_complete(model, state_dict, dtype=dtype)
 
     # Determine target device
     dev = torch.device(device) if isinstance(device, str) else device
@@ -413,8 +453,11 @@ def _get_moshi_lm_with_offload(
     model = dispatch_model(
         model,
         device_map=device_map,
+        main_device=dev,
         offload_dir="offload_weights",  # Directory for disk offload if needed
     )
+    model._cpu_offload_enabled = True
+    model._execution_device_override = dev
 
     model.eval()
     return model

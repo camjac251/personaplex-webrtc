@@ -160,6 +160,46 @@ def test_outputless_frame_does_not_fabricate_enqueue_timing() -> None:
     assert summary["lifecycle"]["server_pipeline_ms"]["count"] == 0
 
 
+def test_snapshot_accounting_is_bounded_numeric_and_resettable() -> None:
+    metrics = RuntimeMetrics()
+    metrics.record_snapshot_capture(
+        tensor_count=153,
+        tensor_bytes=3_162_118_280,
+        total_ms=416.0,
+        clone_ms=47.0,
+        sync_ms=369.0,
+        residency_code=1,
+        free_before_bytes=50_000_000_000,
+        free_after_bytes=46_837_881_720,
+    )
+    metrics.set_snapshot_inventory(
+        cpu_count=2,
+        cpu_bytes=6_324_236_560,
+        gpu_count=0,
+        gpu_bytes=0,
+    )
+    metrics.note_snapshot_failure(reason_code=2, admission_rejected=True)
+
+    summary = metrics.snapshot()
+    accounting = summary["snapshot_accounting"]
+    assert summary["availability"]["snapshot_accounting_available"] == 1
+    assert summary["availability"]["snapshot_accounting_reason_code"] == 0
+    assert accounting["capture_count"] == 1
+    assert accounting["failure_count"] == 1
+    assert accounting["admission_rejection_count"] == 1
+    assert accounting["last_tensor_bytes"] == 3_162_118_280
+    assert accounting["cpu_resident_count"] == 2
+    assert accounting["cpu_resident_bytes"] == 6_324_236_560
+    assert accounting["last_failure_reason_code"] == 2
+    assert numeric_summary_tree(summary)
+
+    metrics.reset()
+    reset = metrics.snapshot()
+    assert reset["snapshot_accounting"]["capture_count"] == 0
+    assert reset["snapshot_accounting"]["cpu_resident_count"] == 0
+    assert reset["availability"]["snapshot_accounting_available"] == 0
+
+
 if __name__ == "__main__":
     tests = [
         test_fixed_histogram_percentile_error_at_exact_bin_boundaries,
@@ -168,6 +208,7 @@ if __name__ == "__main__":
         test_reset_separates_logical_sessions_and_counters,
         test_nonmonotonic_lifecycle_is_invalid_not_completed,
         test_outputless_frame_does_not_fabricate_enqueue_timing,
+        test_snapshot_accounting_is_bounded_numeric_and_resettable,
     ]
     for test in tests:
         print(f"{test.__name__} ...")

@@ -468,6 +468,7 @@ function App() {
   // Labelled snapshot bookmarks for jump-back, newest first: {id, label, atSec}.
   // Session-scoped runtime state (not persisted); reset when a session starts.
   const [bookmarks, setBookmarks] = useState([]);
+  const [bookmarkPending, setBookmarkPending] = useState(false);
   const [contextNoteDraft, setContextNoteDraft] = useState("");
   const [latencyMs, setLatencyMs] = useState(0);
   const [tailLatencyMs, setTailLatencyMs] = useState(0);
@@ -2236,6 +2237,10 @@ function App() {
         resumingRef.current = false;
         const resumed = wasResuming && message.resumed === true;
         setPhase("live");
+        // A transport loss can drop the terminal bookmark event after the
+        // server accepted the request. Never carry a permanently disabled
+        // Bookmark button into the replacement peer connection.
+        setBookmarkPending(false);
         setStageMessage(resumed ? "Live" : "Connected");
         setConnectionIssue(null);
         setServerInfo((info) => mergeServerInfo(info, message));
@@ -2652,6 +2657,31 @@ function App() {
         });
       } else if (message.type === "event") {
         const text = message.text || message.kind || "Server event";
+        if (message.kind === "bookmark") {
+          const data = message.data || {};
+          const status = String(data.status || "");
+          if (status === "pending") {
+            setBookmarkPending(true);
+          } else if (status === "stored") {
+            setBookmarkPending(false);
+            const id = typeof data.id === "string" ? data.id : "";
+            if (id) {
+              const stored = {
+                id,
+                label: typeof data.label === "string" ? data.label : "Mark",
+                atSec: Number.isFinite(Number(data.at_sec)) ? Number(data.at_sec) : 0,
+              };
+              setBookmarks((previous) => [
+                stored,
+                ...previous.filter(
+                  (bookmark) => bookmark.id !== id && bookmark.id !== data.evicted_id,
+                ),
+              ].slice(0, 6));
+            }
+          } else if (status === "rejected") {
+            setBookmarkPending(false);
+          }
+        }
         if (message.kind === "auto_rewind") {
           setRuntimeCounters((counters) => ({
             ...counters,
@@ -3072,6 +3102,7 @@ function App() {
     setVisionFramesGated(0);
     setVisionBudgetTripped(false);
     setBookmarks([]);
+    setBookmarkPending(false);
     setElapsedSec(0);
     sessionStartedAtRef.current = performance.now();
     addNotice("info", "Requesting microphone access");
@@ -3195,6 +3226,7 @@ function App() {
     setRecordingUrl(null);
     setServerRecording(null);
     setBookmarks([]);
+    setBookmarkPending(false);
     setElapsedSec(0);
     setPhase("idle");
     setStageMessage("Standby");
@@ -3562,7 +3594,7 @@ function App() {
   };
 
   const addBookmark = () => {
-    if (phase !== "live") return;
+    if (phase !== "live" || bookmarkPending) return;
     const now = performance.now();
     if (now - lastBookmarkClickRef.current < 1000) return;
     lastBookmarkClickRef.current = now;
@@ -3570,10 +3602,9 @@ function App() {
     const id = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const label = `Mark ${bookmarks.length + 1}`;
     const atSec = elapsedSec;
-    setBookmarks((prev) => [{ id, label, atSec }, ...prev].slice(0, 6));
+    setBookmarkPending(true);
     controlRef.current.send(JSON.stringify({ type: "bookmark", id, label, at_sec: atSec }));
-    addNotice("ok", `Bookmarked snapshot at ${formatOffset(atSec * 1000)}`, "rewind");
-    toast("Snapshot bookmarked");
+    addNotice("info", `Bookmark requested at ${formatOffset(atSec * 1000)}`, "rewind");
   };
 
   const jumpBookmark = (bm) => {
@@ -3583,8 +3614,7 @@ function App() {
     lastRewindClickRef.current = now;
     if (controlRef.current?.readyState !== "open") return;
     controlRef.current.send(JSON.stringify({ type: "rewind", id: bm.id }));
-    addNotice("warn", `Restored snapshot · ${bm.label}`, "rewind");
-    toast(`Jumped to ${bm.label}`);
+    addNotice("info", `Restore requested · ${bm.label}`, "rewind");
   };
 
   const submitContextNote = () => {
@@ -5920,7 +5950,7 @@ function App() {
                   )}
                   <button className="btn ghost" type="button" onClick={rewind}>{Icon.rewind} Rewind</button>
                   <button className="btn ghost" type="button" onClick={voiceReset} title="Restore the session-start voice anchor to cure voice drift">{Icon.skipStart} Voice reset</button>
-                  <button className="btn ghost" type="button" onClick={addBookmark} title="Bookmark the current snapshot to jump back to it">{Icon.bookmark} Bookmark</button>
+                  <button className="btn ghost" type="button" disabled={!isLive || bookmarkPending} onClick={addBookmark} title="Bookmark the current snapshot to jump back to it">{Icon.bookmark} {bookmarkPending ? "Saving…" : "Bookmark"}</button>
                   <button className="btn danger" type="button" onClick={() => interruptResponse("manual")}>{Icon.stop} Stop response</button>
                 </>
               )}

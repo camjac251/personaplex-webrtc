@@ -45,6 +45,39 @@ from .rope import RotaryEmbedding
 from .streaming import StreamingModule, StreamingContainer
 
 
+def _execution_device(module: nn.Module, parameter: torch.Tensor) -> torch.device:
+    """Resolve where an Accelerate-dispatched module actually executes.
+
+    CPU/disk offload replaces some parameters with ``meta`` tensors between
+    forwards. Accelerate keeps the real target on an ``AlignDevicesHook``;
+    ``SequentialHook`` nests those hooks in ``hooks``. Streaming state must
+    live on that execution device, not beside the dormant meta parameter.
+    """
+
+    parameter_device = parameter.device
+    if parameter_device.type != "meta":
+        return parameter_device
+
+    pending = [getattr(module, "_hf_hook", None)]
+    seen: set[int] = set()
+    while pending:
+        hook = pending.pop(0)
+        if hook is None or id(hook) in seen:
+            continue
+        seen.add(id(hook))
+        execution_device = getattr(hook, "execution_device", None)
+        if execution_device is not None:
+            resolved = torch.device(execution_device)
+            if resolved.type != "meta":
+                return resolved
+        pending.extend(getattr(hook, "hooks", ()) or ())
+
+    raise RuntimeError(
+        "streaming state cannot be initialized for a meta parameter without "
+        "an Accelerate execution device"
+    )
+
+
 class LayerNormF32(nn.LayerNorm):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         x_f32 = input.float()
@@ -311,7 +344,7 @@ class RingKVCache:
             end_rolling = self.sink + (self.end_offset - self.sink) % ring
             delta = indexes - end_rolling
             rolling_positions = torch.where(
-                delta <= 0,
+                delta < 0,
                 self.end_offset + delta,
                 self.end_offset + delta - ring,
             )
@@ -330,7 +363,7 @@ class RingKVCache:
             # position(index + 1) = S + 1 + 0 - self.capacity.
 
             positions = torch.where(
-                delta <= 0,
+                delta < 0,
                 self.end_offset + delta,
                 self.end_offset + delta - self.capacity,
             )
@@ -422,7 +455,7 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
                 )
         else:
             capacity = self.context
-        device = self.in_proj_weight.device
+        device = _execution_device(self, self.in_proj_weight)
         # TODO: the following estimation will not work great with FSDP.
         dtype = self.in_proj_weight.dtype
         dim_per_head = self.embed_dim // self.num_heads
@@ -754,7 +787,7 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
             )
 
     def _init_streaming_state(self, batch_size: int) -> _TransformerState:
-        device = next(self.parameters()).device
+        device = _execution_device(self, next(self.parameters()))
         return _TransformerState(offset=torch.zeros(1, device=device, dtype=torch.long))
 
     def forward(self, x: torch.Tensor, *args, **kwargs):
