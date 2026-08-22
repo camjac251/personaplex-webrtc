@@ -403,7 +403,7 @@ const TUNING_DEVIATION_FIELDS = [
   ["text_min_p", "text min-p", "textMinP"],
   ["audio_temperature", "audio temp", "audioTemp"],
   ["audio_topk", "audio top-k", "audioTopk"],
-  ["semantic_temp_cap", "semantic cap", "semanticTempCap"],
+  ["semantic_temp_cap", "semantic temp", "semanticTempCap"],
   ["caption_cfg_gamma", "caption guidance", "captionCfgGamma"],
   ["repetition_penalty", "rep penalty", "repPenalty"],
   ["repetition_penalty_context", "rep context", "repContext"],
@@ -6009,7 +6009,7 @@ function App() {
                   <RailColumn title="AUDIO" aggregate={`t ${fmt(audioTemp, 2)} · k ${audioTopk}`}>
                     <MiniSlider label="Temperature" info="audTemp" value={audioTemp} onChange={(value) => { setAudioTemp(value); setSessionProfileId("custom"); }} onCommit={guardedTuningCommit("audioTemp", setAudioTemp, (v) => ({ audio_temperature: Number(v) }))} min={tuningRanges.audioTemp.min} max={tuningRanges.audioTemp.max} step={tuningRanges.audioTemp.step} format={(v) => fmt(v, 2)} />
                     <MiniSlider label="Top-k" info="audTopK" value={audioTopk} onChange={(value) => { setAudioTopk(value); setSessionProfileId("custom"); }} onCommit={guardedTuningCommit("audioTopk", setAudioTopk, (v) => ({ audio_topk: Number.parseInt(v, 10) }))} min={tuningRanges.audioTopk.min} max={tuningRanges.audioTopk.max} step={tuningRanges.audioTopk.step} format={(v) => fmt(v, 0)} />
-                    <MiniSlider label="Semantic cap" info="semCap" value={semanticTempCap} onChange={(value) => { setSemanticTempCap(value); setSessionProfileId("custom"); }} onCommit={guardedTuningCommit("semanticTempCap", setSemanticTempCap, (v) => ({ semantic_temp_cap: Number(v) }))} min={tuningRanges.semanticTempCap.min} max={tuningRanges.semanticTempCap.max} step={tuningRanges.semanticTempCap.step} format={(v) => fmt(v, 2)} />
+                    <MiniSlider label="Semantic temp" info="semCap" value={semanticTempCap} onChange={(value) => { setSemanticTempCap(value); setSessionProfileId("custom"); }} onCommit={guardedTuningCommit("semanticTempCap", setSemanticTempCap, (v) => ({ semantic_temp_cap: Number(v) }))} min={tuningRanges.semanticTempCap.min} max={tuningRanges.semanticTempCap.max} step={tuningRanges.semanticTempCap.step} format={(v) => fmt(v, 2)} />
                   </RailColumn>
                   <RailColumn title="REPETITION" aggregate={`${fmt(repPenalty, 2)} · ${repContext} tok`}>
                     <MiniSlider label="Penalty" info="repPen" value={repPenalty} onChange={(value) => { setRepPenalty(value); setSessionProfileId("custom"); }} onCommit={guardedTuningCommit("repPenalty", setRepPenalty, (v) => ({ repetition_penalty: Number(v) }))} min={tuningRanges.repPenalty.min} max={tuningRanges.repPenalty.max} step={tuningRanges.repPenalty.step} format={(v) => fmt(v, 2)} />

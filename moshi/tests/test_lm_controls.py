@@ -59,10 +59,10 @@ def test_temperature_updates_graph_input_without_reset() -> None:
     assert graph.resets == []
 
 
-def test_semantic_codebook_temperature_is_capped() -> None:
+def test_semantic_codebook_temperature_is_independent() -> None:
     lm_gen, _ = _bare_lm_gen()
 
-    # Hot acoustic settings leave the semantic level at the cap.
+    # Hot acoustic settings leave the semantic level at its own value.
     lm_gen.set_audio_sampling(1.2, 250)
     assert torch.isclose(
         lm_gen._audio_temperature[0],
@@ -72,11 +72,30 @@ def test_semantic_codebook_temperature_is_capped() -> None:
         lm_gen._audio_temperature[1:], torch.full((7,), 1.2)
     )
 
-    # At or below the cap every level matches the request exactly.
+    # Cool acoustic settings do not drag the semantic level down with them.
     lm_gen.set_audio_sampling(0.6, 250)
-    assert torch.allclose(
-        lm_gen._audio_temperature, torch.full((8,), 0.6)
+    assert torch.isclose(
+        lm_gen._audio_temperature[0],
+        torch.tensor(DEFAULT_SEMANTIC_TEMPERATURE_CAP),
     )
+    assert torch.allclose(
+        lm_gen._audio_temperature[1:], torch.full((7,), 0.6)
+    )
+
+    # The semantic level may run hotter than the acoustic levels; the value
+    # is applied on the next sampling write, which is how the live path
+    # sequences the two assignments.
+    lm_gen.semantic_temperature_cap = 0.9
+    lm_gen.set_audio_sampling(0.8, 250)
+    assert torch.isclose(lm_gen._audio_temperature[0], torch.tensor(0.9))
+    assert torch.allclose(
+        lm_gen._audio_temperature[1:], torch.full((7,), 0.8)
+    )
+
+    # The floor still protects the CUDA-graph division.
+    lm_gen.semantic_temperature_cap = 0.0
+    lm_gen.set_audio_sampling(0.8, 250)
+    assert lm_gen._audio_temperature[0].item() > 0.0
 
 
 def test_min_p_masks_low_probability_text_tokens() -> None:
@@ -583,7 +602,7 @@ def test_depformer_early_exit_preserves_sampling_rng_progression() -> None:
 if __name__ == "__main__":
     tests = [
         test_temperature_updates_graph_input_without_reset,
-        test_semantic_codebook_temperature_is_capped,
+        test_semantic_codebook_temperature_is_independent,
         test_min_p_masks_low_probability_text_tokens,
         test_top_k_updates_graph_input_without_reset,
         test_dynamic_top_k_masks_candidates_without_graph_shape_changes,

@@ -9,7 +9,7 @@ export const PERSONA_PRESETS = [
     id: "assistant",
     label: "Companion",
     prompt:
-      "You enjoy talking with people. Speak as yourself: warm, perceptive, relaxed, and honest. Listen closely, say what you mean plainly, and keep turns short unless there is something worth unpacking.",
+      "You enjoy having a good conversation. Speak as yourself: warm, perceptive, relaxed, and honest. Listen closely, say what you mean plainly, and keep turns short unless there is something worth unpacking.",
   },
   {
     id: "medical",
@@ -27,7 +27,7 @@ export const PERSONA_PRESETS = [
     id: "astronaut",
     label: "Astronaut",
     prompt:
-      "You are an astronaut aboard a Mars mission. Several ship systems are failing because a reactor core is unstable. Explain what is happening and urgently ask for help thinking through how to stabilize it.",
+      "You enjoy having a good conversation. You are an astronaut aboard a Mars mission and your name is Alex. Several ship systems are failing because a reactor core is unstable. Explain what is happening and urgently ask for help thinking through how to stabilize it.",
   },
   {
     id: "detective",
@@ -140,22 +140,25 @@ export const EXPRESSION_MODES = [
     id: "natural",
     label: "Natural",
     desc: "Warm, brief, and practical.",
+    // Personality descriptors, not style directives: the released checkpoint
+    // learned its expressive range from conversation prompts written as facts
+    // about the speaker, and never saw meta-instructions about delivery.
     instruction:
-      "Expression: speak naturally with short, warm responses and avoid long monologues.",
+      "You are warm and easygoing, and you keep what you say short and practical.",
   },
   {
     id: "concise",
     label: "Concise",
     desc: "Minimal words and fast turn-taking.",
     instruction:
-      "Expression: use the fewest words that solve the user's request. Prefer one or two sentences unless detail is explicitly requested.",
+      "You are direct and economical with words, and you answer in a sentence or two unless someone asks for more.",
   },
   {
     id: "expressive",
     label: "Expressive",
-    desc: "More prosody and color when useful.",
+    desc: "Lively, laughs easily, reacts with feeling.",
     instruction:
-      "Expression: use natural vocal variety with warmer emphasis, livelier pacing, and occasional vivid phrasing. Sound conversational rather than theatrical, and leave space for the user to respond.",
+      "You are lively and animated, you laugh easily, and you react with real feeling to what you hear.",
   },
   {
     id: "none",
@@ -250,6 +253,33 @@ export const SESSION_PROFILES = [
     seedRandom: true,
   },
   {
+    id: "upstream",
+    label: "Upstream",
+    desc: "NVIDIA/Kyutai reference point: text 0.7, audio 0.8 on every level, no repetition penalty.",
+    presetId: "assistant",
+    voice: "NATF1",
+    adherenceMode: "none",
+    expressionMode: "none",
+    turnHandling: "recommended",
+    textTemp: 0.7,
+    textTopk: 25,
+    audioTemp: 0.8,
+    audioTopk: 250,
+    semanticTempCap: 0.8,
+    repPenalty: 1.0,
+    repContext: 64,
+    padBonus: 0,
+    maxTurn: 120,
+    echoCancel: false,
+    noiseSupp: false,
+    autoGain: false,
+    visionInTranscript: false,
+    visionFeedModel: false,
+    visionGroundTurns: false,
+    visionIntervalMs: 5000,
+    seedRandom: true,
+  },
+  {
     id: "live_support",
     label: "Concise",
     desc: "Short, focused answers with quick turn handoff.",
@@ -262,6 +292,7 @@ export const SESSION_PROFILES = [
     textTopk: 18,
     audioTemp: 0.65,
     audioTopk: 220,
+    semanticTempCap: 0.65,
     repPenalty: 1.1,
     repContext: 80,
     padBonus: 0,
@@ -287,10 +318,14 @@ export const SESSION_PROFILES = [
     // Keep checkpoint-specific overlap behavior separate from the sampling
     // preset instead of forcing the aligned model's Native mode onto Base.
     turnHandling: "recommended",
-    textTemp: 0.82,
-    textTopk: 40,
+    // Text temperature stays at the reference 0.7: the text stream decides
+    // turn timing, so heat there reads as talking over the user. Colour
+    // comes from the voice, the descriptor, and the audio levels.
+    textTemp: 0.7,
+    textTopk: 25,
     audioTemp: 0.9,
-    audioTopk: 320,
+    audioTopk: 250,
+    semanticTempCap: 0.8,
     repPenalty: 1.0,
     repContext: 64,
     padBonus: 0,
@@ -317,6 +352,7 @@ export const SESSION_PROFILES = [
     textTopk: 12,
     audioTemp: 0.55,
     audioTopk: 180,
+    semanticTempCap: 0.55,
     repPenalty: 1.1,
     repContext: 96,
     padBonus: 0,
@@ -421,11 +457,13 @@ export const PARAM_INFO = {
     title: "Audio temperature",
     body: (
       <>
-        Sampling temperature for the acoustic residual codebooks, which carry
-        prosody and timbre. The first, semantic codebook is limited separately
-        by <b>Semantic cap</b>, so raising this adds expressiveness without
-        destabilizing what is said. The RL checkpoint's published setting, and
-        this dashboard's default, is <b>0.8</b>.
+        Sampling temperature for the acoustic residual codebooks (levels 1-7),
+        which render timbre and the fine detail of the voice. PersonaPlex
+        trains these heads at a fraction of the weight of text and the
+        semantic level, so heat here turns into noise and drift before it
+        turns into expression; the first codebook has its own{" "}
+        <b>Semantic temp</b>. The RL checkpoint's published setting, and this
+        dashboard's default, is <b>0.8</b>.
       </>
     ),
   },
@@ -444,14 +482,16 @@ export const PARAM_INFO = {
     ),
   },
   semCap: {
-    title: "Semantic temperature cap",
+    title: "Semantic temperature",
     body: (
       <>
-        Ceiling for the first codebook, which decides <i>what</i> the audio
-        says; the other levels carry prosody and follow the audio
-        temperature directly. Default <b>0.7</b> keeps content stable while
-        hot audio settings stay expressive. Set it at or above the audio
-        temperature to restore uniform sampling.
+        Sampling temperature for the first codebook, Mimi's semantic level:
+        the audio head the model is trained hardest on, which decides how
+        each 80 ms frame is articulated. It is set independently of the audio
+        temperature, so it can run above it to trade articulation variety
+        against stability, or below it to steady content while the acoustic
+        levels stay lively. Upstream samples it at <b>0.8</b> like every other
+        level; this dashboard's default is <b>0.7</b>.
       </>
     ),
   },
@@ -614,6 +654,12 @@ export const PARAM_INFO = {
         The persona and instructions, wrapped in a <code>&lt;system&gt;</code>{" "}
         tag and sent once when the session connects. Sets who the model is and
         how it should behave. Edits apply on the next connect, not mid-session.
+        The released checkpoint learned its expressive range from real
+        conversations whose prompts open with{" "}
+        <i>You enjoy having a good conversation.</i> and continue with facts
+        about the speaker and the situation; write personas that way (who you
+        are, what is happening, what you feel) rather than asking for a
+        speaking style.
       </>
     ),
   },
@@ -653,10 +699,14 @@ export const PARAM_INFO = {
     title: "Prompted speaking style",
     body: (
       <>
-        A style instruction added to the system prompt; it does not change the
-        selected voice or audio sampler by itself. <b>Natural</b> (the
-        default) is warm and brief, <b>Concise</b> uses the fewest words with
-        fast turn-taking, <b>Expressive</b> adds more prosody and color.
+        A short personality descriptor appended to the system prompt, written
+        the way the model's conversation training prompts were (facts about
+        the speaker, never instructions about delivery); it does not change
+        the selected voice or audio sampler by itself. <b>Natural</b> (the
+        default) is warm and brief, <b>Concise</b> is direct and economical,
+        <b>Expressive</b> is lively, laughs easily, and reacts with feeling.
+        The voice prompt and the persona's situation carry most of the
+        expressive range; this only nudges it.
       </>
     ),
   },

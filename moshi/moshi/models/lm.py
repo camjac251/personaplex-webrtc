@@ -71,10 +71,11 @@ SILENCE_TOKENS = np.array([948, 243, 1178, 546, 1736, 1030, 1978, 2008], dtype=n
 # this floor the softmax collapses to a one-hot at the argmax, so temperature
 # 0 still means greedy decoding instead of NaN probabilities.
 MIN_AUDIO_TEMPERATURE = 1e-6
-# Ceiling for the first depformer level's sampling temperature. Level 0 is
-# Mimi's semantic codebook and decides WHAT the audio says; sampling it as
-# hot as the acoustic residuals destabilizes content and reads as crackle,
-# while the residual levels tolerate heat for prosody and timbre.
+# Sampling temperature for the first depformer level, Mimi's semantic
+# (WavLM-distilled) codebook, set independently of the acoustic residual
+# levels. Upstream samples every level at 0.8; this default keeps level 0 a
+# step cooler. The name is historical (it used to be a ceiling applied on top
+# of the acoustic temperature) and is kept for wire and env compatibility.
 DEFAULT_SEMANTIC_TEMPERATURE_CAP = 0.7
 SINE_TOKENS    = np.array([430, 1268, 381, 1611, 1095, 1495, 56, 472], dtype=np.int64)
 
@@ -898,8 +899,8 @@ class LMGen(StreamingModule[_LMGenState]):
         # Tensor inputs to the CUDA-graphed depformer so live sampling updates
         # change replayed computation without replacing a working graph. The
         # temperature is one value per depformer level: level 0 (the semantic
-        # codebook) is capped by semantic_temperature_cap, the acoustic
-        # residual levels use the requested temperature directly.
+        # codebook) takes semantic_temperature_cap directly, the acoustic
+        # residual levels take the requested acoustic temperature.
         self._audio_temperature = torch.empty(
             lm_model.dep_q,
             dtype=torch.float32,
@@ -1673,14 +1674,13 @@ class LMGen(StreamingModule[_LMGenState]):
     def _write_audio_temperature(self, temperature: float) -> None:
         """Fill the per-level temperature vector for one acoustic setting.
 
-        The semantic level (0) never exceeds semantic_temperature_cap; when
-        the requested temperature sits at or below the cap, every level
-        matches it exactly.
+        Levels 1..dep_q-1 take the acoustic temperature; level 0 (the
+        semantic codebook) takes semantic_temperature_cap as its own
+        temperature, so it can sit above or below the acoustic levels.
         """
         acoustic = max(float(temperature), MIN_AUDIO_TEMPERATURE)
         semantic = max(
-            min(acoustic, self.semantic_temperature_cap),
-            MIN_AUDIO_TEMPERATURE,
+            float(self.semantic_temperature_cap), MIN_AUDIO_TEMPERATURE
         )
         self._audio_temperature.fill_(acoustic)
         self._audio_temperature[0] = semantic

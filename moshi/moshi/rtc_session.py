@@ -859,7 +859,8 @@ class SessionConfig:
     # Adaptive text truncation relative to the step's best candidate; 0
     # (default) disables it and leaves top-k as the sole truncation.
     text_min_p: float = 0.0
-    # Ceiling for the semantic codebook's sampling temperature. Keep the
+    # Sampling temperature for the semantic codebook (depformer level 0),
+    # independent of audio_temperature; the key name is historical. Keep the
     # default in lockstep with models.lm.DEFAULT_SEMANTIC_TEMPERATURE_CAP
     # (not imported here so this transport module stays torch-free).
     semantic_temp_cap: float = 0.7
