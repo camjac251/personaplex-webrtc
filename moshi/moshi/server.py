@@ -3503,7 +3503,7 @@ class ServerState:
             "stop latch released by %.0f s hold ceiling",
             STOP_LATCH_MAX_HOLD_SEC,
         )
-        self._release_stop_response_latch_locked()
+        self._release_stop_response_latch_locked("hold_ceiling", now=now)
         return True
 
     def _update_stop_latch_user_turn_activity(self, chunk_rms: float) -> bool:
@@ -5839,6 +5839,8 @@ class ServerState:
             self._collapse_triggers.clear()
             self._schedule_auto_rewind(rewind_snapshot, trigger_count)
         else:
+            trigger_count = len(self._collapse_triggers)
+            snapshot_age: Optional[float] = None
             if snapshots:
                 snapshot_age = max(0.0, now - snapshots[-1][0])
                 logger.warning(
@@ -5847,10 +5849,48 @@ class ServerState:
                     snapshot_age,
                     AUTO_REWIND_SNAPSHOT_MAX_AGE_SEC,
                 )
+            self._schedule_collapse_event(trigger_count, snapshot_age)
             # discarding stale pre-snapshot triggers; otherwise the first
             # usable snapshot can be torched by a single new trigger that
             # pulls in pre-snapshot history
             self._collapse_triggers.clear()
+
+    def _schedule_collapse_event(
+        self, trigger_count: int, snapshot_age_sec: Optional[float]
+    ) -> None:
+        """Report a collapse detection that found no snapshot to rewind to.
+
+        Without this the detector's only trace is a server log line, so an
+        operator running with periodic snapshots off never learns that the
+        collapse threshold fired.
+        """
+        sess = getattr(self, "_active_session", None)
+        loop = getattr(self, "_main_loop", None)
+        if sess is None or loop is None:
+            return
+        reason = "stale_snapshot" if snapshot_age_sec is not None else "no_snapshot"
+        data: dict[str, object] = {
+            "triggers": int(trigger_count),
+            "window_sec": float(COLLAPSE_WINDOW_SEC),
+            "reason": reason,
+        }
+        if snapshot_age_sec is not None:
+            data["snapshot_age_sec"] = round(float(snapshot_age_sec), 1)
+        text = (
+            f"Collapse detected ({trigger_count} turn caps in "
+            f"{COLLAPSE_WINDOW_SEC:.0f} s) with no recent snapshot to rewind "
+            "to; enable periodic snapshots or lower the sampling heat"
+        )
+        try:
+            loop.call_soon_threadsafe(
+                sess.send_event, "collapse", text, "warn", data
+            )
+        except Exception as exc:
+            logger.warning(
+                "collapse event scheduling failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
 
     def _reset_turn_cap_tracking_for_config_change(self) -> None:
         """Start a new cap accounting window without cancelling an interrupt."""
@@ -5893,8 +5933,45 @@ class ServerState:
                 exc,
             )
 
-    def _release_stop_response_latch_locked(self) -> bool:
-        """Release a Stop latch after a complete new user turn."""
+    def _schedule_stop_latch_event(
+        self, reason: str, held_sec: Optional[float]
+    ) -> None:
+        """Surface a Stop-latch release from the inference worker safely."""
+        sess = getattr(self, "_active_session", None)
+        loop = getattr(self, "_main_loop", None)
+        if sess is None or loop is None:
+            return
+        if reason == "hold_ceiling":
+            text = (
+                f"Stop hold released after {STOP_LATCH_MAX_HOLD_SEC:.0f} s "
+                "without a clear user turn"
+            )
+            level = "warn"
+        else:
+            text = "Stop hold released; new user turn heard"
+            level = "ok"
+        data: dict[str, object] = {"reason": reason}
+        if held_sec is not None:
+            data["held_sec"] = round(float(held_sec), 1)
+        try:
+            loop.call_soon_threadsafe(
+                sess.send_event, "stop_latch", text, level, data
+            )
+        except Exception as exc:
+            logger.warning(
+                "stop-latch event scheduling failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+
+    def _release_stop_response_latch_locked(
+        self, reason: str = "user_turn", now: Optional[float] = None
+    ) -> bool:
+        """Release a Stop latch after a complete new user turn.
+
+        ``reason`` names the release trigger for the emitted ``stop_latch``
+        event so operators can tell a heard user turn from the hold ceiling.
+        """
         if not self._stop_response_latched:
             return False
         self._stop_response_latched = False
@@ -5904,6 +5981,13 @@ class ServerState:
         self._vision_pad_streak = 0
         self._audio_silence_streak = 0
         self._reset_stop_latch_user_turn_activity()
+        latched_at = getattr(self, "_stop_latched_at", None)
+        held_sec: Optional[float] = None
+        if isinstance(latched_at, (int, float)):
+            if now is None:
+                now = time.monotonic()
+            held_sec = max(0.0, now - float(latched_at))
+        self._schedule_stop_latch_event(reason, held_sec)
         return True
 
     def _apply_auto_recovery_tuning_locked(self) -> None:
@@ -6497,6 +6581,44 @@ class ServerState:
                 # and the live-tunable keys resync through update_config
                 # once the client is live again.
                 cfg = resume_state["cfg"]
+                offered_cfg = config_holder.get("cfg")
+                primed_chars = len(cfg.text_prompt or "")
+                offered_chars = (
+                    len(offered_cfg.text_prompt or "")
+                    if offered_cfg is not None
+                    else primed_chars
+                )
+                if (
+                    offered_cfg is not None
+                    and (offered_cfg.text_prompt or "") != (cfg.text_prompt or "")
+                ):
+                    # The prompt was edited between the original connect and
+                    # this resume. Resume cannot re-prime, so say so instead
+                    # of letting the old persona continue silently.
+                    clog.log(
+                        "warning",
+                        "resume keeps the primed text prompt "
+                        f"({primed_chars} chars); the offered prompt "
+                        f"({offered_chars} chars) is ignored until a fresh "
+                        "session",
+                    )
+                    try:
+                        session.send_event(
+                            "resume",
+                            "Resumed with the previous persona prompt; end the "
+                            "session and start again to apply prompt edits",
+                            "warn",
+                            {
+                                "primed_chars": primed_chars,
+                                "offered_chars": offered_chars,
+                            },
+                        )
+                    except Exception as exc:
+                        clog.log(
+                            "warning",
+                            "resume prompt-mismatch notify failed: "
+                            f"{type(exc).__name__}: {exc}",
+                        )
                 clog.log(
                     "info",
                     f"resume grant matched (was {resume_state['session_id']}); "
@@ -8082,6 +8204,13 @@ class ServerState:
             session.send_ready(identity)
             lifecycle_receipt["ready_sent"] = bool(session._ready_sent)
             session.send_lifecycle_receipt(**lifecycle_receipt)
+            clog.log(
+                "info",
+                "lifecycle receipt: "
+                + " ".join(
+                    f"{key}={value}" for key, value in lifecycle_receipt.items()
+                ),
+            )
             # Tell the client whether the vision pipeline is reachable so
             # it can disable the Add Vision button (or warn the user) when
             # the server has no GEMINI_API_KEY configured. A resumed

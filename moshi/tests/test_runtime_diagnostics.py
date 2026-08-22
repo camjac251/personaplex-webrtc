@@ -1041,6 +1041,68 @@ def test_three_spaced_cap_trips_at_default_schedule_auto_rewind() -> None:
     assert list(state._collapse_triggers) == []
 
 
+def test_collapse_without_snapshot_reports_instead_of_staying_silent() -> None:
+    """Three spaced trips with no usable snapshot emit one collapse event."""
+
+    class _Lm:
+        max_turn_text_tokens = 120
+
+    class _Session:
+        def __init__(self) -> None:
+            self.events: list[tuple] = []
+
+        def send_event(self, kind, text, level, data=None):
+            self.events.append((kind, text, level, data))
+
+    class _Loop:
+        def call_soon_threadsafe(self, fn, *args):
+            fn(*args)
+
+    def _state(snapshots: list) -> ServerState:
+        state = ServerState.__new__(ServerState)
+        state.lm_gen = _Lm()
+        state._collapse_triggers = deque()
+        state._schedule_turn_cap_event = lambda _frames: None
+        state._last_rewind_at = None
+        state._active_session_id = "sid"
+        state._session_snapshots = {"sid": snapshots}
+        state._active_session = _Session()
+        state._main_loop = _Loop()
+        state._schedule_auto_rewind = lambda _snap, _count: (_ for _ in ()).throw(
+            AssertionError("no rewind target should be scheduled")
+        )
+        return state
+
+    # Periodic snapshots off and the baseline aged out: stale_snapshot.
+    stale = _state([(0.0, {})])
+    for now in (200.0, 205.0):
+        stale._note_pad_force_edge(12, now=now)
+    assert stale._active_session.events == []
+    stale._note_pad_force_edge(12, now=210.0)
+    assert len(stale._active_session.events) == 1
+    kind, text, level, data = stale._active_session.events[0]
+    assert (kind, level) == ("collapse", "warn")
+    assert "3 turn caps" in text
+    assert data == {
+        "triggers": 3,
+        "window_sec": 30.0,
+        "reason": "stale_snapshot",
+        "snapshot_age_sec": 210.0,
+    }
+    assert list(stale._collapse_triggers) == []
+
+    # No snapshot at all: no_snapshot, and no age field.
+    empty = _state([])
+    for now in (100.0, 105.0, 110.0):
+        empty._note_pad_force_edge(12, now=now)
+    assert len(empty._active_session.events) == 1
+    assert empty._active_session.events[0][3] == {
+        "triggers": 3,
+        "window_sec": 30.0,
+        "reason": "no_snapshot",
+    }
+
+
 def test_turn_cap_event_reports_applied_limit() -> None:
     class _Lm:
         max_turn_text_tokens = 80
@@ -1103,6 +1165,78 @@ def test_stop_latch_releases_only_at_a_new_turn_boundary() -> None:
     assert state._stop_user_audio_attack_streak == 0
     assert state._stop_user_audio_silence_streak == 0
     assert state._release_stop_response_latch_locked() is False
+
+
+def test_stop_latch_release_reports_its_trigger() -> None:
+    """Release emits one typed stop_latch event naming the trigger."""
+
+    class _Lm:
+        _pad_force_remaining = 0
+        _non_pad_streak = 0
+
+        def reset_turn_cap_tracking(self) -> None:
+            self._pad_force_remaining = 0
+            self._non_pad_streak = 0
+
+    class _Session:
+        def __init__(self) -> None:
+            self.events: list[tuple] = []
+
+        def send_event(self, kind, text, level, data=None):
+            self.events.append((kind, text, level, data))
+
+    class _Loop:
+        def call_soon_threadsafe(self, fn, *args):
+            fn(*args)
+
+    def _latched_state() -> ServerState:
+        state = ServerState.__new__(ServerState)
+        state.lm_gen = _Lm()
+        state._stop_response_latched = True
+        state._stop_latched_at = 100.0
+        state._interrupt_gate_remaining = 0
+        state._prev_pad_force_remaining = 0
+        state._vision_pad_streak = 0
+        state._audio_silence_streak = 0
+        state._stop_user_audio_active = False
+        state._stop_user_audio_attack_streak = 0
+        state._stop_user_audio_silence_streak = 0
+        state._active_session = _Session()
+        state._main_loop = _Loop()
+        return state
+
+    heard = _latched_state()
+    assert heard._release_stop_response_latch_locked(now=102.5) is True
+    assert heard._active_session.events == [
+        (
+            "stop_latch",
+            "Stop hold released; new user turn heard",
+            "ok",
+            {"reason": "user_turn", "held_sec": 2.5},
+        )
+    ]
+    # A second call is a no-op and must not emit again.
+    assert heard._release_stop_response_latch_locked(now=103.0) is False
+    assert len(heard._active_session.events) == 1
+
+    starved = _latched_state()
+    past_ceiling = 100.0 + STOP_LATCH_MAX_HOLD_SEC + 1.0
+    assert starved._release_stop_latch_if_expired(now=past_ceiling) is True
+    kind, text, level, data = starved._active_session.events[0]
+    assert kind == "stop_latch"
+    assert level == "warn"
+    assert "without a clear user turn" in text
+    assert data == {
+        "reason": "hold_ceiling",
+        "held_sec": round(STOP_LATCH_MAX_HOLD_SEC + 1.0, 1),
+    }
+
+    # Bare states used by older tests carry no session or loop; release
+    # must stay silent there instead of raising.
+    bare = _latched_state()
+    del bare._active_session
+    del bare._main_loop
+    assert bare._release_stop_response_latch_locked() is True
 
 
 def test_auto_recovery_replaces_extreme_tuning() -> None:
@@ -1198,8 +1332,10 @@ if __name__ == "__main__":
         test_outbound_gate_fades_at_mute_boundaries,
         test_cap_trips_below_default_do_not_feed_auto_rewind,
         test_three_spaced_cap_trips_at_default_schedule_auto_rewind,
+        test_collapse_without_snapshot_reports_instead_of_staying_silent,
         test_turn_cap_event_reports_applied_limit,
         test_stop_latch_releases_only_at_a_new_turn_boundary,
+        test_stop_latch_release_reports_its_trigger,
         test_auto_recovery_replaces_extreme_tuning,
         test_clearing_resume_grant_cancels_snapshot_retaining_timer,
     ]

@@ -97,6 +97,10 @@ export const RECONNECT_GRACE_MS = 2500;
 // can still reclaim the resident model state.
 export const RECONNECT_MAX_ATTEMPTS = 3;
 export const RECONNECT_RETRY_DELAY_MS = 4000;
+// A fresh Start right after End can race the server's teardown and see a
+// 409 session-busy answer; retry a few times before surfacing it.
+export const START_BUSY_MAX_ATTEMPTS = 3;
+export const START_BUSY_RETRY_DELAY_MS = 600;
 // Receiver playoutDelayHint (seconds) when the jitter buffer is biased for
 // smoothness rather than latency.
 export const JITTER_BUFFER_SMOOTH_SEC = 0.2;
@@ -334,9 +338,12 @@ export const PARAM_INFO = {
     body: (
       <>
         <b>Native duplex</b> lets the interactivity-aligned model decide when
-        to yield, overlap, and backchannel. <b>Assisted</b> force-stops output
-        after sustained overlap and is intended as a fallback for base models
-        or difficult acoustic setups. Manual Stop always remains available.
+        to yield, overlap, and backchannel; the server applies no
+        interruption of its own, so a remote echo of the model's voice or a
+        hot sampling configuration shows up as floor-holding rather than as
+        a turn-detection fault. <b>Assisted</b> force-stops output after
+        sustained overlap and is intended as a fallback for base models or
+        difficult acoustic setups. Manual Stop always remains available.
       </>
     ),
   },
@@ -573,8 +580,11 @@ export const PARAM_INFO = {
     title: "Random seed",
     body: (
       <>
-        Use random for normal sessions. Lock a seed when comparing sampling
-        changes against the same prompt and voice.
+        Use random for normal sessions. The seed the server actually drew
+        shows here and in the Session panel once the session starts; Reuse
+        locks it for the next session so a good or bad run can be replayed.
+        Lock a seed when comparing sampling changes against the same prompt
+        and voice.
       </>
     ),
   },

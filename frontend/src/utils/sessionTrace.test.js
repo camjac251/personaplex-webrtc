@@ -418,3 +418,38 @@ describe("session trace bounds and exports", () => {
     expect(prepared.blob.size).toBeLessThanOrEqual(maxBytes);
   });
 });
+
+describe("session trace collapse observability", () => {
+  test("summary keeps the turn-cap and text-starved counters and drops content", () => {
+    const trace = createSessionTrace({
+      clock: deterministicClock(),
+      wallClock: () => "2026-08-21T00:00:00.000Z",
+    });
+    trace.setSummary({
+      turn_caps: 3,
+      text_starved_episodes: 2,
+      transcript: SECRET.transcript,
+    });
+    const report = trace.toReport();
+    expect(report.summary.turn_caps).toBe(3);
+    expect(report.summary.text_starved_episodes).toBe(2);
+    expect(JSON.stringify(report)).not.toContain(SECRET.transcript);
+  });
+
+  test("stop-latch release events carry only the typed reason and duration", () => {
+    const trace = createSessionTrace({
+      clock: deterministicClock(),
+      wallClock: () => "2026-08-21T00:00:00.000Z",
+    });
+    trace.record("server.event.stop_latch", {
+      reason: "hold_ceiling",
+      held_sec: 12.4,
+      text: SECRET.transcript,
+    });
+    const report = trace.toReport();
+    const event = report.events.find((item) => item.kind === "server.event.stop_latch");
+    expect(event).toBeDefined();
+    expect(event.data.held_sec).toBe(12.4);
+    expect(JSON.stringify(report)).not.toContain(SECRET.transcript);
+  });
+});

@@ -171,6 +171,33 @@
   }
   .seed-row input { padding: 6px 9px; font-size: 11.5px; }
   .seed-row .btn { padding: 0 10px; font-size: 11px; }
+  /* Seed the server drew for the current session */
+  .seed-applied {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 6px;
+    min-width: 0;
+    font-family: 'Geist Mono', monospace;
+    font-size: 9.5px;
+    letter-spacing: 0.04em;
+  }
+  .seed-applied .k {
+    flex: none;
+    font-size: 9px;
+    color: var(--ink-4);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .seed-applied .v {
+    flex: 1;
+    min-width: 0;
+    color: var(--ink-2);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .seed-applied .btn { padding: 0 8px; font-size: 10px; }
 
   /* Label-and-stepper option row (session limit) */
   .opt-row {

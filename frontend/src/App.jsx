@@ -21,6 +21,8 @@ import {
   RECONNECT_MAX_ATTEMPTS,
   RECONNECT_RETRY_DELAY_MS,
   SESSION_PROFILES,
+  START_BUSY_MAX_ATTEMPTS,
+  START_BUSY_RETRY_DELAY_MS,
   VISION_FRAME_CHUNK_CHARS,
   VISION_FRAME_MAX_CHARS,
   VISION_FRAME_TARGET_CHARS,
@@ -504,7 +506,14 @@ function App() {
     recoveries: 0,
     reconnects: 0,
     interrupts: 0,
+    turnCaps: 0,
   });
+  // Typed startup receipt for the current transport leg: proves whether the
+  // voice and text prompt were actually primed, or the leg resumed.
+  const [lifecycleReceipt, setLifecycleReceipt] = useState(null);
+  // Shadow counters from the stat envelope; text-starved output (PAD text
+  // over non-silent audio) is the voice-collapse signature.
+  const [starvation, setStarvation] = useState({ frames: 0, episodes: 0 });
   const [assistantRate, setAssistantRate] = useState({ words: 0, seconds: 0, wpm: 0 });
   const [recordingUrl, setRecordingUrl] = useState(null);
   const [recordingMime, setRecordingMime] = useState("audio/webm");
@@ -1454,6 +1463,16 @@ function App() {
   const appliedConfig = serverAppliedConfig?.config && typeof serverAppliedConfig.config === "object"
     ? serverAppliedConfig.config
     : null;
+  // The seed the server actually drew for this session. With the random
+  // toggle on, the local `seed` value is not what ran, so this is the only
+  // way to spot a pattern between seeds and good or bad sessions.
+  const appliedSeed = Number.isFinite(Number(appliedConfig?.seed)) ? Number(appliedConfig.seed) : null;
+  const appliedSeedMode = sentConfigRef.current?.seed === -1 ? "random" : "locked";
+  const primingSummary = lifecycleReceipt
+    ? lifecycleReceipt.resumed
+      ? "resumed · previous prompt kept, no re-prime"
+      : `voice ${lifecycleReceipt.voicePromptFrames} frames · prompt ${lifecycleReceipt.textPromptTokens} tok · ${lifecycleReceipt.primed ? "complete" : "incomplete"}`
+    : null;
   const appliedSystemPrompt = typeof appliedConfig?.system_prompt === "string"
     ? appliedConfig.system_prompt
     : "";
@@ -2212,6 +2231,7 @@ function App() {
       if (!keepPhase) {
         setPhase(showDownload ? "ended" : "idle");
         setServerAppliedConfig(null);
+        setLifecycleReceipt(null);
       }
     },
     [stopRecording, stopVision, teardownTransport],
@@ -2532,6 +2552,12 @@ function App() {
         // Gate on field presence: the stat envelope is shared, so each
         // consumer reads only the fields it knows.
         if (Number.isFinite(message.rtf)) setRtf(message.rtf);
+        if (Number.isFinite(message.text_starved_frames) || Number.isFinite(message.text_starved_episodes)) {
+          setStarvation((prev) => ({
+            frames: Number.isFinite(message.text_starved_frames) ? message.text_starved_frames : prev.frames,
+            episodes: Number.isFinite(message.text_starved_episodes) ? message.text_starved_episodes : prev.episodes,
+          }));
+        }
         if (Number.isFinite(message.idle_rms) || Number.isFinite(message.silence_streak)) {
           setInjectStat((prev) => ({
             idleRms: Number.isFinite(message.idle_rms) ? message.idle_rms : prev.idleRms,
@@ -2649,11 +2675,30 @@ function App() {
             );
           }
         }
+        if (fullSync && Number.isFinite(Number(config.seed))) {
+          const drawn = Number(config.seed);
+          const mode = sentConfigRef.current?.seed === -1 ? "random" : "locked";
+          addNotice("info", `Session seed ${drawn} (${mode})`, "seed", { seed: drawn });
+        }
         setServerAppliedConfig({
           source: typeof message.source === "string" ? message.source : "",
           applied: Array.isArray(message.applied) ? message.applied : [],
           config,
           at: new Date().toTimeString().slice(0, 8),
+        });
+      } else if (message.type === "lifecycle_receipt") {
+        const textPromptTokens = Number(message.text_prompt_tokens);
+        const voicePromptFrames = Number(message.voice_prompt_frames);
+        setLifecycleReceipt({
+          resumed: message.resumed === true,
+          source: message.source === "resume" ? "resume" : "connect",
+          textPromptTokens: Number.isFinite(textPromptTokens) ? textPromptTokens : 0,
+          voicePromptFrames: Number.isFinite(voicePromptFrames) ? voicePromptFrames : 0,
+          primed:
+            message.voice_prompt_complete === true &&
+            message.audio_silence_a_complete === true &&
+            message.text_prompt_complete === true &&
+            message.audio_silence_b_complete === true,
         });
       } else if (message.type === "event") {
         const text = message.text || message.kind || "Server event";
@@ -2686,6 +2731,12 @@ function App() {
           setRuntimeCounters((counters) => ({
             ...counters,
             recoveries: counters.recoveries + 1,
+          }));
+        }
+        if (message.kind === "turn_cap") {
+          setRuntimeCounters((counters) => ({
+            ...counters,
+            turnCaps: counters.turnCaps + 1,
           }));
         }
         if (message.kind === "rewind" && message.level === "ok") {
@@ -3088,7 +3139,9 @@ function App() {
     userSpokeAtRef.current = 0;
     setNotices([]);
     setSessionTimeline([]);
-    setRuntimeCounters({ recoveries: 0, reconnects: 0, interrupts: 0 });
+    setRuntimeCounters({ recoveries: 0, reconnects: 0, interrupts: 0, turnCaps: 0 });
+    setLifecycleReceipt(null);
+    setStarvation({ frames: 0, episodes: 0 });
     setServerRecording(null);
     setAssistantRate({ words: 0, seconds: 0, wpm: 0 });
     assistantTurnRef.current = { startedAt: 0, startLength: 0, lastChunkAt: 0, lastLength: 0, words: 0 };
@@ -3113,7 +3166,21 @@ function App() {
       });
       await refreshAudioOutputs();
       await initAudioContext();
-      await openPeerSession();
+      for (let attempt = 1; ; attempt += 1) {
+        try {
+          await openPeerSession();
+          break;
+        } catch (error) {
+          // The previous session's teardown can still hold the server lock
+          // for a moment after End; a busy answer that soon is a timing
+          // artifact, not another client, so retry briefly before giving up.
+          if (error.code !== "session_busy" || attempt >= START_BUSY_MAX_ATTEMPTS) throw error;
+          addNotice("warn", `Server still closing the previous session, retrying (${attempt}/${START_BUSY_MAX_ATTEMPTS})`);
+          await new Promise((resolve) => {
+            setTimeout(resolve, START_BUSY_RETRY_DELAY_MS);
+          });
+        }
+      }
     } catch (error) {
       console.error("startConversation failed:", error);
       if (error.code === "session_busy") {
@@ -4504,6 +4571,8 @@ function App() {
       auto_recoveries: runtimeCounters.recoveries,
       reconnects: runtimeCounters.reconnects,
       interrupts: runtimeCounters.interrupts,
+      turn_caps: runtimeCounters.turnCaps,
+      text_starved_episodes: starvation.episodes,
       rewinds: totals.rewinds,
       errors: totals.errors,
       max_rtf: traceMaximaRef.current.rtf,
@@ -4817,6 +4886,12 @@ function App() {
                   <div className="prompt-preview-server">
                     <span className="k">Server</span>
                     <span className="v">{appliedPromptMeta || "applied"}</span>
+                  </div>
+                )}
+                {primingSummary && (
+                  <div className="prompt-preview-server">
+                    <span className="k">Primed</span>
+                    <span className="v">{primingSummary}</span>
                   </div>
                 )}
                 <pre>{promptPreviewText}</pre>
@@ -5295,7 +5370,11 @@ function App() {
                     <Info k="seed" />
                   </div>
                 </div>
-                <span className="sect-sub">{seedRandom ? "random" : "fixed"}</span>
+                <span className="sect-sub">
+                  {appliedSeed !== null
+                    ? `${seedRandom ? "random" : "fixed"} · ${appliedSeed}`
+                    : seedRandom ? "random" : "fixed"}
+                </span>
               </div>
               <div className="seed-row">
                 <input
@@ -5317,6 +5396,26 @@ function App() {
                   {seedRandom ? "Lock" : "Random"}
                 </button>
               </div>
+              {appliedSeed !== null && (
+                <div className="seed-applied">
+                  <span className="k">Session seed</span>
+                  <span className="v">{appliedSeed} · {appliedSeedMode}</span>
+                  {seedRandom && (
+                    <button
+                      className="btn ghost"
+                      type="button"
+                      title="Lock this seed for the next session"
+                      onClick={() => {
+                        setSeed(appliedSeed);
+                        setSeedRandom(false);
+                        setSessionProfileId("custom");
+                      }}
+                    >
+                      Reuse
+                    </button>
+                  )}
+                </div>
+              )}
               <div className="opt-row">
                 <div className="opt-l">
                   <span className="opt-n" style={{ display: "inline-flex", alignItems: "center" }}>
@@ -5984,8 +6083,24 @@ function App() {
             <Row label="Status" value={phase} dot={isLive ? "ok" : phase === "connecting" || phase === "warmup" || phase === "stopping" ? "warn" : ""} />
             <Row label="Uptime" value={elapsedStr} />
             <Row label="Voice" value={voiceDisplay} />
+            <Row
+              label="Seed"
+              value={appliedSeed !== null
+                ? `${appliedSeed} · ${appliedSeedMode}`
+                : seedRandom ? "random · next session" : `${seed} · next session`}
+            />
+            <Row
+              label="Priming"
+              value={primingSummary ?? (phase === "connecting" || phase === "warmup" ? "priming" : "idle")}
+              dot={lifecycleReceipt ? (lifecycleReceipt.resumed || !lifecycleReceipt.primed ? "warn" : "ok") : ""}
+            />
             <Row label="Auto-recoveries" value={runtimeCounters.recoveries} dot={runtimeCounters.recoveries > 0 ? "warn" : ""} />
             <Row label="Reconnects · interrupts" value={`${runtimeCounters.reconnects} · ${runtimeCounters.interrupts}`} />
+            <Row
+              label="Turn caps · text-starved"
+              value={`${runtimeCounters.turnCaps} · ${starvation.episodes}`}
+              dot={runtimeCounters.turnCaps > 0 || starvation.episodes > 0 ? "warn" : ""}
+            />
             <Row label="Vision" value={visionOn ? (visionPaused ? "paused" : `live · ${visionAge ?? "idle"} s`) : visionEnabledFromServer ? "available" : "disabled"} />
             {serverRecording && (
               <Row
