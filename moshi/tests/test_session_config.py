@@ -59,6 +59,7 @@ from moshi.rtc_session import (  # noqa: E402
     clamp_temperature,
     clamp_text_min_p,
     clamp_text_topk,
+    clamp_turn_handling,
     clamp_turn_onset_bias,
     clamp_vision_cost_limit_usd,
     clamp_vision_cost_per_call_usd,
@@ -316,6 +317,20 @@ def test_parse_session_config_preserves_valid_wire_values() -> None:
     assert cfg.vision_cost_per_call_usd == 0.00012
 
 
+def test_turn_handling_contract() -> None:
+    assert parse_session_config({}).turn_handling == "native"
+    assert (
+        parse_session_config({"turn_handling": "assisted"}).turn_handling
+        == "assisted"
+    )
+    for bad in ("auto", "", "NATIVE", None, 1):
+        try:
+            clamp_turn_handling(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for {bad!r}")
+
+
 if __name__ == "__main__":
     print("test_in_range_values_pass_through ...")
     test_in_range_values_pass_through()
@@ -352,5 +367,8 @@ if __name__ == "__main__":
     print("  ok")
     print("test_parse_session_config_preserves_valid_wire_values ...")
     test_parse_session_config_preserves_valid_wire_values()
+    print("  ok")
+    print("test_turn_handling_contract ...")
+    test_turn_handling_contract()
     print("  ok")
     print("all session config tests passed")

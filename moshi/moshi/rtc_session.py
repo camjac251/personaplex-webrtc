@@ -470,6 +470,12 @@ PADDING_BONUS_MAX = 2.0
 # swings the onset odds ~55x, so wider values pin the behavior.
 TURN_ONSET_BIAS_MIN = -4.0
 TURN_ONSET_BIAS_MAX = 4.0
+# Who owns overlap handling. "native" leaves barge-in to the aligned
+# model's own duplex behavior; the server then rejects client-sourced
+# barge_in interrupts so a stale or modified client cannot bypass the
+# mode. "assisted" additionally arms the server-side sustained-overlap
+# detector in the frame loop.
+TURN_HANDLING_MODES = ("native", "assisted")
 # Keep the truncation circuit breaker meaningful for every user-supplied
 # configuration. Caps below the server's collapse-signal floor truncate
 # without feeding auto-rewind (see server.COLLAPSE_SIGNAL_MIN_TURN_TOKENS).
@@ -576,6 +582,16 @@ def clamp_turn_onset_bias(value) -> float:
         TURN_ONSET_BIAS_MAX,
         "turn_onset_bias",
     )
+
+
+def clamp_turn_handling(value) -> str:
+    text = str(value)
+    if text not in TURN_HANDLING_MODES:
+        raise ValueError(
+            f"turn_handling must be one of {TURN_HANDLING_MODES}, "
+            f"got {value!r}"
+        )
+    return text
 
 
 def clamp_text_min_p(value) -> float:
@@ -900,6 +916,9 @@ class SessionConfig:
     # delivering, decaying back to the neutral 1.0 between packets. Only
     # meaningful on servers started in caption-CFG mode; ignored otherwise.
     caption_cfg_gamma: float = 2.0
+    # Overlap ownership: native keeps barge-in with the model, assisted
+    # force-stops the assistant on sustained server-observed overlap.
+    turn_handling: str = "native"
 
 
 def parse_session_config(payload: dict) -> SessionConfig:
@@ -989,6 +1008,9 @@ def parse_session_config(payload: dict) -> SessionConfig:
         ),
         caption_cfg_gamma=clamp_caption_cfg_gamma(
             payload.get("caption_cfg_gamma", defaults.caption_cfg_gamma)
+        ),
+        turn_handling=clamp_turn_handling(
+            payload.get("turn_handling", defaults.turn_handling)
         ),
     )
 

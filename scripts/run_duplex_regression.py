@@ -1493,8 +1493,15 @@ async def run_scenario(
             metrics["operational_failures"] = list(
                 dict.fromkeys(operational_failures)
             )
-            metrics["quality_complete"] = False
-            metrics["quality_failures"] = []
+            # Quality evidence is complete whenever scenario analysis ran:
+            # the degeneration signals below fire regardless of manifest
+            # limits, so a pair can reach Accepted/Rejected instead of
+            # permanently Inconclusive. A flagged baseline is Inconclusive
+            # (reason 5); a flagged candidate is Rejected (reason 6).
+            metrics["quality_complete"] = True
+            metrics["quality_failures"] = [
+                f"runaway: {flag}" for flag in metrics.get("runaway_flags", [])
+            ]
             metrics["failures"] = [
                 *metrics["operational_failures"],
                 *metrics.get("threshold_failures", []),

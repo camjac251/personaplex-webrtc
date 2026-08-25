@@ -86,6 +86,7 @@ from .rtc_session import (
     clamp_text_min_p,
     clamp_text_topk,
     clamp_turn_onset_bias,
+    clamp_turn_handling,
     clamp_vision_cost_limit_usd,
     reassemble_vision_chunk,
 )
@@ -1070,6 +1071,15 @@ USER_TURN_RELEASE_RMS = 0.0045
 USER_TURN_ATTACK_STREAK = 3
 USER_TURN_MIN_ACTIVE_FRAMES = 4
 USER_TURN_END_SILENCE_STREAK = 7
+
+# Server-owned assisted barge-in: sustained user speech while the
+# assistant is audibly mid-reply force-stops the answer. The floor is
+# the shared user-speech RMS, not the browser's much higher overlap
+# threshold, so quiet voices get the same protection. Ten frames is
+# ~800 ms: long enough to ride out backchannels, short enough to feel
+# like yielding rather than talking over.
+ASSISTED_BARGE_OVERLAP_FRAMES = 10
+ASSISTED_BARGE_ASSISTANT_QUIET_STREAK = 2
 # Stop uses a separate, deliberately shorter speech gate. A one- or two-word
 # reply can occupy only two 80 ms outer frames, so requiring the normal four
 # voiced frames leaves the latched assistant muted after "yes", "no", or
@@ -1636,6 +1646,16 @@ class ServerState:
     event-loop coroutines.
     """
 
+    # Serializes every mutation and bulk iteration of the per-session
+    # snapshot registries (auto-rewind ring, baselines, bookmarks). The
+    # inference thread iterates them for admission accounting while the
+    # event loop inserts, replaces, and pops, so an unguarded pass used
+    # to raise "dictionary changed size during iteration" and silently
+    # drop a recovery point. Leaf critical sections only: never held
+    # across awaits, GPU work, or _infer_lock acquisition. Class-level so
+    # partially constructed ServerState fixtures in tests expose it too.
+    _snapshot_registry_lock = threading.Lock()
+
     def __init__(self, mimi: MimiModel, lm_gen: LMGen, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  device: str | torch.device, voice_prompt_dir: str | None = None,
                  uploads_dir: str | None = None,
@@ -1925,6 +1945,11 @@ class ServerState:
         self._context_seal_token: Optional[int] = _derive_context_seal_token(
             text_tokenizer
         )
+        if self._context_seal_token is None:
+            logger.warning(
+                "tokenizer lacks a '.' piece: context seals disabled; "
+                "interrupted context drips can leave a dangling clause"
+            )
         # Monotonic timestamp when the Stop latch was last armed; drives
         # the hold ceiling in _release_stop_latch_if_expired.
         self._stop_latched_at: float = 0.0
@@ -2363,6 +2388,9 @@ class ServerState:
                 cfg.session_timeout_sec
             )
             self._active_text_prompt = cfg.text_prompt or ""
+            self._active_turn_handling = getattr(
+                cfg, "turn_handling", "native"
+            )
             wrapped_text_prompt = (
                 wrap_with_system_tags(self._active_text_prompt)
                 if self._active_text_prompt
@@ -2382,6 +2410,11 @@ class ServerState:
                     self._reinforce_prompt_text,
                     self._reinforce_prompt_tokens,
                 ) = self._fit_vision_context(compact_persona)
+                if not self._reinforce_prompt_tokens:
+                    logger.warning(
+                        "persona reinforcement disabled: persona text does "
+                        "not fit the inject budget"
+                    )
             else:
                 self._reinforce_prompt_text = ""
                 self._reinforce_prompt_tokens = []
@@ -3452,10 +3485,68 @@ class ServerState:
             self._user_audio_attack_streak = 0
         return user_turn_started, user_turn_ended
 
+    def _apply_interrupt_locked(self, reason: str) -> None:
+        """Apply an interrupt's model-state mutations; caller holds the lock."""
+        self.lm_gen._pad_force_remaining = max(
+            self.lm_gen._pad_force_remaining,
+            INTERRUPT_YIELD_FRAMES,
+        )
+        self.lm_gen._non_pad_streak = 0
+        self.lm_gen._turn_pad_streak = 0
+        # A user stop is a real turn boundary, unlike the automatic
+        # max-turn cap. Do not carry abandoned response words into the
+        # next reply's penalty.
+        self.lm_gen.reset_repetition_state()
+        self._prev_pad_force_remaining = (
+            self.lm_gen._pad_force_remaining
+        )
+        self._interrupt_gate_remaining = max(
+            self._interrupt_gate_remaining,
+            INTERRUPT_YIELD_FRAMES,
+        )
+        self._arm_stop_response_latch_locked(reason)
+        self._clear_vision_pending()
+        self._vision_inject_steps = 0
+        self._clear_reinforce_pending()
+        self._reinforce_inject_steps = 0
+        self._active_context_meta = {}
+        self._inject_active = False
+
+    def _notify_assisted_barge(self, session_id: str) -> None:
+        """Tell the client the server itself force-stopped the reply."""
+        session = self._active_session
+        loop = self._main_loop
+        if session is None or loop is None:
+            return
+
+        def _notify() -> None:
+            try:
+                if session_id != self._active_session_id:
+                    return
+                session.send_event(
+                    "interrupt",
+                    "Sustained overlap: assistant yielded",
+                    "warn",
+                    {"reason": "barge_in"},
+                )
+                session.send_interrupted("barge_in")
+                session.send_notice("Barge-in stopped assistant audio")
+            except Exception as exc:
+                logger.warning(
+                    "assisted barge notify failed: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+
+        loop.call_soon_threadsafe(_notify)
+
     def _reset_stop_latch_user_turn_activity(self) -> None:
         self._stop_user_audio_active = False
         self._stop_user_audio_attack_streak = 0
         self._stop_user_audio_silence_streak = 0
+        # A server-side assisted barge-in rebuilds from silence after any
+        # latch cycle, so a stale streak can never fire on its own.
+        self._assisted_barge_streak = 0
 
     def _arm_stop_response_latch_locked(self, reason: str) -> None:
         """Arm Stop, carrying server-observed speech only for barge-in.
@@ -3661,6 +3752,33 @@ class ServerState:
             inbound_speaking = (
                 chunk_rms >= USER_TURN_SPEECH_RMS or self._user_audio_active
             )
+            # Server-owned assisted barge-in: sustained real user speech
+            # while the assistant is audibly mid-reply force-stops the
+            # answer with the same mutation set as a client interrupt.
+            # Runs inline: this loop already executes under _infer_lock on
+            # the single inference worker.
+            if (
+                getattr(self, "_active_turn_handling", "native") == "assisted"
+                and inbound_speaking
+                and not self._stop_response_latched
+                and self._interrupt_gate_remaining <= 0
+                and not self._inject_active
+                and not self._vision_active
+                and not self._reinforce_active
+                and self._audio_silence_streak
+                < ASSISTED_BARGE_ASSISTANT_QUIET_STREAK
+            ):
+                self._assisted_barge_streak = (
+                    getattr(self, "_assisted_barge_streak", 0) + 1
+                )
+                if self._assisted_barge_streak >= ASSISTED_BARGE_OVERLAP_FRAMES:
+                    barge_session_id = self._active_session_id
+                    if barge_session_id is not None:
+                        self._assisted_barge_streak = 0
+                        self._apply_interrupt_locked("barge_in")
+                        self._notify_assisted_barge(barge_session_id)
+            else:
+                self._assisted_barge_streak = 0
             # Decide once per outer call whether to inject this frame.
             inject_token: Optional[int] = None
             inject_meta: dict = {}
@@ -4454,54 +4572,55 @@ class ServerState:
         return inferred_residency, inferred_bytes
 
     def _retained_snapshot_inventory(self) -> dict[str, int]:
-        snapshots: list[dict] = []
-        for history in getattr(self, "_session_snapshots", {}).values():
-            snapshots.extend(
-                snapshot for _captured_at, snapshot in history
-                if isinstance(snapshot, dict)
-            )
-        for _captured_at, snapshot in getattr(
-            self, "_session_baselines", {}
-        ).values():
-            if isinstance(snapshot, dict):
-                snapshots.append(snapshot)
-        for bookmarks in getattr(self, "_session_bookmarks", {}).values():
-            snapshots.extend(
-                bookmark["state"]
-                for bookmark in bookmarks
-                if isinstance(bookmark, dict)
-                and isinstance(bookmark.get("state"), dict)
-            )
-        grant = getattr(self, "_resume_grant", None)
-        if isinstance(grant, dict):
-            snapshots.extend(
-                snapshot
-                for _captured_at, snapshot in grant.get("snapshots", [])
-                if isinstance(snapshot, dict)
-            )
-            snapshots.extend(
-                bookmark["state"]
-                for bookmark in grant.get("bookmarks", [])
-                if isinstance(bookmark, dict)
-                and isinstance(bookmark.get("state"), dict)
-            )
+        with self._snapshot_registry_lock:
+            snapshots: list[dict] = []
+            for history in getattr(self, "_session_snapshots", {}).values():
+                snapshots.extend(
+                    snapshot for _captured_at, snapshot in history
+                    if isinstance(snapshot, dict)
+                )
+            for _captured_at, snapshot in getattr(
+                self, "_session_baselines", {}
+            ).values():
+                if isinstance(snapshot, dict):
+                    snapshots.append(snapshot)
+            for bookmarks in getattr(self, "_session_bookmarks", {}).values():
+                snapshots.extend(
+                    bookmark["state"]
+                    for bookmark in bookmarks
+                    if isinstance(bookmark, dict)
+                    and isinstance(bookmark.get("state"), dict)
+                )
+            grant = getattr(self, "_resume_grant", None)
+            if isinstance(grant, dict):
+                snapshots.extend(
+                    snapshot
+                    for _captured_at, snapshot in grant.get("snapshots", [])
+                    if isinstance(snapshot, dict)
+                )
+                snapshots.extend(
+                    bookmark["state"]
+                    for bookmark in grant.get("bookmarks", [])
+                    if isinstance(bookmark, dict)
+                    and isinstance(bookmark.get("state"), dict)
+                )
 
-        inventory = {
-            "cpu_count": 0,
-            "cpu_bytes": 0,
-            "gpu_count": 0,
-            "gpu_bytes": 0,
-        }
-        seen: set[int] = set()
-        for snapshot in snapshots:
-            identity = id(snapshot)
-            if identity in seen:
-                continue
-            seen.add(identity)
-            residency, tensor_bytes = self._snapshot_payload_stats(snapshot)
-            inventory[f"{residency}_count"] += 1
-            inventory[f"{residency}_bytes"] += tensor_bytes
-        return inventory
+            inventory = {
+                "cpu_count": 0,
+                "cpu_bytes": 0,
+                "gpu_count": 0,
+                "gpu_bytes": 0,
+            }
+            seen: set[int] = set()
+            for snapshot in snapshots:
+                identity = id(snapshot)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                residency, tensor_bytes = self._snapshot_payload_stats(snapshot)
+                inventory[f"{residency}_count"] += 1
+                inventory[f"{residency}_bytes"] += tensor_bytes
+            return inventory
 
     def _refresh_snapshot_inventory_metrics(self) -> None:
         metrics = getattr(self, "_runtime_metrics", None)
@@ -4596,6 +4715,24 @@ class ServerState:
                 ):
                     raise SnapshotDeferred(
                         "context injection is active; retry at the next boundary"
+                    )
+                if kind == "periodic" and not (
+                    getattr(self, "_vision_pad_streak", 0)
+                    >= LIVE_PROMPT_BOUNDARY_STREAK
+                    and getattr(self, "_audio_silence_streak", 0)
+                    >= getattr(
+                        self,
+                        "_inject_silence_streak",
+                        INJECT_SILENCE_STREAK_DEFAULT,
+                    )
+                ):
+                    # A periodic clone stalls the frame loop for its
+                    # synchronize, so only capture in the same quiet
+                    # boundary the inject gate trusts. The cadence task
+                    # retries quickly, so the rolling recovery point stays
+                    # fresh without ever stalling audible output.
+                    raise SnapshotDeferred(
+                        "no quiet boundary; periodic capture waits for silence"
                     )
                 lm_tensors, lm_metadata = self._flatten_live_streaming_state(
                     self.lm_gen
@@ -5069,13 +5206,16 @@ class ServerState:
                 ),
             )
         self._clear_resume_grant()
+        with self._snapshot_registry_lock:
+            grant_snapshots = self._session_snapshots.get(session_id, [])
+            grant_bookmarks = self._session_bookmarks.get(session_id, [])
         self._resume_grant = {
             "session_id": session_id,
             "deadline": time.monotonic() + RESUME_GRANT_WINDOW_SEC,
             "cfg": cfg,
             "timeout_remaining_sec": remaining_sec,
-            "snapshots": self._session_snapshots.get(session_id, []),
-            "bookmarks": self._session_bookmarks.get(session_id, []),
+            "snapshots": grant_snapshots,
+            "bookmarks": grant_bookmarks,
         }
         self._schedule_resume_grant_expiry(self._resume_grant)
         return True
@@ -5575,6 +5715,9 @@ class ServerState:
             "text_min_p": float(self.lm_gen.min_p_text),
             "semantic_temp_cap": float(self.lm_gen.semantic_temperature_cap),
             "max_turn_text_tokens": int(self.lm_gen.max_turn_text_tokens),
+            "turn_handling": str(
+                getattr(self, "_active_turn_handling", "native")
+            ),
             "session_timeout_sec": int(self._active_session_timeout_sec),
             "vision_cost_limit_usd": float(self._vision_cost_limit_usd),
             "vision_cost_per_call_usd": float(
@@ -6625,10 +6768,9 @@ class ServerState:
                     "continuing with resident model state",
                 )
                 # Re-key the carried per-session snapshot stores.
-                self._session_snapshots[session_id] = resume_state["snapshots"]
-                self._session_bookmarks[session_id] = resume_state["bookmarks"]
-                # Fall through to the shared live-path setup below; every
-                # step between here and there is fresh-session priming.
+                with self._snapshot_registry_lock:
+                    self._session_snapshots[session_id] = resume_state["snapshots"]
+                    self._session_bookmarks[session_id] = resume_state["bookmarks"]
             _prepare_runtime_metrics(
                 self._runtime_metrics,
                 resuming=resuming,
@@ -6765,7 +6907,8 @@ class ServerState:
                 self._reset_stop_latch_user_turn_activity()
                 # Start this session's labelled-snapshot store empty so pins from
                 # a prior session can never be jumped to in this one.
-                self._session_bookmarks[session_id] = []
+                with self._snapshot_registry_lock:
+                    self._session_bookmarks[session_id] = []
                 # Reset user-speech recognition turn state and drop any audio a
                 # prior session left buffered. No-op when ASR is disabled.
                 self._asr_assistant_silent = False
@@ -7102,31 +7245,32 @@ class ServerState:
                                 exc,
                             )
                         return
-                    marks = self._session_bookmarks.get(session_id)
-                    if (
-                        marks is None
-                        or session_id != self._active_session_id
-                        or not session.is_alive()
-                    ):
-                        # Teardown may have removed the bucket while the GPU
-                        # clone was in flight. Never resurrect an orphaned
-                        # session id that no future teardown will release.
-                        return
-                    marks.append(
-                        {
-                            "id": bm_id,
-                            "label": label,
-                            "at_sec": at_sec,
-                            "ts": time.monotonic(),
-                            "state": snap,
-                        }
-                    )
-                    # Evict oldest on overflow so the server store mirrors the
-                    # client's newest-first capped list and the two stay in
-                    # sync; otherwise a jump to an evicted id hits not-found.
-                    evicted = None
-                    while len(marks) > MAX_BOOKMARKS:
-                        evicted = marks.pop(0)
+                    with self._snapshot_registry_lock:
+                        marks = self._session_bookmarks.get(session_id)
+                        if (
+                            marks is None
+                            or session_id != self._active_session_id
+                            or not session.is_alive()
+                        ):
+                            # Teardown may have removed the bucket while the GPU
+                            # clone was in flight. Never resurrect an orphaned
+                            # session id that no future teardown will release.
+                            return
+                        marks.append(
+                            {
+                                "id": bm_id,
+                                "label": label,
+                                "at_sec": at_sec,
+                                "ts": time.monotonic(),
+                                "state": snap,
+                            }
+                        )
+                        # Evict oldest on overflow so the server store mirrors the
+                        # client's newest-first capped list and the two stay in
+                        # sync; otherwise a jump to an evicted id hits not-found.
+                        evicted = None
+                        while len(marks) > MAX_BOOKMARKS:
+                            evicted = marks.pop(0)
                     self._refresh_snapshot_inventory_metrics()
                     try:
                         event_data = {
@@ -7169,35 +7313,31 @@ class ServerState:
                         return
                     reason_raw = str(msg.get("reason") or "manual")
                     reason = reason_raw[:64]
+                    if reason == "barge_in" and getattr(
+                        self, "_active_turn_handling", "native"
+                    ) != "assisted":
+                        # Native owns overlap on the server too, so a
+                        # stale or modified client cannot bypass the mode.
+                        try:
+                            session.send_event(
+                                "interrupt",
+                                "Barge-in ignored in Native turn handling",
+                                "warn",
+                                {"reason": reason},
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "barge-in reject notify failed: %s: %s",
+                                type(exc).__name__,
+                                exc,
+                            )
+                        return
 
                     def _do_interrupt():
                         with self._infer_lock:
                             if session_id != self._active_session_id:
                                 return
-                            self.lm_gen._pad_force_remaining = max(
-                                self.lm_gen._pad_force_remaining,
-                                INTERRUPT_YIELD_FRAMES,
-                            )
-                            self.lm_gen._non_pad_streak = 0
-                            self.lm_gen._turn_pad_streak = 0
-                            # A user stop is a real turn boundary, unlike the
-                            # automatic max-turn cap. Do not carry abandoned
-                            # response words into the next reply's penalty.
-                            self.lm_gen.reset_repetition_state()
-                            self._prev_pad_force_remaining = (
-                                self.lm_gen._pad_force_remaining
-                            )
-                            self._interrupt_gate_remaining = max(
-                                self._interrupt_gate_remaining,
-                                INTERRUPT_YIELD_FRAMES,
-                            )
-                            self._arm_stop_response_latch_locked(reason)
-                            self._clear_vision_pending()
-                            self._vision_inject_steps = 0
-                            self._clear_reinforce_pending()
-                            self._reinforce_inject_steps = 0
-                            self._active_context_meta = {}
-                            self._inject_active = False
+                            self._apply_interrupt_locked(reason)
 
                     await loop.run_in_executor(
                         self._infer_executor, _do_interrupt
@@ -7261,6 +7401,7 @@ class ServerState:
                         "repetition_penalty_context",
                         "padding_bonus",
                         "turn_onset_bias",
+                        "turn_handling",
                         "text_min_p",
                         "semantic_temp_cap",
                         "max_turn_text_tokens",
@@ -7286,6 +7427,7 @@ class ServerState:
                     inject_silence_rms: Optional[float] = None
                     inject_silence_streak: Optional[int] = None
                     caption_cfg_gamma: Optional[float] = None
+                    turn_handling_update: Optional[str] = None
                     try:
                         if "text_temperature" in msg:
                             updates["temp_text"] = clamp_temperature(
@@ -7329,6 +7471,10 @@ class ServerState:
                         if "turn_onset_bias" in msg:
                             updates["turn_onset_bias"] = clamp_turn_onset_bias(
                                 msg["turn_onset_bias"]
+                            )
+                        if "turn_handling" in msg:
+                            turn_handling_update = clamp_turn_handling(
+                                msg["turn_handling"]
                             )
                         if "text_min_p" in msg:
                             updates["min_p_text"] = clamp_text_min_p(
@@ -7443,6 +7589,10 @@ class ServerState:
                             self._inject_silence_rms = inject_silence_rms
                         if inject_silence_streak is not None:
                             self._inject_silence_streak = inject_silence_streak
+                        if turn_handling_update is not None:
+                            # Plain attribute read by the interrupt paths;
+                            # the rebind is atomic in CPython.
+                            self._active_turn_handling = turn_handling_update
                     applied = [k for k in live_keys if k in msg]
                     if not applied:
                         return
@@ -7851,7 +8001,8 @@ class ServerState:
                         history = self._session_snapshots.get(session_id)
                         if history is None:
                             break
-                        history[:] = [(time.monotonic(), snap)]
+                        with self._snapshot_registry_lock:
+                            history[:] = [(time.monotonic(), snap)]
                         self._refresh_snapshot_inventory_metrics()
                 except asyncio.CancelledError:
                     if snapshot_future is not None and not snapshot_future.done():
@@ -8063,16 +8214,17 @@ class ServerState:
                             pass
                         raise
                     baseline_ts = time.monotonic()
-                    self._session_snapshots.setdefault(session_id, []).append(
-                        (baseline_ts, baseline)
-                    )
-                    # Same clone under a second key: the periodic snapshot
-                    # task replaces the ring wholesale, and voice_reset must
-                    # still find the session-start anchor afterwards.
-                    self._session_baselines[session_id] = (
-                        baseline_ts,
-                        baseline,
-                    )
+                    with self._snapshot_registry_lock:
+                        self._session_snapshots.setdefault(session_id, []).append(
+                            (baseline_ts, baseline)
+                        )
+                        # Same clone under a second key: the periodic snapshot
+                        # task replaces the ring wholesale, and voice_reset must
+                        # still find the session-start anchor afterwards.
+                        self._session_baselines[session_id] = (
+                            baseline_ts,
+                            baseline,
+                        )
                     self._refresh_snapshot_inventory_metrics()
                     clog.log("info", "baseline snapshot captured")
                 except Exception as exc:
@@ -8381,11 +8533,12 @@ class ServerState:
                     )
                     clog.log("info", f"no resume grant recorded: {reason}")
                 self._candidate_sessions.pop(session_id, None)
-                self._session_snapshots.pop(session_id, None)
-                # Release the labelled snapshots' tensor clones on session end,
-                # exactly like the auto-rewind ring above.
-                self._session_bookmarks.pop(session_id, None)
-                self._session_baselines.pop(session_id, None)
+                with self._snapshot_registry_lock:
+                    self._session_snapshots.pop(session_id, None)
+                    # Release the labelled snapshots' tensor clones on session end,
+                    # exactly like the auto-rewind ring above.
+                    self._session_bookmarks.pop(session_id, None)
+                    self._session_baselines.pop(session_id, None)
                 self._refresh_snapshot_inventory_metrics()
                 # Drain in-flight Gemini calls before the next session can
                 # acquire the lock. A stale handle_vision_frame still
@@ -8666,17 +8819,18 @@ def main():
     parser.add_argument(
         "--periodic-snapshots",
         action=argparse.BooleanOptionalAction,
-        default=_environment_flag("PERSONAPLEX_PERIODIC_SNAPSHOTS", False),
+        default=_environment_flag("PERSONAPLEX_PERIODIC_SNAPSHOTS", True),
         help=(
-            "Clone live model state once per minute so auto-rewind and manual "
-            "Rewind restore a recent state instead of the session-start "
-            "baseline. Off by default: the session keeps only the baseline "
-            "and explicit bookmarks, and auto-rewind can fire only while the "
-            "baseline is younger than its 90 s freshness limit. Baselines "
-            "and bookmarks tier to CPU; periodic recovery retains one GPU "
-            "snapshot. A measured two-row Caption-CFG capture is 2.945 GiB "
-            "and about 416 ms on an RTX 6000 Ada, so periodic capture remains "
-            "an explicitly qualified deployment choice."
+            "Clone live model state once per minute so auto-rewind keeps a "
+            "recovery point younger than its 90 s freshness limit for the "
+            "whole session. On by default: without it a trip after the "
+            "session-start baseline ages out only logs a collapse event. "
+            "Periodic captures defer until the same quiet boundary the "
+            "context-inject gate trusts, so their ~416 ms frame-loop stall "
+            "never lands on audible output; a measured two-row Caption-CFG "
+            "capture is 2.945 GiB retained as one GPU snapshot. Baselines "
+            "and bookmarks tier to CPU and are untouched. Opt out with "
+            "--no-periodic-snapshots."
         ),
     )
     parser.add_argument(

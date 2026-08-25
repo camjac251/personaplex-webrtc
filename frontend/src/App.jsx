@@ -260,7 +260,7 @@ const TURN_HANDLING_MODES = [
   {
     id: "assisted",
     label: "Assisted",
-    desc: "Force-stop the assistant after sustained overlap.",
+    desc: "Server force-stops the assistant on sustained overlap.",
   },
 ];
 
@@ -812,7 +812,7 @@ function App() {
     sessionTraceRef.current?.record(kind, data, options);
   }, []);
 
-  stateRef.current = { visionOn, visionPaused, visionInjecting, phase, interrupting, jitterBuffer, visionFeedModel, visionGroundTurns };
+  stateRef.current = { visionOn, visionPaused, visionInjecting, phase, interrupting, jitterBuffer, visionFeedModel, visionGroundTurns, speaking };
   modelDefaultsRef.current = modelDefaults;
 
   // Latest live-tunable rail values, refreshed every render. The rail
@@ -1513,6 +1513,9 @@ function App() {
       vision_feed_model: !!visionFeedModel,
       vision_ground_user_turns: !!visionOn && !!visionGroundTurns,
       reinforce_in_silences: !!reinforceInSilences,
+      // Overlap ownership travels with the session so the server can
+      // enforce the mode and run its own sustained-overlap stop.
+      turn_handling: turnHandling,
       // Clamp to the active range mode so a stale stored extreme can never
       // ride into a fresh session unless Expert is deliberately active.
       audio_temperature: clampInferenceValue("audioTemp", audioTemp, DEFAULTS.audioTemp, tuningRangeMode),
@@ -1549,6 +1552,7 @@ function App() {
     visionGroundTurns,
     visionOn,
     reinforceInSilences,
+    turnHandling,
     audioTemp,
     textTemp,
     textTopk,
@@ -3563,6 +3567,11 @@ function App() {
     );
     const intervalId = setInterval(() => {
       if (stateRef.current.visionPaused) return;
+      // Hold ambient captures while the user is talking: a caption
+      // arriving mid-turn only lands in the post-turn holdoff and gets
+      // dropped, so the budget is better spent on the turn-end frame.
+      const speakingNow = stateRef.current.speaking;
+      if (speakingNow === "you" || speakingNow === "both") return;
       // Fallback only: server-requested and forced captures cover an
       // active scene, so skip the tick when a frame already went out
       // within the current period.
@@ -3872,7 +3881,7 @@ function App() {
       const now = performance.now();
       // Debounce per reason: an auto barge-in must not swallow a manual
       // Stop pressed right after it.
-      if (now - (lastInterruptClickRef.current[reason] || 0) < 900) return;
+      if (now - (lastInterruptClickRef.current[reason] || 0) < 900) return false;
       lastInterruptClickRef.current[reason] = now;
       if (controlRef.current?.readyState === "open") {
         controlRef.current.send(JSON.stringify({ type: "interrupt", reason }));
@@ -3882,7 +3891,9 @@ function App() {
           reason === "barge_in" ? "Barge-in sent, stopping assistant audio" : "Stop response requested",
           "interrupt",
         );
+        return true;
       }
+      return false;
     },
     [addNotice, pulseInterrupt],
   );
@@ -4279,11 +4290,14 @@ function App() {
         setSpeaking("both");
         if (
           turnHandling === "assisted"
-          && overlapTicks === 3
+          && overlapTicks >= 3
           && !bargeActiveRef.current
+          // Latch only on a successful send: a debounce-suppressed
+          // attempt must retry next tick instead of dropping the
+          // whole overlap episode.
+          && interruptResponse("barge_in")
         ) {
           bargeActiveRef.current = true;
-          interruptResponse("barge_in");
         }
       } else {
         overlapTicks = 0;
@@ -4315,6 +4329,17 @@ function App() {
       // Assistant resumed after the user spoke: close the user turn,
       // stamped with the time the speech started.
       userSpokeRef.current = false;
+      // Refresh scene context right as the reply starts forming, so the
+      // next caption describes the screen as it is now rather than up to
+      // one idle interval ago. The motion gate still applies: an
+      // unchanged screen keeps its existing caption.
+      if (
+        stateRef.current.visionOn
+        && !stateRef.current.visionPaused
+        && !stateRef.current.visionInjecting
+      ) {
+        captureFrame(false, false, "turn_end");
+      }
       const at = userSpokeAtRef.current || performance.now();
       userSpokeAtRef.current = 0;
       const id = `${Date.now()}-you-${Math.random().toString(36).slice(2, 7)}`;
@@ -4323,7 +4348,7 @@ function App() {
       traceTotalsRef.current.userTurns += 1;
       setUserTurns((turns) => [...turns, { id, audioOnly: true, text: "", at }].slice(-40));
     }
-  }, [speaking, phase, recordTrace]);
+  }, [captureFrame, speaking, phase, recordTrace]);
 
   useEffect(() => {
     if (phase !== "live") return;
@@ -5993,6 +6018,9 @@ function App() {
                         onClick={() => {
                           setTurnHandling(mode.id);
                           setSessionProfileId("custom");
+                          // Mid-session switches reach the server too, so
+                          // its barge-in enforcement and detector follow.
+                          sendLiveConfig({ turn_handling: mode.id });
                         }}
                       >
                         {mode.label}
