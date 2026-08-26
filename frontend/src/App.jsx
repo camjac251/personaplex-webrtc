@@ -1678,6 +1678,9 @@ function App() {
       ),
     );
     setReinforceInSilences(!!config.reinforce_in_silences);
+    if (config.turn_handling === "assisted" || config.turn_handling === "native") {
+      setTurnHandling(config.turn_handling);
+    }
     setAudioTemp(clampInferenceValue("audioTemp", config.audio_temperature, DEFAULTS.audioTemp));
     setTextTemp(clampInferenceValue("textTemp", config.text_temperature, DEFAULTS.textTemp));
     setTextTopk(clampInferenceValue("textTopk", config.text_topk, DEFAULTS.textTopk));
