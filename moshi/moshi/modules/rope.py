@@ -89,6 +89,43 @@ def apply_rope(
     return qo.view(*dims, D), ko.view(*dims, D)
 
 
+def shift_rope(
+    k: torch.Tensor,
+    delta: torch.Tensor,
+    max_period: float = 10_000,
+) -> torch.Tensor:
+    """Advance the rotary phase of already-rotated keys by ``delta`` steps.
+
+    RoPE rotations compose additively, so a key stored with its rotation at
+    absolute position ``p`` comes back rotated as if written at ``p + delta``.
+    Every position in ``k`` receives the same shift; ``delta`` is a one-element
+    long tensor so the call stays capturable inside a CUDA graph.
+
+    Args:
+        k (torch.Tensor): rotated keys, shape `[B, H, T, D]`.
+        delta (torch.Tensor): shift in positions, shape `[1]`.
+        max_period (float): maximum period for the cos and sin.
+    """
+    B, H, T, D = k.shape
+    assert D % 2 == 0
+    assert delta.numel() == 1
+
+    ds = torch.arange(D // 2, device=k.device, dtype=torch.float32)
+    freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))
+    angle = freqs * delta.float().view(1)
+    rotr = torch.cos(angle)
+    roti = torch.sin(angle)
+
+    k = k.view(B, H, T, D // 2, 2)
+    kr = k[..., 0].float()
+    ki = k[..., 1].float()
+    kor = kr * rotr - ki * roti
+    koi = kr * roti + ki * rotr
+    dtype = k.dtype
+    ko = torch.stack([kor.to(dtype), koi.to(dtype)], dim=-1)
+    return ko.view(B, H, T, D)
+
+
 class RotaryEmbedding(nn.Module):
     """Rotary positional embedding (RoPE) from [Su et al 2022](https://arxiv.org/abs/2104.09864).
 

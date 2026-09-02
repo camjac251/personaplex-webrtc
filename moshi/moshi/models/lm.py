@@ -122,13 +122,6 @@ def _undelay_sequence(delays: List[int], tensor: torch.Tensor,
     return torch.stack(outs, dim=1), mask
 
 
-def create_sinewave(duration: float, sample_rate: int) -> np.ndarray:
-    """Return a 440 Hz 'silent' sinewave of the given duration."""
-    t = np.linspace(0.0, duration, int(sample_rate * duration), endpoint=False)
-    amplitude = 0.5
-    return amplitude * np.sin(2 * np.pi * 440.0 * t).astype(np.float32)
-
-
 def boundary_trim_bounds(
     wav: np.ndarray,
     sr: int,
@@ -882,10 +875,6 @@ class LMGen(StreamingModule[_LMGenState]):
         self._frame_rate = frame_rate
         self._sample_rate = sample_rate
         self._frame_size = int(self._sample_rate / self._frame_rate)
-        self._zero_frame = torch.zeros(1, 1, self._frame_size, device=self.lm_model.device)
-        duration = self._frame_size / self._sample_rate
-        sine = create_sinewave(duration, self._sample_rate)
-        self._sine_frame = torch.tensor(sine, device=self.lm_model.device).unsqueeze(0).unsqueeze(0)  # (1,1,T)
         self._zero_codes = torch.as_tensor(
             SILENCE_TOKENS,
             dtype=torch.long,

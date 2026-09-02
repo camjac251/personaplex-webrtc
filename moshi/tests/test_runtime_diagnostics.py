@@ -17,6 +17,7 @@ import threading
 import time
 import types
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -643,6 +644,10 @@ def _snapshot_test_state(*, host_budget_bytes: int) -> ServerState:
     state = ServerState.__new__(ServerState)
     state.device = torch.device("cpu")
     state._infer_lock = threading.Lock()
+    state._infer_executor = ThreadPoolExecutor(max_workers=1)
+    state._snapshot_executor = ThreadPoolExecutor(max_workers=1)
+    state._snapshot_staging_lock = threading.Lock()
+    state._snapshot_staging = {}
     state.lm_gen = _SnapshotModule(1.0)
     state.mimi = _SnapshotModule(2.0)
     state._snapshot_host_budget_bytes = host_budget_bytes
@@ -679,7 +684,7 @@ def test_bookmark_budget_rejection_is_nonfatal_and_keeps_prior_points() -> None:
     state._session_baselines = {"session": (1.0, prior)}
     state._session_snapshots = {"session": [(1.0, prior)]}
 
-    snapshot, status = state._capture_bookmark_snapshot()
+    snapshot, status = asyncio.run(state._capture_bookmark_snapshot())
 
     assert snapshot is None
     assert status == "rejected"
@@ -700,6 +705,129 @@ def test_snapshot_capacity_error_is_specific() -> None:
         raise AssertionError("over-budget snapshot should be rejected")
 
 
+def test_periodic_capture_does_not_count_the_ring_entry_it_replaces() -> None:
+    """Replacing the rolling GPU snapshot must fit one copy in the budget.
+
+    Measured on the A6000 profile: a two-row state with a 256-frame sink is
+    3,296,432,800 bytes, so counting the retained periodic entry plus the
+    new capture (6.6 GB) overshoots the 6 GiB default even though only the
+    newest is ever kept. The ring entry is excluded; bookmarks and other
+    sessions' retained state still count.
+    """
+    state = _snapshot_test_state(host_budget_bytes=1024)
+    state._snapshot_gpu_budget_bytes = 6 * 1024**3
+    held = 3_296_432_800
+    ring_entry = {"version": 2, "residency": "gpu", "tensor_bytes": held}
+    state._active_session_id = "live"
+    state._session_snapshots = {"live": [(1.0, ring_entry)]}
+    original_free = state._snapshot_free_bytes
+    state._snapshot_free_bytes = lambda residency: 64 * 1024**3
+    try:
+        assert state._replaceable_ring_bytes("gpu") == held
+        assert state._replaceable_ring_bytes("cpu") == 0
+        try:
+            state._admit_snapshot("gpu", held)
+        except SnapshotCapacityError:
+            pass
+        else:
+            raise AssertionError("two full copies must not fit the 6 GiB budget")
+        assert state._admit_snapshot("gpu", held, replacing_bytes=held) == 64 * 1024**3
+        # A bookmark-held GPU snapshot from another session is not replaced.
+        state._session_bookmarks = {
+            "other": [{"id": "b", "state": {"version": 2, "residency": "gpu", "tensor_bytes": held}}]
+        }
+        try:
+            state._admit_snapshot("gpu", held, replacing_bytes=held)
+        except SnapshotCapacityError:
+            pass
+        else:
+            raise AssertionError("retained bookmark bytes must still count")
+    finally:
+        state._snapshot_free_bytes = original_free
+
+
+def test_staged_snapshot_drains_pinned_pool_into_pageable_copies() -> None:
+    """A staged capture must publish private copies and free the pool.
+
+    On CUDA the staging buffers are pinned and the copies run
+    asynchronously; here the same path runs on CPU tensors so the
+    bookkeeping is checked without a device: the published LM tensor is a
+    copy (not the shared buffer), Mimi copies directly, the staging lock is
+    held from stage to finish, and a capture that overlaps the drain is
+    deferred instead of overwriting the buffers.
+    """
+    state = _snapshot_test_state(host_budget_bytes=1024)
+    staging_buffer = torch.zeros(4)
+    state._snapshot_staging = {"state": staging_buffer}
+
+    staged = state._stage_snapshot("bookmark")
+
+    assert staged.holds_staging
+    assert staged.staged_keys == ("state",)
+    assert staged.copy_event is None
+    assert staged.snapshot["lm"]["state"] is staging_buffer
+    assert torch.equal(staging_buffer, torch.full((4,), 1.0))
+    assert state._snapshot_staging_lock.locked()
+    try:
+        state._stage_snapshot("bookmark")
+    except SnapshotDeferred as exc:
+        assert "staging" in str(exc)
+    else:
+        raise AssertionError("overlapping staged capture was not deferred")
+
+    snapshot = state._finish_snapshot(staged)
+
+    assert not state._snapshot_staging_lock.locked()
+    assert snapshot["lm"]["state"] is not staging_buffer
+    assert torch.equal(snapshot["lm"]["state"], torch.full((4,), 1.0))
+    assert torch.equal(snapshot["mimi"]["state"], torch.full((4,), 2.0))
+    # The pool is reusable: a later capture overwrites the buffer without
+    # touching the published snapshot.
+    state.lm_gen.value = 3.0
+    later = state._take_snapshot("bookmark")
+    assert torch.equal(later["lm"]["state"], torch.full((4,), 3.0))
+    assert torch.equal(snapshot["lm"]["state"], torch.full((4,), 1.0))
+    accounting = state._runtime_metrics.snapshot()["snapshot_accounting"]
+    assert accounting["capture_count"] == 2
+
+
+def test_staged_snapshot_rejects_unknown_lm_tensor_shape() -> None:
+    state = _snapshot_test_state(host_budget_bytes=1024)
+    state._snapshot_staging = {"state": torch.zeros(3)}
+
+    try:
+        state._stage_snapshot("bookmark")
+    except RuntimeError as exc:
+        assert "staging has no buffer" in str(exc)
+    else:
+        raise AssertionError("shape mismatch must fail loudly")
+    assert not state._snapshot_staging_lock.locked()
+    accounting = state._runtime_metrics.snapshot()["snapshot_accounting"]
+    assert accounting["failure_count"] == 1
+
+
+def test_capture_snapshot_finishes_staged_captures_off_the_inference_worker() -> None:
+    state = _snapshot_test_state(host_budget_bytes=1024)
+    state._snapshot_staging = {"state": torch.zeros(4)}
+    finish_threads: list[str] = []
+    original_finish = state._finish_snapshot
+
+    def _recording_finish(staged):
+        finish_threads.append(threading.current_thread().name)
+        return original_finish(staged)
+
+    state._finish_snapshot = _recording_finish
+    state._snapshot_executor = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="snapshot-test"
+    )
+
+    snapshot = asyncio.run(state._capture_snapshot("bookmark"))
+
+    assert torch.equal(snapshot["lm"]["state"], torch.full((4,), 1.0))
+    assert finish_threads and finish_threads[0].startswith("snapshot-test")
+    assert not state._snapshot_staging_lock.locked()
+
+
 def test_restore_waits_for_cuda_copy_completion() -> None:
     class _RestoreModule:
         def validate_streaming_state(self, _state: dict) -> None:
@@ -717,6 +845,8 @@ def test_restore_waits_for_cuda_copy_completion() -> None:
     state.lm_gen = _RestoreModule()
     state.lm_gen._non_pad_streak = 0
     state.lm_gen._pad_force_remaining = 0
+    state.lm_gen.max_delay = 1
+    state._pending_text_flags = deque()
     state._clear_vision_pending = lambda: None
     state._clear_reinforce_pending = lambda: None
     state._collapse_triggers = deque()
@@ -1319,6 +1449,9 @@ if __name__ == "__main__":
         test_baseline_and_bookmark_snapshots_are_cpu_resident_and_accounted,
         test_bookmark_budget_rejection_is_nonfatal_and_keeps_prior_points,
         test_snapshot_capacity_error_is_specific,
+        test_staged_snapshot_drains_pinned_pool_into_pageable_copies,
+        test_staged_snapshot_rejects_unknown_lm_tensor_shape,
+        test_capture_snapshot_finishes_staged_captures_off_the_inference_worker,
         test_restore_waits_for_cuda_copy_completion,
         test_restore_preflights_both_modules_and_rng_before_any_apply,
         test_short_noise_burst_does_not_complete_user_turn,

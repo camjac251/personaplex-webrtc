@@ -43,6 +43,7 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
 from typing import Callable, Literal, Optional
@@ -924,6 +925,29 @@ class SnapshotCapacityError(RuntimeError):
     """Snapshot capture was rejected without mutating live state."""
 
 
+@dataclass
+class _StagedSnapshot:
+    """A capture whose device-to-host copies may still be in flight.
+
+    Produced by ``ServerState._stage_snapshot`` under the inference lock and
+    completed by ``ServerState._finish_snapshot``. ``holds_staging`` means the
+    LM tensors in ``snapshot["lm"]`` are the shared pinned staging buffers and
+    the staging lock is held until ``_finish_snapshot`` runs; ``copy_event``
+    marks the end of those copies on the inference stream.
+    """
+
+    snapshot: dict
+    kind: str
+    residency: str
+    holds_staging: bool
+    staged_keys: tuple[str, ...]
+    copy_event: Optional[torch.cuda.Event]
+    free_before: int
+    started_at: float
+    lock_acquired_at: float
+    clone_submitted_at: float
+
+
 GIB = 1024**3
 DEFAULT_SNAPSHOT_GPU_BUDGET_BYTES = 6 * GIB
 DEFAULT_SNAPSHOT_GPU_FREE_FLOOR_BYTES = 2 * GIB
@@ -1784,6 +1808,14 @@ class ServerState:
             max_workers=1,
             thread_name_prefix="personaplex-infer",
         )
+        # Finishes CPU-resident snapshot captures: waits for the staged
+        # device-to-host copies and moves them to pageable memory. Driver
+        # waits and host memcpy only, never kernels, so it does not pay the
+        # cold-worker cost above and never contends with the frame loop.
+        self._snapshot_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="personaplex-snapshot",
+        )
         # Set in _run_rtc_session for the lifetime of an active session.
         # Lets vision-side coroutines push captions back to the client
         # without plumbing a session reference through every call site.
@@ -2093,6 +2125,18 @@ class ServerState:
         # contrasts against. Mimi stays single-row; only row 0's audio is
         # ever decoded.
         self.lm_gen.streaming_forever(2 if self.caption_cfg else 1)
+        # Forced-text inputs for the frame loop, allocated once so a forced
+        # step launches a fill kernel instead of a host-to-device copy that
+        # would stream-sync behind the Mimi encode it follows.
+        self._init_forced_text_buffers()
+        # (forced, interrupt_gated) flags for the text slots the LM has
+        # consumed but not yet emitted; see _process_audio_frame.
+        self._pending_text_flags: deque[tuple[bool, bool]] = deque()
+        self._reset_pending_text_flags()
+        # Pinned host staging for CPU-resident snapshots of the LM state.
+        # Held from _stage_snapshot until _finish_snapshot drains it.
+        self._snapshot_staging_lock = threading.Lock()
+        self._snapshot_staging = self._allocate_snapshot_staging()
         # GPU-hang watchdog: process-lifetime, so it outlives sessions and
         # still fires in the post-disconnect zombie stage where every
         # per-session task has self-exited but the stuck phase persists
@@ -2155,6 +2199,71 @@ class ServerState:
         if age_sec > AUTO_REWIND_SNAPSHOT_MAX_AGE_SEC:
             return None
         return snapshot
+
+    def _init_forced_text_buffers(self) -> None:
+        """Allocate the device tensors the frame loop forces onto the text channel.
+
+        ``_forced_text_pad`` is the Stop-latch PAD; one element broadcasts
+        across the streaming rows. ``_forced_text_inject`` carries a context
+        token in row 0 and, under caption-CFG, a PAD in the unconditional row
+        1; only element 0 is rewritten per drip step.
+        """
+        pad_id = self.lm_gen.lm_model.text_padding_token_id
+        rows = 2 if self.caption_cfg else 1
+        self._forced_text_pad = torch.full(
+            (1,), pad_id, dtype=torch.long, device=self.device
+        )
+        self._forced_text_inject = torch.full(
+            (rows,), pad_id, dtype=torch.long, device=self.device
+        )
+
+    def _reset_pending_text_flags(self) -> None:
+        """Mark the LM's not-yet-emitted text slots as forced.
+
+        ``LMGen.step`` returns the text slot from ``max_delay`` steps back, so
+        that many slots are always in flight. Called when the LM timeline is
+        replaced: after fresh-session priming (the pending slots hold prompt
+        text) and after a snapshot restore (the pending slot holds the
+        quiet-boundary PAD the snapshot was captured at). Neither belongs in
+        the transcript or the natural pad streak.
+        """
+        self._pending_text_flags.clear()
+        self._pending_text_flags.extend(
+            [(True, False)] * self.lm_gen.max_delay
+        )
+
+    def _allocate_snapshot_staging(self) -> dict[str, torch.Tensor]:
+        """Pin one host buffer per LM streaming tensor for CPU-resident snapshots.
+
+        A pinned destination lets the capture enqueue asynchronous
+        device-to-host copies and release the inference lock before they
+        finish, so the frame loop is delayed by the copy engine time rather
+        than blocked for a synchronous pageable transfer. The LM state has
+        fixed shapes after ``streaming_forever``, so the pool is sized once.
+        Mimi's conv states change shape between reset and steady streaming
+        and total a few megabytes, so those copy directly.
+        """
+        if (
+            torch.device(self.device).type != "cuda"
+            or not torch.cuda.is_available()
+        ):
+            return {}
+        tensors, _metadata = self._flatten_live_streaming_state(self.lm_gen)
+        staging = {
+            key: torch.empty(
+                value.shape, dtype=value.dtype, device="cpu", pin_memory=True
+            )
+            for key, value in tensors.items()
+        }
+        pinned_bytes = sum(
+            value.numel() * value.element_size() for value in staging.values()
+        )
+        logger.info(
+            "snapshot staging pinned %d bytes across %d LM tensors",
+            pinned_bytes,
+            len(staging),
+        )
+        return staging
 
     def _set_inflight_phase(self, phase: str) -> None:
         # Written only from _process_audio_frame's execution scope (the
@@ -2457,6 +2566,7 @@ class ServerState:
             self.lm_gen.reset_turn_cap_tracking()
             self.mimi.reset_streaming()
             self.lm_gen.reset_streaming()
+            self._reset_pending_text_flags()
 
             self._clear_vision_pending()
             self._vision_pad_streak = 0
@@ -3957,23 +4067,15 @@ class ServerState:
                 # how many Mimi codes a chunk emits.
                 forced_text = None
                 if self._stop_response_latched:
-                    forced_text = torch.tensor(
-                        [[pad_id]], device=self.device, dtype=torch.long
-                    )
+                    forced_text = self._forced_text_pad
                 elif inject_token is not None and c == 0:
-                    if self.caption_cfg:
-                        # Context text conditions only the CFG conditional
-                        # row (0); the unconditional row (1) pads, keeping
-                        # the emitted timeline free of context tokens.
-                        forced_text = torch.tensor(
-                            [inject_token, pad_id],
-                            device=self.device,
-                            dtype=torch.long,
-                        )
-                    else:
-                        forced_text = torch.tensor(
-                            [[inject_token]], device=self.device, dtype=torch.long
-                        )
+                    # Row 0 carries the context token; under caption-CFG the
+                    # unconditional row 1 keeps its preset PAD so the emitted
+                    # timeline never carries context tokens. fill_ passes the
+                    # scalar as a kernel argument: no host-to-device copy, no
+                    # stream sync behind the Mimi encode just launched.
+                    self._forced_text_inject[0].fill_(inject_token)
+                    forced_text = self._forced_text_inject
 
                 interrupt_gate = self._interrupt_gate_remaining > 0
                 force_assistant_silence = (
@@ -3984,6 +4086,15 @@ class ServerState:
                 input_codes = codes[:, :, c: c + 1]
                 if context_ritual_frame and c == 0:
                     input_codes = self.lm_gen._encode_sine_frame()
+                # LMGen.step returns the text slot from max_delay steps back,
+                # so the flags describing the token it is about to emit are
+                # the ones recorded that many steps ago. Push this step's pair
+                # before the step; the pop after a real emission yields the
+                # emitted frame's pair. A None return consumed a slot without
+                # emitting, so its pair stays queued.
+                self._pending_text_flags.append(
+                    (forced_text is not None, interrupt_gate)
+                )
                 self._set_inflight_phase("lm_step")
                 tokens = self.lm_gen.step(
                     input_codes,
@@ -3996,6 +4107,7 @@ class ServerState:
                 )
                 if tokens is None:
                     continue
+                emitted_forced, emitted_gated = self._pending_text_flags.popleft()
                 assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
                 self._set_inflight_phase("mimi_decode")
                 # Row 0 only: Mimi's streaming state is single-row, and in
@@ -4009,9 +4121,9 @@ class ServerState:
                 pcm_np = main_pcm[0, 0].numpy()
                 self._set_inflight_phase("output_postprocess")
 
-                # Pre-gate RMS of the frame's natural decoded output; stays
-                # None on excluded frames (forced text or interrupt gate) so
-                # the starved-text telemetry below skips them.
+                # Pre-gate RMS of the emitted frame's natural decoded output;
+                # stays None on excluded frames (forced text or interrupt
+                # gate) so the starved-text telemetry below skips them.
                 natural_frame_rms = None
 
                 # Track how long the model's own audio has been silent so an
@@ -4021,8 +4133,10 @@ class ServerState:
                 # draining). Measured on the natural output before the gate.
                 # Frozen on forced (drip) frames like the pad streak, and
                 # also on interrupt frames, whose gated audio is not real
-                # model output to measure.
-                if forced_text is None and not interrupt_gate:
+                # model output to measure. The emitted frame's flags decide:
+                # the audio decoded here belongs to the same delayed slot as
+                # the text token below.
+                if not emitted_forced and not emitted_gated:
                     frame_rms = (
                         float(np.sqrt(np.mean(np.square(pcm_np))))
                         if pcm_np.size
@@ -4046,6 +4160,10 @@ class ServerState:
 
                 # Audio gate: silence outbound PCM while we're injecting
                 # or while a user interrupt is forcing the model to yield.
+                # Keyed on this step's flags, not the emitted frame's: the
+                # first gated step must cut the natural frame still in the
+                # pipeline, and the first ungated step plays a frame whose
+                # codes were already forced to silence.
                 pcm_np = self._gate_outbound_pcm(
                     pcm_np, forced_text is not None or interrupt_gate
                 )
@@ -4056,7 +4174,7 @@ class ServerState:
 
                 # Track pad streak on natural emissions only. Forced
                 # tokens don't represent the model's intent to be silent.
-                if forced_text is None:
+                if not emitted_forced:
                     if text_token == pad_id:
                         self._vision_pad_streak += 1
                     else:
@@ -4073,11 +4191,13 @@ class ServerState:
 
                 text = None
                 # Don't surface forced tokens in the visible transcript.
-                if forced_text is None and not interrupt_gate and text_token not in (0, 3):
+                if (
+                    not emitted_forced
+                    and not emitted_gated
+                    and text_token not in (0, 3)
+                ):
                     _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
                     text = _text.replace("▁", " ")
-                    # Keep a short rolling tail of natural text for the
-                    # vision-side transcript-context window.
                 if interrupt_gate:
                     self._interrupt_gate_remaining -= 1
                 results.append((pcm_np, text))
@@ -4646,7 +4766,34 @@ class ServerState:
             return None
         return int(free) + reusable
 
-    def _admit_snapshot(self, residency: str, tensor_bytes: int) -> int:
+    def _replaceable_ring_bytes(self, residency: str) -> int:
+        """Bytes the active session's rolling ring holds at ``residency``.
+
+        A periodic capture replaces that ring wholesale, so its entries stop
+        counting against the retained-byte budget the moment the new capture
+        publishes. Counting them anyway would need two full copies inside
+        the budget forever: 2 x 3.07 GiB for a two-row state with a 256-frame
+        sink exceeds the 6 GiB default even though only one is ever kept. The
+        free-memory floor still guards the transient overlap.
+        """
+        session_id = getattr(self, "_active_session_id", None)
+        if not session_id:
+            return 0
+        with self._snapshot_registry_lock:
+            history = getattr(self, "_session_snapshots", {}).get(session_id, [])
+            return sum(
+                tensor_bytes
+                for _captured_at, snapshot in history
+                if isinstance(snapshot, dict)
+                for held_residency, tensor_bytes in (
+                    self._snapshot_payload_stats(snapshot),
+                )
+                if held_residency == residency
+            )
+
+    def _admit_snapshot(
+        self, residency: str, tensor_bytes: int, *, replacing_bytes: int = 0
+    ) -> int:
         inventory = self._retained_snapshot_inventory()
         if residency == "cpu":
             retained = inventory["cpu_bytes"]
@@ -4675,6 +4822,7 @@ class ServerState:
             )
             budget_name = "GPU snapshot budget"
 
+        retained = max(0, retained - max(0, replacing_bytes))
         if retained + tensor_bytes > budget:
             raise SnapshotCapacityError(
                 f"{budget_name} rejected a {tensor_bytes}-byte capture"
@@ -4690,19 +4838,72 @@ class ServerState:
             )
         return free_before
 
-    def _take_snapshot(self, kind: str = "manual") -> dict:
-        """Atomically clone LM, Mimi, RNG, and turn-safety state."""
+    def _note_snapshot_failure(self, exc: BaseException) -> None:
+        metrics = getattr(self, "_runtime_metrics", None)
+        if metrics is None:
+            return
+        metrics.note_snapshot_failure(
+            reason_code=(
+                SNAPSHOT_FAILURE_BUDGET
+                if isinstance(exc, SnapshotCapacityError)
+                else SNAPSHOT_FAILURE_CAPTURE
+            ),
+            admission_rejected=isinstance(exc, SnapshotCapacityError),
+        )
+
+    def _stage_lm_snapshot(
+        self,
+        tensors: dict,
+        metadata: dict,
+        staging: dict[str, torch.Tensor],
+    ) -> tuple[dict, tuple[str, ...]]:
+        """Enqueue asynchronous copies of the LM tensors into pinned staging.
+
+        Stream order protects the sources: the next frame's kernels queue
+        behind these copies, so the inference lock can drop as soon as they
+        are enqueued. The returned dict aliases the shared staging buffers
+        until ``_finish_snapshot`` replaces them with pageable copies.
+        """
+        staged: dict = {}
+        for key, value in tensors.items():
+            buffer = staging.get(key)
+            if (
+                buffer is None
+                or buffer.shape != value.shape
+                or buffer.dtype != value.dtype
+            ):
+                raise RuntimeError(
+                    f"snapshot staging has no buffer for LM tensor {key} "
+                    f"with shape {tuple(value.shape)} and dtype {value.dtype}"
+                )
+            buffer.copy_(value, non_blocking=True)
+            staged[key] = buffer
+        staged_keys = tuple(staged)
+        staged.update(metadata)
+        return staged, staged_keys
+
+    def _stage_snapshot(self, kind: str = "manual") -> _StagedSnapshot:
+        """Clone LM, Mimi, RNG, and turn-safety state under the inference lock.
+
+        GPU-resident captures come back complete apart from their stream
+        synchronize. CPU-resident captures on CUDA copy the LM state into the
+        pinned staging pool asynchronously and return with the copies in
+        flight; ``_finish_snapshot`` must then run off the inference worker
+        to wait for them and move them to pageable memory. The pool is held
+        from here until then, so a second CPU capture inside that window is
+        deferred rather than queued behind it.
+        """
         started_at = time.perf_counter()
-        lock_acquired_at = started_at
-        clone_submitted_at = started_at
-        sync_ms = 0.0
         snapshot_device = torch.device(getattr(self, "device", "cpu"))
+        on_cuda = snapshot_device.type == "cuda" and torch.cuda.is_available()
         residency = (
             "cpu"
             if kind in {"baseline", "bookmark"} or snapshot_device.type != "cuda"
             else "gpu"
         )
-        metrics = getattr(self, "_runtime_metrics", None)
+        staging = getattr(self, "_snapshot_staging", {}) if residency == "cpu" else {}
+        staging_lock = getattr(self, "_snapshot_staging_lock", None)
+        holds_staging = False
         try:
             with self._infer_lock:
                 lock_acquired_at = time.perf_counter()
@@ -4748,62 +4949,144 @@ class ServerState:
                     value.numel() * value.element_size()
                     for value in tensor_values
                 )
-                free_before = self._admit_snapshot(residency, tensor_bytes)
+                free_before = self._admit_snapshot(
+                    residency,
+                    tensor_bytes,
+                    replacing_bytes=(
+                        self._replaceable_ring_bytes(residency)
+                        if kind == "periodic"
+                        else 0
+                    ),
+                )
+                # Mimi copies synchronously (pageable, a few megabytes) and
+                # must go first: a synchronous copy waits for everything
+                # queued ahead of it on the stream, so issuing it after the
+                # LM staging copies would hold the lock for the whole
+                # transfer. Measured on an A6000: 515 ms held versus a few
+                # milliseconds with this order.
+                mimi_state = self._clone_flattened_streaming_state(
+                    mimi_tensors,
+                    mimi_metadata,
+                    residency=residency,
+                )
+                staged_keys: tuple[str, ...] = ()
+                if staging:
+                    if staging_lock is None or not staging_lock.acquire(
+                        blocking=False
+                    ):
+                        raise SnapshotDeferred(
+                            "snapshot staging is still draining the previous capture"
+                        )
+                    holds_staging = True
+                    lm_state, staged_keys = self._stage_lm_snapshot(
+                        lm_tensors, lm_metadata, staging
+                    )
+                else:
+                    lm_state = self._clone_flattened_streaming_state(
+                        lm_tensors,
+                        lm_metadata,
+                        residency=residency,
+                    )
                 snapshot = {
                     "version": 2,
                     "captured_at": time.monotonic(),
                     "residency": residency,
                     "tensor_count": tensor_count,
                     "tensor_bytes": tensor_bytes,
-                    "lm": self._clone_flattened_streaming_state(
-                        lm_tensors,
-                        lm_metadata,
-                        residency=residency,
-                    ),
-                    "mimi": self._clone_flattened_streaming_state(
-                        mimi_tensors,
-                        mimi_metadata,
-                        residency=residency,
-                    ),
+                    "lm": lm_state,
+                    "mimi": mimi_state,
                     "rng_cpu": torch.get_rng_state().clone(),
                     "rng_cuda": None,
                 }
-                if self.device.type == "cuda" and torch.cuda.is_available():
+                if on_cuda:
                     snapshot["rng_cuda"] = torch.cuda.get_rng_state(
-                        _cuda_device_index(self.device)
+                        _cuda_device_index(snapshot_device)
                     ).clone()
+                copy_event: Optional[torch.cuda.Event] = None
+                if holds_staging and on_cuda:
+                    copy_event = torch.cuda.Event()
+                    copy_event.record()
                 clone_submitted_at = time.perf_counter()
-                if self.device.type == "cuda" and torch.cuda.is_available():
-                    sync_started_at = time.perf_counter()
-                    torch.cuda.synchronize(_cuda_device_index(self.device))
-                    sync_ms = (time.perf_counter() - sync_started_at) * 1000.0
-                free_after = self._snapshot_free_bytes(residency)
-                floor = (
-                    getattr(
-                        self,
-                        "_snapshot_host_free_floor_bytes",
-                        DEFAULT_SNAPSHOT_HOST_FREE_FLOOR_BYTES,
-                    )
-                    if residency == "cpu"
-                    else getattr(
-                        self,
-                        "_snapshot_gpu_free_floor_bytes",
-                        DEFAULT_SNAPSHOT_GPU_FREE_FLOOR_BYTES,
-                    )
-                )
-                if free_after is None or free_after < floor:
-                    raise SnapshotCapacityError(
-                        "snapshot capture could not preserve its configured "
-                        "free-memory floor"
-                    )
+            return _StagedSnapshot(
+                snapshot=snapshot,
+                kind=kind,
+                residency=residency,
+                holds_staging=holds_staging,
+                staged_keys=staged_keys,
+                copy_event=copy_event,
+                free_before=free_before,
+                started_at=started_at,
+                lock_acquired_at=lock_acquired_at,
+                clone_submitted_at=clone_submitted_at,
+            )
+        except SnapshotDeferred:
+            if holds_staging:
+                staging_lock.release()
+            raise
+        except Exception as exc:
+            if holds_staging:
+                staging_lock.release()
+            self._note_snapshot_failure(exc)
+            raise
 
+    def _finish_snapshot(self, staged: _StagedSnapshot) -> dict:
+        """Wait for a staged capture's copies, then publish it as a snapshot.
+
+        Runs on the inference worker for GPU-resident captures (their
+        synchronize is milliseconds) and on the snapshot executor for staged
+        CPU captures, where it waits on the copy event and clones the pinned
+        buffers into pageable memory. ``clone()`` allocates through the
+        default CPU allocator, so the retained tensors are pageable and the
+        pinned pool is free for the next capture once the staging lock drops.
+        """
+        snapshot = staged.snapshot
+        residency = staged.residency
+        snapshot_device = torch.device(getattr(self, "device", "cpu"))
+        sync_ms = 0.0
+        try:
+            if (
+                residency == "gpu"
+                and snapshot_device.type == "cuda"
+                and torch.cuda.is_available()
+            ):
+                sync_started_at = time.perf_counter()
+                torch.cuda.synchronize(_cuda_device_index(snapshot_device))
+                sync_ms = (time.perf_counter() - sync_started_at) * 1000.0
+            if staged.copy_event is not None:
+                sync_started_at = time.perf_counter()
+                staged.copy_event.synchronize()
+                sync_ms = (time.perf_counter() - sync_started_at) * 1000.0
+            if staged.staged_keys:
+                lm_state = snapshot["lm"]
+                for key in staged.staged_keys:
+                    lm_state[key] = lm_state[key].clone()
+            free_after = self._snapshot_free_bytes(residency)
+            floor = (
+                getattr(
+                    self,
+                    "_snapshot_host_free_floor_bytes",
+                    DEFAULT_SNAPSHOT_HOST_FREE_FLOOR_BYTES,
+                )
+                if residency == "cpu"
+                else getattr(
+                    self,
+                    "_snapshot_gpu_free_floor_bytes",
+                    DEFAULT_SNAPSHOT_GPU_FREE_FLOOR_BYTES,
+                )
+            )
+            if free_after is None or free_after < floor:
+                raise SnapshotCapacityError(
+                    "snapshot capture could not preserve its configured "
+                    "free-memory floor"
+                )
             finished_at = time.perf_counter()
-            clone_ms = (clone_submitted_at - lock_acquired_at) * 1000.0
-            total_ms = (finished_at - started_at) * 1000.0
+            clone_ms = (staged.clone_submitted_at - staged.lock_acquired_at) * 1000.0
+            total_ms = (finished_at - staged.started_at) * 1000.0
+            metrics = getattr(self, "_runtime_metrics", None)
             if metrics is not None:
                 metrics.record_snapshot_capture(
-                    tensor_count=tensor_count,
-                    tensor_bytes=tensor_bytes,
+                    tensor_count=snapshot["tensor_count"],
+                    tensor_bytes=snapshot["tensor_bytes"],
                     total_ms=total_ms,
                     clone_ms=clone_ms,
                     sync_ms=sync_ms,
@@ -4812,48 +5095,85 @@ class ServerState:
                         if residency == "cpu"
                         else SNAPSHOT_RESIDENCY_GPU
                     ),
-                    free_before_bytes=free_before,
+                    free_before_bytes=staged.free_before,
                     free_after_bytes=free_after,
                 )
             logger.info(
-                "snapshot capture session=%s kind=%s residency=%s "
+                "snapshot capture session=%s kind=%s residency=%s staged=%d "
                 "lock_wait_ms=%.1f clone_ms=%.1f sync_ms=%.1f "
                 "total_ms=%.1f tensors=%d bytes=%d free_before=%d "
                 "free_after=%d",
                 getattr(self, "_active_session_id", None) or "-",
-                kind,
+                staged.kind,
                 residency,
-                (lock_acquired_at - started_at) * 1000.0,
+                len(staged.staged_keys),
+                (staged.lock_acquired_at - staged.started_at) * 1000.0,
                 clone_ms,
                 sync_ms,
                 total_ms,
-                tensor_count,
-                tensor_bytes,
-                free_before,
+                snapshot["tensor_count"],
+                snapshot["tensor_bytes"],
+                staged.free_before,
                 free_after,
             )
             return snapshot
-        except SnapshotDeferred:
-            raise
         except Exception as exc:
-            if metrics is not None:
-                metrics.note_snapshot_failure(
-                    reason_code=(
-                        SNAPSHOT_FAILURE_BUDGET
-                        if isinstance(exc, SnapshotCapacityError)
-                        else SNAPSHOT_FAILURE_CAPTURE
-                    ),
-                    admission_rejected=isinstance(exc, SnapshotCapacityError),
-                )
+            self._note_snapshot_failure(exc)
             raise
+        finally:
+            if staged.holds_staging:
+                self._snapshot_staging_lock.release()
 
-    def _capture_bookmark_snapshot(self) -> tuple[dict | None, str]:
-        """Contain optional bookmark failures inside the inference worker."""
+    def _take_snapshot(self, kind: str = "manual") -> dict:
+        """Capture and finish a snapshot on the calling thread.
+
+        The periodic GPU-resident capture and the tests use this form. CPU
+        captures during a live session go through ``_capture_snapshot`` so
+        the finish phase does not block the frame loop.
+        """
+        return self._finish_snapshot(self._stage_snapshot(kind))
+
+    async def _capture_snapshot(self, kind: str) -> dict:
+        """Stage on the inference worker, finish off it, return the snapshot.
+
+        Cancellation never leaks the staging pool: a stage that completes
+        after its waiter was cancelled still gets its finish submitted, and a
+        cancelled finish wait leaves the running finish to release the pool.
+        """
+        loop = asyncio.get_running_loop()
+        stage_future = loop.run_in_executor(
+            self._infer_executor, self._stage_snapshot, kind
+        )
+        try:
+            staged = await asyncio.shield(stage_future)
+        except asyncio.CancelledError:
+
+            def _finish_orphan(done: asyncio.Future) -> None:
+                if done.cancelled() or done.exception() is not None:
+                    return
+                orphan = done.result()
+                if orphan.holds_staging:
+                    self._snapshot_executor.submit(self._finish_snapshot, orphan)
+
+            stage_future.add_done_callback(_finish_orphan)
+            raise
+        finish_executor = (
+            self._snapshot_executor if staged.holds_staging else self._infer_executor
+        )
+        finish_future = loop.run_in_executor(
+            finish_executor, self._finish_snapshot, staged
+        )
+        return await asyncio.shield(finish_future)
+
+    async def _capture_bookmark_snapshot(self) -> tuple[dict | None, str]:
+        """Contain optional bookmark failures; never raise into the control path."""
 
         try:
-            return self._take_snapshot("bookmark"), "stored"
+            return await self._capture_snapshot("bookmark"), "stored"
         except SnapshotDeferred:
             return None, "deferred"
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             logger.exception(
                 "bookmark snapshot rejected nonfatally: %s",
@@ -4903,6 +5223,7 @@ class ServerState:
         # path, not the conversation state being restored. Carrying them over
         # can manufacture an immediate forced-silence edge after rewind.
         self.lm_gen.reset_turn_cap_tracking()
+        self._reset_pending_text_flags()
         self._clear_vision_pending()
         self._clear_reinforce_pending()
         self._active_context_meta = {}
@@ -7185,20 +7506,10 @@ class ServerState:
                             type(exc).__name__,
                             exc,
                         )
-                    # Capture and CPU-tier the candidate off the event loop.
-                    # The worker wrapper contains optional allocation errors
-                    # so they never reach RTCSession._control_task_done.
-                    try:
-                        snap, capture_status = await loop.run_in_executor(
-                            self._infer_executor,
-                            self._capture_bookmark_snapshot,
-                        )
-                    except RuntimeError as exc:
-                        logger.exception(
-                            "bookmark executor failed nonfatally: %s",
-                            type(exc).__name__,
-                        )
-                        snap, capture_status = None, "rejected"
+                    # Stage on the inference worker, drain the copies off it.
+                    # The wrapper contains optional allocation errors so they
+                    # never reach RTCSession._control_task_done.
+                    snap, capture_status = await self._capture_bookmark_snapshot()
                     if capture_status == "deferred":
                         try:
                             session.send_event(
@@ -8198,21 +8509,7 @@ class ServerState:
             # manual Rewind remains available without periodic snapshots.
             if not resuming:
                 try:
-                    baseline_future = asyncio.ensure_future(
-                        loop.run_in_executor(
-                            self._infer_executor,
-                            self._take_snapshot,
-                            "baseline",
-                        )
-                    )
-                    try:
-                        baseline = await asyncio.shield(baseline_future)
-                    except asyncio.CancelledError:
-                        try:
-                            await baseline_future
-                        except BaseException:
-                            pass
-                        raise
+                    baseline = await self._capture_snapshot("baseline")
                     baseline_ts = time.monotonic()
                     with self._snapshot_registry_lock:
                         self._session_snapshots.setdefault(session_id, []).append(
@@ -9356,6 +9653,7 @@ def main():
             state._voice_window_embedder.unload()
         await asyncio.to_thread(state._voice_executor.shutdown, True)
         await asyncio.to_thread(state._infer_executor.shutdown, True)
+        await asyncio.to_thread(state._snapshot_executor.shutdown, True)
     app.on_cleanup.append(_close_http_session)
 
     web.run_app(app, host=args.host, port=args.port, ssl_context=ssl_context)

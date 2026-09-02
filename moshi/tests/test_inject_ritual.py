@@ -3,7 +3,9 @@
 A context drip must replicate the t=0 conditioning ritual (sine user
 channel, silent agent audio, forced text) and a fully delivered packet
 must be followed by a PAD hold so the injected sentence lands as a
-completed thought. Run directly:
+completed thought. The fake LM honors ``LMGen.step``'s delay contract (the
+returned text slot belongs to the previous step) so the transcript checks
+exercise the frame loop's slot attribution. Run directly:
 ``uv run python moshi/tests/test_inject_ritual.py``.
 """
 
@@ -37,8 +39,19 @@ class _FakeLmModel:
     dep_q = 8
 
 
+class _FakeTokenizer:
+    def id_to_piece(self, token: int) -> str:
+        return f"▁tok{token}"
+
+
 class _FakeLmGen:
-    """Records every step() call so tests can assert the exact ritual."""
+    """Records every step() call so tests can assert the exact ritual.
+
+    Mirrors the real delay contract: with ``max_delay == 1`` the text slot
+    of the returned frame is the token consumed by the previous step.
+    """
+
+    max_delay = 1
 
     def __init__(self) -> None:
         self.lm_model = _FakeLmModel()
@@ -47,6 +60,7 @@ class _FakeLmGen:
         self._zero = torch.full((1, 8, 1), ZERO_MARK, dtype=torch.long)
         self.steps: list[dict] = []
         self.natural_text_token = PAD_ID
+        self.pending_text = PAD_ID
 
     def _encode_sine_frame(self) -> torch.Tensor:
         return self._sine
@@ -64,7 +78,8 @@ class _FakeLmGen:
             }
         )
         tokens = torch.zeros(1, 9, 1, dtype=torch.long)
-        tokens[0, 0, 0] = self.natural_text_token if forced is None else forced
+        tokens[0, 0, 0] = self.pending_text
+        self.pending_text = self.natural_text_token if forced is None else forced
         return tokens
 
 
@@ -81,6 +96,7 @@ def _pipeline_state() -> tuple[ServerState, _FakeLmGen]:
     lm_gen = _FakeLmGen()
     state.lm_gen = lm_gen
     state.mimi = _FakeMimi()
+    state.text_tokenizer = _FakeTokenizer()
     state.device = "cpu"
     state.asr = None
     state.caption_cfg = False
@@ -90,6 +106,9 @@ def _pipeline_state() -> tuple[ServerState, _FakeLmGen]:
     state._active_session = None
     state._active_session_id = None
     state._main_loop = None
+    state._init_forced_text_buffers()
+    state._pending_text_flags = deque()
+    state._reset_pending_text_flags()
 
     # Inject machinery.
     state._vision_pending = deque()
@@ -359,6 +378,76 @@ def test_inbound_activity_counters_follow_processed_frames() -> None:
     assert state._mimi_encode_frames == 11
 
 
+def _surfaced(results: list[tuple[np.ndarray, str | None]]) -> list[str]:
+    return [text for _pcm, text in results if text is not None]
+
+
+def test_forced_tokens_never_surface_after_a_dropped_hold() -> None:
+    """The frame after a completed drip emits the drip's last token.
+
+    If the user starts speaking on that frame the PAD hold is abandoned and
+    the step runs unforced, so the emitted slot must be attributed to the
+    forced frame that produced it, not to the natural step that returned it.
+    """
+    state, _lm_gen = _pipeline_state()
+    state._vision_active.extend([41])
+    state._vision_active_meta = {"source": "ambient", "text": "scene"}
+
+    first = state._process_audio_frame(_silent_chunk())
+    second = state._process_audio_frame(_loud_chunk())
+
+    assert state._inject_seal_remaining == 0
+    assert _surfaced(first) == []
+    assert _surfaced(second) == []
+
+
+def test_persona_words_never_surface_when_speech_interrupts_the_drip() -> None:
+    state, lm_gen = _pipeline_state()
+    state._reinforce_enabled = True
+    state._reinforce_prompt_tokens = [61, 62, 63]
+    state._reinforce_prompt_text = "persona reminder"
+    state._last_reinforce_at = -1e18
+
+    first = state._process_audio_frame(_silent_chunk())
+    second = state._process_audio_frame(_loud_chunk())
+
+    assert [frame["forced_text"] for frame in lm_gen.steps] == [61, None]
+    assert _surfaced(first) == []
+    assert _surfaced(second) == []
+    # The frame that emitted the persona token must not count it as a
+    # natural non-PAD emission either.
+    assert state._vision_pad_streak == 8
+
+
+def test_natural_word_before_a_drip_still_reaches_the_transcript() -> None:
+    state, lm_gen = _pipeline_state()
+    lm_gen.natural_text_token = 500
+
+    natural = state._process_audio_frame(_silent_chunk())
+    # The natural word is now the pending slot; the next step is forced.
+    state._vision_active.extend([41, 42])
+    state._vision_active_meta = {"source": "ambient", "text": "scene"}
+    forced = state._process_audio_frame(_silent_chunk())
+
+    assert lm_gen.steps[1]["forced_text"] == 41
+    # The first frame returned the priming slot, which is never surfaced.
+    assert _surfaced(natural) == []
+    assert _surfaced(forced) == [" tok500"]
+
+
+def test_pending_slots_mark_priming_text_as_forced() -> None:
+    state, lm_gen = _pipeline_state()
+    lm_gen.pending_text = 77  # last token of the text prompt
+    lm_gen.natural_text_token = 500
+
+    first = state._process_audio_frame(_silent_chunk())
+    second = state._process_audio_frame(_silent_chunk())
+
+    assert _surfaced(first) == []
+    assert _surfaced(second) == [" tok500"]
+    assert state._vision_pad_streak == 0
+
+
 if __name__ == "__main__":
     tests = [
         test_drip_frames_ride_the_t0_ritual,
@@ -369,6 +458,10 @@ if __name__ == "__main__":
         test_stop_latch_frames_keep_real_mic_audio,
         test_typed_note_queues_at_manual_priority_and_drips,
         test_inbound_activity_counters_follow_processed_frames,
+        test_forced_tokens_never_surface_after_a_dropped_hold,
+        test_persona_words_never_surface_when_speech_interrupts_the_drip,
+        test_natural_word_before_a_drip_still_reaches_the_transcript,
+        test_pending_slots_mark_priming_text_as_forced,
     ]
     for test in tests:
         print(f"{test.__name__} ...")

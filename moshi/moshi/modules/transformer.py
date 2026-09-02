@@ -41,7 +41,7 @@ from torch.nn import functional as F
 
 from ..utils.compile import no_compile
 from .gating import make_gating
-from .rope import RotaryEmbedding
+from .rope import RotaryEmbedding, shift_rope
 from .streaming import StreamingModule, StreamingContainer
 
 
@@ -271,6 +271,10 @@ class RingKVCache:
         dim_per_head (int): Dimension per head.
         device (torch.device): Device on which to initialize the cache.
         dtype (torch.dtype): dtype to use for the cache.
+        sink (int): Leading slots pinned as attention sinks (0 disables).
+        rope_max_period (float, optional): RoPE period of the keys written
+            into the cache. Required to re-position sink keys once the ring
+            has evicted frames; None means the keys carry no rotary phase.
     """
 
     def __init__(
@@ -282,6 +286,7 @@ class RingKVCache:
         device: torch.device = torch.device("cuda"),
         dtype: torch.dtype = torch.bfloat16,
         sink: int = 0,
+        rope_max_period: tp.Optional[float] = None,
     ):
         self.capacity = capacity
         # Number of leading cache slots reserved as attention sinks: they are
@@ -295,12 +300,28 @@ class RingKVCache:
                 f"sink ({sink}) must satisfy 0 <= sink < capacity ({capacity})"
             )
         self.sink = sink
+        self.rope_max_period = rope_max_period
         self.cache = torch.zeros(
             (2, batch_size, num_heads, capacity, dim_per_head),
             device=device,
             dtype=dtype,
         )
         self.end_offset = torch.zeros(1, device=device, dtype=torch.long)
+        # Sink keys as written, rotated at their true positions [0, sink).
+        # Once the ring evicts frames, the sink slots of `cache` are refreshed
+        # from this buffer with the rotary phase advanced by the number of
+        # evicted frames, so the query sees the sinks at the positions they
+        # occupy in the cache (StreamingLLM's within-cache numbering) rather
+        # than at a relative distance that grows past the trained window.
+        # Recomputed from the pristine copy every step: shifting the cached
+        # slot incrementally would accumulate bf16 rounding.
+        self.sink_keys: tp.Optional[torch.Tensor] = None
+        if sink and rope_max_period is not None:
+            self.sink_keys = torch.zeros(
+                (batch_size, num_heads, sink, dim_per_head),
+                device=device,
+                dtype=dtype,
+            )
 
     def reset(self):
         self.end_offset.zero_()
@@ -325,9 +346,30 @@ class RingKVCache:
             )
         else:
             indexes = positions_written % self.capacity
+        if self.sink_keys is not None:
+            # Frames below `sink` also land in the pristine sink buffer; every
+            # other sink slot keeps its value, so the buffer freezes without a
+            # branch and without duplicate scatter indices.
+            slots = torch.arange(
+                self.sink, device=self.end_offset.device, dtype=torch.long
+            )
+            batch_index = slots - self.end_offset
+            written = (batch_index >= 0) & (batch_index < T)
+            incoming = k.index_select(2, batch_index.clamp(0, T - 1))
+            self.sink_keys.copy_(
+                torch.where(written.view(1, 1, -1, 1), incoming, self.sink_keys)
+            )
         self.cache[0].index_copy_(2, indexes, k)
         self.cache[1].index_copy_(2, indexes, v)
         self.end_offset.add_(T)
+        if self.sink_keys is not None:
+            # Within-cache position of sink i is i once the rolling window is
+            # full; its true position is i as well, so the phase advance equals
+            # the number of frames evicted so far, zero until the first wrap.
+            evicted = (self.end_offset - self.capacity).clamp(min=0)
+            self.cache[0][:, :, : self.sink] = shift_rope(
+                self.sink_keys, evicted, self.rope_max_period
+            )
 
         keys = self.cache[0]
         values = self.cache[1]
@@ -372,7 +414,10 @@ class RingKVCache:
         return KVCacheResult(keys, values, positions)
 
     def asdict(self):
-        return {"cache": self.cache, "end_offset": self.end_offset}
+        state = {"cache": self.cache, "end_offset": self.end_offset}
+        if self.sink_keys is not None:
+            state["sink_keys"] = self.sink_keys
+        return state
 
 
 @dataclass
@@ -428,7 +473,9 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
         self.num_heads = num_heads
         # Attention-sink frames pinned at the front of the ring cache; also
         # exempt from the sliding-window mask so they stay attendable past
-        # `context`. 0 disables the feature entirely.
+        # `context`. Keys are cached with RoPE applied, so the cache gets the
+        # rotary period to re-position the pinned keys after eviction.
+        # 0 disables the feature entirely.
         self.kv_sink = kv_sink
 
         out_dim = embed_dim
@@ -470,6 +517,7 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
             device,
             dtype,
             sink=self.kv_sink,
+            rope_max_period=None if self.rope is None else self.rope.max_period,
         )
         return _MHAState(
             kv_cache,
