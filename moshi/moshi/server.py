@@ -2581,6 +2581,20 @@ class ServerState:
                         "persona reinforcement disabled: persona text does "
                         "not fit the inject budget"
                     )
+                else:
+                    kept_words = len(self._reinforce_prompt_text.split())
+                    total_words = len(compact_persona.split())
+                    if kept_words < total_words:
+                        # The drip window is one inject budget, so a long
+                        # persona reinforces only its opening. Say so rather
+                        # than let the toggle imply the whole prompt recurs.
+                        logger.warning(
+                            "persona reinforcement drips the first %d of %d "
+                            "words (%d-token inject budget)",
+                            kept_words,
+                            total_words,
+                            VISION_QUEUE_MAX,
+                        )
             else:
                 self._reinforce_prompt_text = ""
                 self._reinforce_prompt_tokens = []

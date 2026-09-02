@@ -6,10 +6,8 @@ import { PreflightModal, VisionSourceModal, FrameModal } from "./components/Moda
 import { Badge, Flow, Level, RailColumn, Row, RTTGraph, Scope, TelemetryCell, VuMeter } from "./components/Telemetry.jsx";
 import { Icon } from "./components/icons.jsx";
 import {
-  ADHERENCE_MODES,
   DEFAULTS,
   DEFAULT_VISION_PROMPT,
-  EXPRESSION_MODES,
   HEARTBEAT_INTERVAL_MS,
   HEARTBEAT_MAX_PENDING,
   HEARTBEAT_MISSED_LIMIT,
@@ -536,10 +534,6 @@ function App() {
   // Holds at most one at a time, so starting a new preview supersedes any
   // in-flight one. Drives the row's play/stop glyph and waveform recolor.
   const [previewing, setPreviewing] = useState(null);
-  // Guardrail directives default on: a bare persona with no adherence or
-  // expression instruction wanders and monologues on a full-duplex model.
-  const [adherenceMode, setAdherenceMode] = useStoredState("pp_adherenceMode", "balanced");
-  const [expressionMode, setExpressionMode] = useStoredState("pp_expressionMode", "natural");
   const [turnHandling, setTurnHandling] = useStoredState(
     "pp_turnHandling",
     DEFAULTS.turnHandling,
@@ -1163,25 +1157,9 @@ function App() {
     () => customProfiles.find((profile) => profile.id === sessionProfileId) || null,
     [customProfiles, sessionProfileId],
   );
-  const selectedAdherence = useMemo(
-    () =>
-      ADHERENCE_MODES.find((item) => item.id === adherenceMode)
-      || ADHERENCE_MODES.find((item) => item.id === "none")
-      || ADHERENCE_MODES[0],
-    [adherenceMode],
-  );
-  const selectedExpression = useMemo(
-    () =>
-      EXPRESSION_MODES.find((item) => item.id === expressionMode)
-      || EXPRESSION_MODES.find((item) => item.id === "none")
-      || EXPRESSION_MODES[0],
-    [expressionMode],
-  );
   const systemPromptAtDefault =
     presetId === DEFAULT_PERSONA_PRESET.id &&
     textPrompt === DEFAULT_PERSONA_PRESET.prompt &&
-    adherenceMode === "none" &&
-    expressionMode === "none" &&
     !reinforceInSilences;
   const visionPromptAtDefault = visionPrompt === DEFAULT_VISION_PROMPT;
   const currentProfileSnapshot = useMemo(() => {
@@ -1189,12 +1167,10 @@ function App() {
     return {
       custom: true,
       label,
-      desc: `${selectedAdherence.label} · ${selectedExpression.label} · ${uploadedVoiceFilename ? "uploaded voice" : voice}`,
+      desc: `${PERSONA_PRESETS.find((item) => item.id === presetId)?.label || "Custom persona"} · ${uploadedVoiceFilename ? "uploaded voice" : voice}`,
       presetId,
       textPrompt,
       voice,
-      adherenceMode,
-      expressionMode,
       turnHandling,
       textTemp: Number(textTemp),
       textTopk: Number(textTopk),
@@ -1222,13 +1198,11 @@ function App() {
       seed: Number(seed),
     };
   }, [
-    adherenceMode,
     audioTemp,
     audioTopk,
     captionCfgGamma,
     autoGain,
     echoCancel,
-    expressionMode,
     maxTurn,
     noiseSupp,
     padBonus,
@@ -1239,8 +1213,6 @@ function App() {
     repPenalty,
     seed,
     seedRandom,
-    selectedAdherence,
-    selectedExpression,
     textPrompt,
     textTemp,
     textTopk,
@@ -1270,15 +1242,8 @@ function App() {
     setSessionProfileId("custom");
     setPresetId(DEFAULT_PERSONA_PRESET.id);
     setTextPrompt(DEFAULT_PERSONA_PRESET.prompt);
-    setAdherenceMode("none");
-    setExpressionMode("none");
     setReinforceInSilences(false);
-  }, [
-    setAdherenceMode,
-    setExpressionMode,
-    setReinforceInSilences,
-    setTextPrompt,
-  ]);
+  }, [setReinforceInSilences, setTextPrompt]);
 
   const resetVisionPromptDefault = useCallback(() => {
     setSessionProfileId("custom");
@@ -1308,16 +1273,6 @@ function App() {
       setVoiceBlend(false);
       clearUploadedVoice();
     }
-    setAdherenceMode(
-      ADHERENCE_MODES.some((item) => item.id === profile.adherenceMode)
-        ? profile.adherenceMode
-        : "none",
-    );
-    setExpressionMode(
-      EXPRESSION_MODES.some((item) => item.id === profile.expressionMode)
-        ? profile.expressionMode
-        : "none",
-    );
     if (profile.turnHandling === "assisted" || profile.turnHandling === "native") {
       setTurnHandling(profile.turnHandling);
     } else {
@@ -1396,13 +1351,11 @@ function App() {
     addNotice,
     clearUploadedVoice,
     uploadedVoiceFilename,
-    setAdherenceMode,
     setAudioTemp,
     setAudioTopk,
     setAutoGain,
     setCaptionCfgGamma,
     setEchoCancel,
-    setExpressionMode,
     setMaxTurn,
     setNoiseSupp,
     setPadBonus,
@@ -1436,34 +1389,7 @@ function App() {
     applySessionProfileData(allSessionProfiles.find((item) => item.id === id));
   };
 
-  const composeTextPrompt = useCallback(() => {
-    // Single-line, space-joined: the model's text tokenizer has no newline
-    // piece, so a paragraph break would reach it as byte-fallback tokens
-    // no training prompt ever contained (the server collapses whitespace
-    // too; joining here keeps the preview equal to what is tokenized).
-    return [textPrompt || "", selectedAdherence.instruction, selectedExpression.instruction]
-      .filter(Boolean)
-      .join(" ");
-  }, [selectedAdherence, selectedExpression, textPrompt]);
-
-  const resolvedTextPrompt = useMemo(() => composeTextPrompt(), [composeTextPrompt]);
-  const promptPreviewParts = useMemo(() => [
-    {
-      label: "Persona",
-      active: Boolean((textPrompt || "").trim()),
-      state: (textPrompt || "").trim() ? "base" : "empty",
-    },
-    {
-      label: "Adherence",
-      active: Boolean(selectedAdherence.instruction),
-      state: selectedAdherence.instruction ? selectedAdherence.label : "off",
-    },
-    {
-      label: "Expression",
-      active: Boolean(selectedExpression.instruction),
-      state: selectedExpression.instruction ? selectedExpression.label : "off",
-    },
-  ], [selectedAdherence, selectedExpression, textPrompt]);
+  const resolvedTextPrompt = textPrompt || "";
   const appliedConfig = serverAppliedConfig?.config && typeof serverAppliedConfig.config === "object"
     ? serverAppliedConfig.config
     : null;
@@ -1507,7 +1433,7 @@ function App() {
       // prompts send 1.0 so the contract stays uniform and the server's
       // preset path ignores it.
       clone_strength: uploadedVoiceFilename ? Number(cloneStrength) / 100 : 1.0,
-      text_prompt: composeTextPrompt(),
+      text_prompt: textPrompt || "",
       // An empty value delegates the canonical default to the server and
       // avoids appending a browser copy as additional observation focus.
       vision_prompt:
@@ -1548,7 +1474,7 @@ function App() {
     voiceB,
     blendMix,
     cloneStrength,
-    composeTextPrompt,
+    textPrompt,
     visionPrompt,
     visionPromptReplace,
     visionInTranscript,
@@ -1579,7 +1505,7 @@ function App() {
   ]);
 
   const buildConfigProfile = useCallback(() => {
-    const config = { ...buildConfigPayload(), text_prompt: textPrompt || "" };
+    const config = buildConfigPayload();
     if (uploadedVoiceFilename) {
       // Config files are portable settings, not private-media manifests.
       // Preserve the need to re-upload and the strength value without
@@ -1591,11 +1517,8 @@ function App() {
       exported_at: new Date().toISOString(),
       session_profile_id: sessionProfileId === "custom" ? "" : sessionProfileId,
       preset_id: presetId,
-      adherence_mode: adherenceMode,
-      expression_mode: expressionMode,
       voice_filter: { gender: voiceGender },
       config,
-      resolved_text_prompt: composeTextPrompt(),
       mic: {
         echo_cancellation: !!echoCancel,
         noise_suppression: !!noiseSupp,
@@ -1616,13 +1539,9 @@ function App() {
   }, [
     presetId,
     sessionProfileId,
-    adherenceMode,
-    expressionMode,
     voiceGender,
     uploadedVoiceFilename,
     buildConfigPayload,
-    composeTextPrompt,
-    textPrompt,
     echoCancel,
     noiseSupp,
     autoGain,
@@ -1649,16 +1568,6 @@ function App() {
     setSessionProfileId(allSessionProfiles.some((item) => item.id === profile?.session_profile_id) ? profile.session_profile_id : "custom");
     setPresetId(preset ? preset.id : "custom");
     setTextPrompt(text);
-    setAdherenceMode(
-      ADHERENCE_MODES.some((item) => item.id === profile?.adherence_mode)
-        ? profile.adherence_mode
-        : "none",
-    );
-    setExpressionMode(
-      EXPRESSION_MODES.some((item) => item.id === profile?.expression_mode)
-        ? profile.expression_mode
-        : "none",
-    );
     if (typeof config.vision_prompt === "string") setVisionPrompt(config.vision_prompt);
     setVisionPromptReplace(!!config.vision_prompt_replace);
     setVisionInTranscript(!!config.vision_in_transcript);
@@ -1768,7 +1677,7 @@ function App() {
     const interval = readNumber(profile?.vision?.interval_ms, visionIntervalMs);
     if (interval >= 1000 && interval <= 30000) setVisionIntervalMs(interval);
     setVisionCostLimitUsd(Math.max(0, readNumber(profile?.vision?.cost_limit_usd, visionCostLimitUsd)));
-  }, [addNotice, allSessionProfiles, clearUploadedVoice, cloneStrength, textPrompt, uploadedVoiceFilename, visionCostLimitUsd, visionIntervalMs, voiceList, setAdherenceMode, setExpressionMode, setAudioTemp, setTextTemp, setTextTopk, setTextMinP, setAudioTopk, setSemanticTempCap, setCaptionCfgGamma, setRepPenalty, setRepContext, setPadBonus, setTurnOnsetBias, setMaxTurn, setInjectSilenceRms, setInjectSilenceStreak, setSeedRandom, setSeed, setIdleTimeout, setTextPrompt, setVisionPrompt, setVisionPromptReplace, setVisionInTranscript, setVisionReactionMode, setReinforceInSilences, setVoice, setVoiceBlend, setVoiceB, setBlendMix, setCloneStrength, setEchoCancel, setNoiseSupp, setAutoGain, setOutputDeviceId, setTurnHandling, setVisionIntervalMs, setVisionCostLimitUsd]);
+  }, [addNotice, allSessionProfiles, clearUploadedVoice, cloneStrength, textPrompt, uploadedVoiceFilename, visionCostLimitUsd, visionIntervalMs, voiceList, setAudioTemp, setTextTemp, setTextTopk, setTextMinP, setAudioTopk, setSemanticTempCap, setCaptionCfgGamma, setRepPenalty, setRepContext, setPadBonus, setTurnOnsetBias, setMaxTurn, setInjectSilenceRms, setInjectSilenceStreak, setSeedRandom, setSeed, setIdleTimeout, setTextPrompt, setVisionPrompt, setVisionPromptReplace, setVisionInTranscript, setVisionReactionMode, setReinforceInSilences, setVoice, setVoiceBlend, setVoiceB, setBlendMix, setCloneStrength, setEchoCancel, setNoiseSupp, setAutoGain, setOutputDeviceId, setTurnHandling, setVisionIntervalMs, setVisionCostLimitUsd]);
 
   const exportConfig = useCallback(() => {
     const profile = JSON.stringify(buildConfigProfile(), null, 2);
@@ -1925,8 +1834,6 @@ function App() {
     const fields = [
       ["Prompt", currentProfileSnapshot.textPrompt, pinned.textPrompt],
       ["Voice", currentProfileSnapshot.voice, pinned.voice],
-      ["Adherence", currentProfileSnapshot.adherenceMode, pinned.adherenceMode],
-      ["Expression", currentProfileSnapshot.expressionMode, pinned.expressionMode],
       ["Turn handling", currentProfileSnapshot.turnHandling, pinned.turnHandling],
       ["Text t", currentProfileSnapshot.textTemp, pinned.textTemp],
       ["Text k", currentProfileSnapshot.textTopk, pinned.textTopk],
@@ -4862,38 +4769,6 @@ function App() {
                   <span>{textPrompt.length} / 2000</span>
                 </span>
               </div>
-              <div className="prompt-modes">
-                <Listbox
-                  label="Adherence"
-                  caption="Adherence"
-                  info="adherence"
-                  value={adherenceMode}
-                  options={ADHERENCE_MODES.map((mode) => ({
-                    value: mode.id,
-                    label: mode.label,
-                    desc: mode.desc,
-                  }))}
-                  onChange={(value) => {
-                    setAdherenceMode(value);
-                    setSessionProfileId("custom");
-                  }}
-                />
-                <Listbox
-                  label="Prompted style"
-                  caption="Prompted style"
-                  info="expression"
-                  value={expressionMode}
-                  options={EXPRESSION_MODES.map((mode) => ({
-                    value: mode.id,
-                    label: mode.label,
-                    desc: mode.desc,
-                  }))}
-                  onChange={(value) => {
-                    setExpressionMode(value);
-                    setSessionProfileId("custom");
-                  }}
-                />
-              </div>
               <details className="prompt-preview">
                 <summary>
                   <span className="prompt-preview-copy">
@@ -4903,17 +4778,9 @@ function App() {
                     </span>
                   </span>
                   <span className="prompt-preview-state mono">
-                    {promptPreviewParts.filter((part) => part.active).length} parts
+                    {appliedSystemPrompt ? "wrapped" : "persona"}
                   </span>
                 </summary>
-                <div className="prompt-preview-parts">
-                  {promptPreviewParts.map((part) => (
-                    <div className={cls("prompt-preview-part", part.active && "active")} key={part.label}>
-                      <span className="k">{part.label}</span>
-                      <span className="v">{part.state}</span>
-                    </div>
-                  ))}
-                </div>
                 {appliedConfig && (
                   <div className="prompt-preview-server">
                     <span className="k">Server</span>

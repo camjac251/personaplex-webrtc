@@ -105,69 +105,6 @@ export const START_BUSY_RETRY_DELAY_MS = 600;
 // smoothness rather than latency.
 export const JITTER_BUFFER_SMOOTH_SEC = 0.2;
 
-export const ADHERENCE_MODES = [
-  {
-    id: "balanced",
-    label: "Balanced",
-    desc: "Stay on role without sounding rigid.",
-    instruction:
-      "Adherence: follow the persona and task above, stay focused on the user's request, and stop when the answer is complete.",
-  },
-  {
-    id: "strict",
-    label: "Strict",
-    desc: "Prefer short, literal task completion.",
-    instruction:
-      "Adherence: treat the persona and task above as firm instructions. Do not drift into unrelated topics, do not keep talking after the task is answered, and ask one brief clarification if needed.",
-  },
-  {
-    id: "adaptive",
-    label: "Adaptive",
-    desc: "Follow the user when the conversation shifts.",
-    instruction:
-      "Adherence: keep the persona active, but adapt to the user's latest intent when they interrupt, correct, or redirect the conversation.",
-  },
-  {
-    id: "none",
-    label: "Off",
-    desc: "Do not append an adherence directive.",
-    instruction: "",
-  },
-];
-
-export const EXPRESSION_MODES = [
-  {
-    id: "natural",
-    label: "Natural",
-    desc: "Warm, brief, and practical.",
-    // Personality descriptors, not style directives: the released checkpoint
-    // learned its expressive range from conversation prompts written as facts
-    // about the speaker, and never saw meta-instructions about delivery.
-    instruction:
-      "You are warm and easygoing, and you keep what you say short and practical.",
-  },
-  {
-    id: "concise",
-    label: "Concise",
-    desc: "Minimal words and fast turn-taking.",
-    instruction:
-      "You are direct and economical with words, and you answer in a sentence or two unless someone asks for more.",
-  },
-  {
-    id: "expressive",
-    label: "Expressive",
-    desc: "Lively, laughs easily, reacts with feeling.",
-    instruction:
-      "You are lively and animated, you laugh easily, and you react with real feeling to what you hear.",
-  },
-  {
-    id: "none",
-    label: "Off",
-    desc: "Do not append an expression directive.",
-    instruction: "",
-  },
-];
-
 export const DEFAULTS = {
   textTemp: 0.7,
   textTopk: 25,
@@ -238,8 +175,6 @@ export const SESSION_PROFILES = [
     desc: "Stable defaults for natural full-duplex conversation.",
     presetId: "assistant",
     voice: "NATF1",
-    adherenceMode: "balanced",
-    expressionMode: "natural",
     turnHandling: "recommended",
     // Sampling fields intentionally inherit the active checkpoint defaults.
     // Base and the aligned checkpoint do not share the same safe values.
@@ -258,8 +193,6 @@ export const SESSION_PROFILES = [
     desc: "NVIDIA/Kyutai reference point: text 0.7, audio 0.8 on every level, no repetition penalty.",
     presetId: "assistant",
     voice: "NATF1",
-    adherenceMode: "none",
-    expressionMode: "none",
     turnHandling: "recommended",
     textTemp: 0.7,
     textTopk: 25,
@@ -285,18 +218,20 @@ export const SESSION_PROFILES = [
     desc: "Short, focused answers with quick turn handoff.",
     presetId: "assistant",
     voice: "NATF1",
-    adherenceMode: "strict",
-    expressionMode: "concise",
     turnHandling: "assisted",
+    // Cooler text sampling yields sooner; the persona text asks for short
+    // turns. No repetition penalty and the shipped cap: a penalty taxes the
+    // names and terms a task reply must repeat, and caps below 120 tokens
+    // force a pause into ordinary substantive answers.
     textTemp: 0.55,
     textTopk: 18,
     audioTemp: 0.65,
     audioTopk: 220,
     semanticTempCap: 0.65,
-    repPenalty: 1.1,
-    repContext: 80,
+    repPenalty: 1.0,
+    repContext: 64,
     padBonus: 0,
-    maxTurn: 80,
+    maxTurn: 120,
     echoCancel: false,
     noiseSupp: false,
     autoGain: false,
@@ -312,15 +247,13 @@ export const SESSION_PROFILES = [
     desc: "More vocal color while remaining interruption friendly.",
     presetId: "assistant",
     voice: "VARF4",
-    adherenceMode: "balanced",
-    expressionMode: "expressive",
     // Resolve to Native on the aligned checkpoint and Assisted on Base.
     // Keep checkpoint-specific overlap behavior separate from the sampling
     // preset instead of forcing the aligned model's Native mode onto Base.
     turnHandling: "recommended",
     // Text temperature stays at the reference 0.7: the text stream decides
     // turn timing, so heat there reads as talking over the user. Colour
-    // comes from the voice, the descriptor, and the audio levels.
+    // comes from the voice and the audio levels.
     textTemp: 0.7,
     textTopk: 25,
     audioTemp: 0.9,
@@ -345,18 +278,19 @@ export const SESSION_PROFILES = [
     desc: "Structured collection with low drift.",
     presetId: "medical",
     voice: "NATF2",
-    adherenceMode: "strict",
-    expressionMode: "concise",
     turnHandling: "assisted",
-    textTemp: 0.45,
-    textTopk: 12,
+    // Intake repeats field names and the caller's answers back, so the
+    // repetition penalty stays off; near-greedy text sampling was only
+    // tolerable with the penalty compensating, so text matches Concise.
+    textTemp: 0.55,
+    textTopk: 18,
     audioTemp: 0.55,
     audioTopk: 180,
     semanticTempCap: 0.55,
-    repPenalty: 1.1,
-    repContext: 96,
+    repPenalty: 1.0,
+    repContext: 64,
     padBonus: 0,
-    maxTurn: 90,
+    maxTurn: 120,
     echoCancel: false,
     noiseSupp: false,
     autoGain: false,
@@ -683,41 +617,16 @@ export const PARAM_INFO = {
       </>
     ),
   },
-  adherence: {
-    title: "Adherence",
-    body: (
-      <>
-        How tightly the model holds to the persona and task. <b>Balanced</b>{" "}
-        (the default) stays in role without sounding rigid, <b>Strict</b>{" "}
-        prefers short literal task completion, <b>Adaptive</b> follows you when
-        you redirect, <b>Off</b> sends the bare persona, which drifts and
-        monologues more. Added to the prompt on connect.
-      </>
-    ),
-  },
-  expression: {
-    title: "Prompted speaking style",
-    body: (
-      <>
-        A short personality descriptor appended to the system prompt, written
-        the way the model's conversation training prompts were (facts about
-        the speaker, never instructions about delivery); it does not change
-        the selected voice or audio sampler by itself. <b>Natural</b> (the
-        default) is warm and brief, <b>Concise</b> is direct and economical,
-        <b>Expressive</b> is lively, laughs easily, and reacts with feeling.
-        The voice prompt and the persona's situation carry most of the
-        expressive range; this only nudges it.
-      </>
-    ),
-  },
   reinforce: {
     title: "Reinforce in silences",
     body: (
       <>
         Quietly re-feeds the persona into the text channel during natural pauses
-        to fight drift on long sessions. Off by default because mid-stream
-        injection is off-distribution; enable only if the model wanders from its
-        role.
+        to fight drift on long sessions. One drip carries at most 32 tokens
+        (about 25 words), so a longer persona reinforces only its opening.
+        Off by default because mid-stream injection is off-distribution; with
+        the attention sink pinning the t=0 prompt, enable it only if the model
+        still wanders from its role.
       </>
     ),
   },
