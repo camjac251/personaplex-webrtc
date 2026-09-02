@@ -1437,9 +1437,13 @@ function App() {
   };
 
   const composeTextPrompt = useCallback(() => {
+    // Single-line, space-joined: the model's text tokenizer has no newline
+    // piece, so a paragraph break would reach it as byte-fallback tokens
+    // no training prompt ever contained (the server collapses whitespace
+    // too; joining here keeps the preview equal to what is tokenized).
     return [textPrompt || "", selectedAdherence.instruction, selectedExpression.instruction]
       .filter(Boolean)
-      .join("\n\n");
+      .join(" ");
   }, [selectedAdherence, selectedExpression, textPrompt]);
 
   const resolvedTextPrompt = useMemo(() => composeTextPrompt(), [composeTextPrompt]);

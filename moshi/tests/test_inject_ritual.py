@@ -25,6 +25,7 @@ from moshi.server import (  # noqa: E402
     INJECT_SILENCE_RMS_DEFAULT,
     INJECT_SILENCE_STREAK_DEFAULT,
     ServerState,
+    wrap_with_system_tags,
 )
 
 PAD_ID = 3
@@ -448,6 +449,57 @@ def test_pending_slots_mark_priming_text_as_forced() -> None:
     assert state._vision_pad_streak == 0
 
 
+def test_system_prompt_wrap_collapses_line_breaks() -> None:
+    """A multi-paragraph persona must reach the tokenizer as one line."""
+    wrapped = wrap_with_system_tags(
+        "You are Alex.\n\nAdherence: stay on task.\n  You laugh easily.  "
+    )
+    assert wrapped == (
+        "<system> You are Alex. Adherence: stay on task. You laugh easily. "
+        "<system>"
+    )
+    assert wrap_with_system_tags("<system> hi <system>\n") == "<system> hi <system>"
+
+
+class _EventSink:
+    def __init__(self) -> None:
+        self.events: list[tuple] = []
+        self.logs: list[tuple[str, str]] = []
+
+    def send_event(self, kind, text, level="info", data=None) -> None:
+        self.events.append((kind, level, data))
+
+    def log(self, level, text) -> None:
+        self.logs.append((level, text))
+
+
+def test_prefix_beyond_sink_warns_once_with_frame_counts() -> None:
+    state, lm_gen = _pipeline_state()
+    lm_gen.audio_silence_frame_cnt = 6
+    state.process_flags = {"kv_sink_frames": 256}
+    sink = _EventSink()
+
+    # voice 50 + 2 * 6 + 190 = 252 fits.
+    state._note_prefix_beyond_sink(sink, sink, voice_frames=50, text_tokens=190)
+    assert sink.events == []
+
+    # voice 69 + 12 + 200 = 281 overflows by 25 frames.
+    state._note_prefix_beyond_sink(sink, sink, voice_frames=69, text_tokens=200)
+    assert [e[0:2] for e in sink.events] == [("sink", "warn")]
+    assert sink.events[0][2] == {
+        "prefix_frames": 281,
+        "sink_frames": 256,
+        "text_tokens": 200,
+        "voice_frames": 69,
+    }
+    assert any("25 frames" in text for _level, text in sink.logs)
+
+    # No sink configured: nothing to pin, nothing to warn about.
+    state.process_flags = {"kv_sink_frames": 0}
+    state._note_prefix_beyond_sink(sink, sink, voice_frames=69, text_tokens=2000)
+    assert len(sink.events) == 1
+
+
 if __name__ == "__main__":
     tests = [
         test_drip_frames_ride_the_t0_ritual,
@@ -462,6 +514,8 @@ if __name__ == "__main__":
         test_persona_words_never_surface_when_speech_interrupts_the_drip,
         test_natural_word_before_a_drip_still_reaches_the_transcript,
         test_pending_slots_mark_priming_text_as_forced,
+        test_system_prompt_wrap_collapses_line_breaks,
+        test_prefix_beyond_sink_warns_once_with_frame_counts,
     ]
     for test in tests:
         print(f"{test.__name__} ...")

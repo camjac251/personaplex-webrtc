@@ -561,8 +561,14 @@ def _new_lifecycle_receipt(*, resuming: bool) -> dict[str, bool | int | str]:
 def wrap_with_system_tags(text: str) -> str:
     """Add system tags as the model expects if they are missing.
     Example: "<system> You enjoy talking with people. Have a deep conversation about technology. Your name is Jane. <system>"
+
+    Line breaks and runs of whitespace collapse to single spaces first. The
+    text tokenizer has no newline piece: a paragraph break encodes as two
+    <0x0A> byte-fallback tokens the dialogue fine-tune never produced, and
+    the word after it loses its word-boundary marker, so a multi-paragraph
+    persona tokenizes unlike any prompt the model trained on.
     """
-    cleaned = text.strip()
+    cleaned = " ".join(text.split())
     if cleaned.startswith("<system>") and cleaned.endswith("<system>"):
         return cleaned
     return f"<system> {cleaned} <system>"
@@ -2187,6 +2193,57 @@ class ServerState:
                 ]
             )
         return " ".join(parts)
+
+    def _note_prefix_beyond_sink(
+        self,
+        session: "RTCSession",
+        clog,
+        *,
+        voice_frames: int,
+        text_tokens: int,
+    ) -> None:
+        """Flag a t=0 prefix the attention sink cannot pin whole.
+
+        The sink pins positions [0, N) at startup, but the primed prefix is
+        per session: voice frames, two silence holds, and one frame per
+        text token. Past the 3000-frame context the unpinned tail of the
+        persona (its last sentences, usually the most specific ones) is the
+        part that evicts, while the beginning stays attendable.
+        """
+        sink = int(self.process_flags.get("kv_sink_frames", 0))
+        if sink <= 0:
+            return
+        prefix = (
+            voice_frames
+            + 2 * int(self.lm_gen.audio_silence_frame_cnt)
+            + text_tokens
+        )
+        if prefix <= sink:
+            return
+        clog.log(
+            "warning",
+            f"primed prefix {prefix} frames exceeds the {sink}-frame attention "
+            f"sink; the last {prefix - sink} frames of the persona evict after "
+            "the context window fills",
+        )
+        try:
+            session.send_event(
+                "sink",
+                "Persona prompt is longer than the attention sink; its tail "
+                "stops conditioning the model after about four minutes",
+                "warn",
+                {
+                    "prefix_frames": prefix,
+                    "sink_frames": sink,
+                    "text_tokens": text_tokens,
+                    "voice_frames": voice_frames,
+                },
+            )
+        except Exception as exc:
+            clog.log(
+                "warning",
+                f"sink notify failed: {type(exc).__name__}: {exc}",
+            )
 
     def _recent_auto_rewind_snapshot(
         self, session_id: str, now: Optional[float] = None
@@ -8482,6 +8539,12 @@ class ServerState:
                 clog.log(
                     "info",
                     f"timing: system prompts {(time.monotonic() - t_sp) * 1000:.0f} ms",
+                )
+                self._note_prefix_beyond_sink(
+                    session,
+                    clog,
+                    voice_frames=int(lifecycle_receipt["voice_prompt_frames"]),
+                    text_tokens=len(self.lm_gen.text_prompt_tokens or []),
                 )
                 warmup_done.set()
             # The model state is primed from here on: an unexpected
