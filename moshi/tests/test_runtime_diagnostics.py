@@ -846,6 +846,9 @@ def test_restore_waits_for_cuda_copy_completion() -> None:
     state.lm_gen._non_pad_streak = 0
     state.lm_gen._pad_force_remaining = 0
     state.lm_gen.max_delay = 1
+    # Persona-CFG floor: a caption boost in flight must fall back to it.
+    state.lm_gen.cfg_gamma_floor = 1.5
+    state.lm_gen.cfg_gamma = 2.0
     state._pending_text_flags = deque()
     state._clear_vision_pending = lambda: None
     state._clear_reinforce_pending = lambda: None
@@ -870,6 +873,7 @@ def test_restore_waits_for_cuda_copy_completion() -> None:
         torch.cuda.synchronize = original_synchronize
 
     assert sync_calls == [0]
+    assert state.lm_gen.cfg_gamma == 1.5
 
 
 def test_restore_preflights_both_modules_and_rng_before_any_apply() -> None:

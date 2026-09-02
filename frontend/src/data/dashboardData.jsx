@@ -113,6 +113,7 @@ export const DEFAULTS = {
   audioTopk: 250,
   semanticTempCap: 0.7,
   captionCfgGamma: 2.0,
+  personaCfgGamma: 1.0,
   repPenalty: 1.0,
   repContext: 64,
   padBonus: 0,
@@ -142,6 +143,7 @@ export const INFERENCE_RANGES = {
     audioTopk: { min: 100, max: 500, step: 1, integer: true },
     semanticTempCap: { min: 0.5, max: 0.8, step: 0.05 },
     captionCfgGamma: { min: 1, max: 3, step: 0.1 },
+    personaCfgGamma: { min: 1, max: 2.5, step: 0.1 },
     repPenalty: { min: 1, max: 1.3, step: 0.05 },
     repContext: { min: 0, max: 128, step: 8, integer: true },
     padBonus: { min: 0, max: 1, step: 0.1 },
@@ -158,6 +160,7 @@ export const INFERENCE_RANGES = {
     audioTopk: { min: 8, max: 2048, step: 1, integer: true },
     semanticTempCap: { min: 0.1, max: 1.5, step: 0.05 },
     captionCfgGamma: { min: 1, max: 4, step: 0.1 },
+    personaCfgGamma: { min: 1, max: 4, step: 0.1 },
     repPenalty: { min: 1, max: 2, step: 0.05 },
     repContext: { min: 0, max: 256, step: 8, integer: true },
     padBonus: { min: 0, max: 2, step: 0.1 },
@@ -349,6 +352,22 @@ export const PARAM_INFO = {
         Default <b>2.0</b>. Higher values make the next response follow visual
         context more strongly; <b>1.0</b> is neutral. Changes apply to the next
         completed caption and do not alter a boost already decaying.
+      </>
+    ),
+  },
+  personaCfg: {
+    title: "Persona guidance",
+    body: (
+      <>
+        Classifier-free guidance on the system prompt. Above <b>1.0</b> the
+        second streaming row is primed without the persona text, and the
+        text logits are pushed toward the persona-conditioned row by this
+        factor for the whole session: the model's word choices follow the
+        role more firmly. <b>1.0</b> (default) is off and leaves sampling
+        untouched; <b>1.5</b> is the usual starting point for prompt guidance
+        on language models. Higher values can flatten phrasing or repeat.
+        Set at connect time because it decides how the second row is primed;
+        needs a server started with caption-CFG.
       </>
     ),
   },

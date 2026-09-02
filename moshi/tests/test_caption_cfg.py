@@ -203,6 +203,49 @@ def test_gamma_one_does_not_mutate_the_graph_logits_buffer() -> None:
     assert torch.equal(logits, before)
 
 
+class _FakeLmModelWithDevice(_FakeLmModel):
+    device = torch.device("cpu")
+
+
+def _priming_lm_gen(*, caption_cfg: bool, persona_cfg: bool) -> tuple[LMGen, list]:
+    lm_gen = LMGen.__new__(LMGen)
+    lm_gen.lm_model = _FakeLmModelWithDevice()
+    lm_gen.caption_cfg = caption_cfg
+    lm_gen.persona_cfg = persona_cfg
+    lm_gen.text_prompt_tokens = [11, 12, 13]
+    lm_gen._zero_codes = torch.zeros(1, 8, 1, dtype=torch.long)
+    lm_gen._sine_codes = torch.ones(1, 8, 1, dtype=torch.long)
+    calls: list = []
+
+    def step(**kwargs):
+        calls.append(kwargs)
+
+    lm_gen.step = step
+    return lm_gen, calls
+
+
+def test_persona_cfg_primes_the_unconditional_row_with_pad() -> None:
+    lm_gen, calls = _priming_lm_gen(caption_cfg=True, persona_cfg=True)
+    lm_gen._step_text_prompt()
+    assert [c["text_token"].tolist() for c in calls] == [
+        [11, PAD_ID],
+        [12, PAD_ID],
+        [13, PAD_ID],
+    ]
+    # Audio conditioning stays shared: the ritual's silent agent frame and
+    # sine user frame broadcast across both rows.
+    assert all(torch.equal(c["moshi_tokens"], lm_gen._zero_codes) for c in calls)
+    assert all(torch.equal(c["input_tokens"], lm_gen._sine_codes) for c in calls)
+
+
+def test_prompt_rows_stay_identical_without_persona_cfg() -> None:
+    for caption_cfg, persona_cfg in ((True, False), (False, True), (False, False)):
+        lm_gen, calls = _priming_lm_gen(caption_cfg=caption_cfg, persona_cfg=persona_cfg)
+        lm_gen._step_text_prompt()
+        # A scalar token broadcasts to every row, so the rows prime alike.
+        assert [c["text_token"] for c in calls] == [11, 12, 13], (caption_cfg, persona_cfg)
+
+
 if __name__ == "__main__":
     tests = [
         test_gamma_amplifies_the_context_delta,
@@ -210,6 +253,8 @@ if __name__ == "__main__":
         test_rows_share_row_zero_audio_history,
         test_repetition_penalty_applies_to_the_single_guided_row,
         test_gamma_one_does_not_mutate_the_graph_logits_buffer,
+        test_persona_cfg_primes_the_unconditional_row_with_pad,
+        test_prompt_rows_stay_identical_without_persona_cfg,
     ]
     for test in tests:
         print(f"{test.__name__} ...")

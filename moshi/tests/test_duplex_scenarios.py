@@ -451,6 +451,7 @@ def test_runner_verifies_replay_config_and_concrete_seed() -> None:
         "inject_silence_rms": 0.004,
         "inject_silence_streak": 8,
         "caption_cfg_gamma": 2.0,
+        "persona_cfg_gamma": 1.0,
     }
     assert set(requested) == set(APPLIED_CONFIG_KEYS)
     assert _config_application_failures(requested, dict(requested)) == []

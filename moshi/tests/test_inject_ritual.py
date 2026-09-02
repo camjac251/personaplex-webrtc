@@ -500,6 +500,41 @@ def test_prefix_beyond_sink_warns_once_with_frame_counts() -> None:
     assert len(sink.events) == 1
 
 
+def test_caption_boost_decays_to_the_persona_floor() -> None:
+    """Persona-CFG raises the floor caption guidance relaxes back to."""
+    state, lm_gen = _pipeline_state()
+    state.caption_cfg = True
+    state._init_forced_text_buffers()
+    lm_gen.cfg_gamma_floor = 1.5
+    lm_gen.cfg_gamma = 1.5
+    state._caption_cfg_gamma = 2.0
+    state._vision_active.extend([41])
+    state._vision_active_meta = {"source": "ambient", "text": "scene"}
+
+    # Delivering the packet boosts to the caption target (above the floor).
+    state._process_audio_frame(_silent_chunk())
+    assert lm_gen.cfg_gamma == 2.0
+
+    # Each later frame relaxes toward the floor, never below it, and the
+    # boost snaps exactly onto the floor once it is within 0.01.
+    seen = []
+    for _ in range(400):
+        state._process_audio_frame(_silent_chunk())
+        seen.append(lm_gen.cfg_gamma)
+    assert all(later <= earlier for earlier, later in zip(seen, seen[1:]))
+    assert all(value >= 1.5 for value in seen)
+    assert seen[-1] == 1.5
+
+    # A caption target below the floor never lowers the live guidance.
+    state._caption_cfg_gamma = 1.2
+    state._vision_pad_streak = 8
+    state._audio_silence_streak = 8
+    state._vision_active.extend([41])
+    state._vision_active_meta = {"source": "ambient", "text": "scene two"}
+    state._process_audio_frame(_silent_chunk())
+    assert lm_gen.cfg_gamma == 1.5
+
+
 if __name__ == "__main__":
     tests = [
         test_drip_frames_ride_the_t0_ritual,
@@ -516,6 +551,7 @@ if __name__ == "__main__":
         test_pending_slots_mark_priming_text_as_forced,
         test_system_prompt_wrap_collapses_line_breaks,
         test_prefix_beyond_sink_warns_once_with_frame_counts,
+        test_caption_boost_decays_to_the_persona_floor,
     ]
     for test in tests:
         print(f"{test.__name__} ...")

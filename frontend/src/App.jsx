@@ -403,6 +403,7 @@ const TUNING_DEVIATION_FIELDS = [
   ["audio_topk", "audio top-k", "audioTopk"],
   ["semantic_temp_cap", "semantic temp", "semanticTempCap"],
   ["caption_cfg_gamma", "caption guidance", "captionCfgGamma"],
+  ["persona_cfg_gamma", "persona guidance", "personaCfgGamma"],
   ["repetition_penalty", "rep penalty", "repPenalty"],
   ["repetition_penalty_context", "rep context", "repContext"],
   ["padding_bonus", "pad bonus", "padBonus"],
@@ -443,6 +444,7 @@ function App() {
       "pp_audioTopkSlider",
       "pp_semanticTempCapSlider",
       "pp_captionCfgGammaSlider",
+      "pp_personaCfgGammaSlider",
       "pp_repPenaltySlider",
       "pp_repContextSlider",
       "pp_padBonusSlider",
@@ -571,6 +573,9 @@ function App() {
   const [audioTopk, setAudioTopk] = useStoredState("pp_audioTopkSlider", DEFAULTS.audioTopk, (value) => clampInferenceValue("audioTopk", value, DEFAULTS.audioTopk));
   const [semanticTempCap, setSemanticTempCap] = useStoredState("pp_semanticTempCapSlider", DEFAULTS.semanticTempCap, (value) => clampInferenceValue("semanticTempCap", value, DEFAULTS.semanticTempCap));
   const [captionCfgGamma, setCaptionCfgGamma] = useStoredState("pp_captionCfgGammaSlider", DEFAULTS.captionCfgGamma, (value) => clampInferenceValue("captionCfgGamma", value, DEFAULTS.captionCfgGamma));
+  // Connect-time only: it decides how the second CFG row is primed, so it
+  // is never part of the live tuning payload.
+  const [personaCfgGamma, setPersonaCfgGamma] = useStoredState("pp_personaCfgGammaSlider", DEFAULTS.personaCfgGamma, (value) => clampInferenceValue("personaCfgGamma", value, DEFAULTS.personaCfgGamma));
   const [repPenalty, setRepPenalty] = useStoredState("pp_repPenaltySlider", DEFAULTS.repPenalty, (value) => clampInferenceValue("repPenalty", value, DEFAULTS.repPenalty));
   const [repContext, setRepContext] = useStoredState("pp_repContextSlider", DEFAULTS.repContext, (value) => clampInferenceValue("repContext", value, DEFAULTS.repContext));
   const [padBonus, setPadBonus] = useStoredState("pp_padBonusSlider", DEFAULTS.padBonus, (value) => clampInferenceValue("padBonus", value, DEFAULTS.padBonus));
@@ -616,6 +621,7 @@ function App() {
         audioTopk,
         semanticTempCap,
         captionCfgGamma,
+        personaCfgGamma,
         repPenalty,
         repContext,
         padBonus,
@@ -1028,6 +1034,7 @@ function App() {
           setAudioTopk(nextDefaults.audioTopk);
           setSemanticTempCap(nextDefaults.semanticTempCap);
           setCaptionCfgGamma(nextDefaults.captionCfgGamma);
+          setPersonaCfgGamma(nextDefaults.personaCfgGamma);
           setRepPenalty(nextDefaults.repPenalty);
           setRepContext(nextDefaults.repContext);
           setPadBonus(nextDefaults.padBonus);
@@ -1051,6 +1058,7 @@ function App() {
     setAudioTemp,
     setAudioTopk,
     setCaptionCfgGamma,
+    setPersonaCfgGamma,
     setMaxTurn,
     setPadBonus,
     setRepContext,
@@ -1177,6 +1185,7 @@ function App() {
       audioTemp: Number(audioTemp),
       audioTopk: Number(audioTopk),
       captionCfgGamma: Number(captionCfgGamma),
+      personaCfgGamma: Number(personaCfgGamma),
       repPenalty: Number(repPenalty),
       repContext: Number(repContext),
       padBonus: Number(padBonus),
@@ -1201,6 +1210,7 @@ function App() {
     audioTemp,
     audioTopk,
     captionCfgGamma,
+    personaCfgGamma,
     autoGain,
     echoCancel,
     maxTurn,
@@ -1292,6 +1302,7 @@ function App() {
     setTextMinP(clampInferenceValue("textMinP", profile.textMinP, modelDefaults.textMinP));
     setSemanticTempCap(clampInferenceValue("semanticTempCap", profile.semanticTempCap, modelDefaults.semanticTempCap));
     setCaptionCfgGamma(clampInferenceValue("captionCfgGamma", profile.captionCfgGamma, modelDefaults.captionCfgGamma));
+    setPersonaCfgGamma(clampInferenceValue("personaCfgGamma", profile.personaCfgGamma, modelDefaults.personaCfgGamma));
     setAudioTemp(clampInferenceValue("audioTemp", profile.audioTemp, modelDefaults.audioTemp));
     setAudioTopk(clampInferenceValue("audioTopk", profile.audioTopk, modelDefaults.audioTopk));
     setRepPenalty(clampInferenceValue("repPenalty", profile.repPenalty, modelDefaults.repPenalty));
@@ -1355,6 +1366,7 @@ function App() {
     setAudioTopk,
     setAutoGain,
     setCaptionCfgGamma,
+    setPersonaCfgGamma,
     setEchoCancel,
     setMaxTurn,
     setNoiseSupp,
@@ -1455,6 +1467,7 @@ function App() {
       audio_topk: clampInferenceValue("audioTopk", audioTopk, DEFAULTS.audioTopk, tuningRangeMode),
       semantic_temp_cap: clampInferenceValue("semanticTempCap", semanticTempCap, DEFAULTS.semanticTempCap, tuningRangeMode),
       caption_cfg_gamma: clampInferenceValue("captionCfgGamma", captionCfgGamma, DEFAULTS.captionCfgGamma, tuningRangeMode),
+      persona_cfg_gamma: clampInferenceValue("personaCfgGamma", personaCfgGamma, DEFAULTS.personaCfgGamma, tuningRangeMode),
       repetition_penalty: clampInferenceValue("repPenalty", repPenalty, DEFAULTS.repPenalty, tuningRangeMode),
       repetition_penalty_context: clampInferenceValue("repContext", repContext, DEFAULTS.repContext, tuningRangeMode),
       padding_bonus: clampInferenceValue("padBonus", padBonus, DEFAULTS.padBonus, tuningRangeMode),
@@ -1490,6 +1503,7 @@ function App() {
     audioTopk,
     semanticTempCap,
     captionCfgGamma,
+    personaCfgGamma,
     repPenalty,
     repContext,
     padBonus,
@@ -1601,6 +1615,7 @@ function App() {
     setTextMinP(clampInferenceValue("textMinP", config.text_min_p, DEFAULTS.textMinP));
     setSemanticTempCap(clampInferenceValue("semanticTempCap", config.semantic_temp_cap, DEFAULTS.semanticTempCap));
     setCaptionCfgGamma(clampInferenceValue("captionCfgGamma", config.caption_cfg_gamma, DEFAULTS.captionCfgGamma));
+    setPersonaCfgGamma(clampInferenceValue("personaCfgGamma", config.persona_cfg_gamma, DEFAULTS.personaCfgGamma));
     setRepPenalty(clampInferenceValue("repPenalty", config.repetition_penalty, DEFAULTS.repPenalty));
     setRepContext(clampInferenceValue("repContext", config.repetition_penalty_context, DEFAULTS.repContext));
     setPadBonus(clampInferenceValue("padBonus", config.padding_bonus, DEFAULTS.padBonus));
@@ -1677,7 +1692,7 @@ function App() {
     const interval = readNumber(profile?.vision?.interval_ms, visionIntervalMs);
     if (interval >= 1000 && interval <= 30000) setVisionIntervalMs(interval);
     setVisionCostLimitUsd(Math.max(0, readNumber(profile?.vision?.cost_limit_usd, visionCostLimitUsd)));
-  }, [addNotice, allSessionProfiles, clearUploadedVoice, cloneStrength, textPrompt, uploadedVoiceFilename, visionCostLimitUsd, visionIntervalMs, voiceList, setAudioTemp, setTextTemp, setTextTopk, setTextMinP, setAudioTopk, setSemanticTempCap, setCaptionCfgGamma, setRepPenalty, setRepContext, setPadBonus, setTurnOnsetBias, setMaxTurn, setInjectSilenceRms, setInjectSilenceStreak, setSeedRandom, setSeed, setIdleTimeout, setTextPrompt, setVisionPrompt, setVisionPromptReplace, setVisionInTranscript, setVisionReactionMode, setReinforceInSilences, setVoice, setVoiceBlend, setVoiceB, setBlendMix, setCloneStrength, setEchoCancel, setNoiseSupp, setAutoGain, setOutputDeviceId, setTurnHandling, setVisionIntervalMs, setVisionCostLimitUsd]);
+  }, [addNotice, allSessionProfiles, clearUploadedVoice, cloneStrength, textPrompt, uploadedVoiceFilename, visionCostLimitUsd, visionIntervalMs, voiceList, setAudioTemp, setTextTemp, setTextTopk, setTextMinP, setAudioTopk, setSemanticTempCap, setCaptionCfgGamma, setPersonaCfgGamma, setRepPenalty, setRepContext, setPadBonus, setTurnOnsetBias, setMaxTurn, setInjectSilenceRms, setInjectSilenceStreak, setSeedRandom, setSeed, setIdleTimeout, setTextPrompt, setVisionPrompt, setVisionPromptReplace, setVisionInTranscript, setVisionReactionMode, setReinforceInSilences, setVoice, setVoiceBlend, setVoiceB, setBlendMix, setCloneStrength, setEchoCancel, setNoiseSupp, setAutoGain, setOutputDeviceId, setTurnHandling, setVisionIntervalMs, setVisionCostLimitUsd]);
 
   const exportConfig = useCallback(() => {
     const profile = JSON.stringify(buildConfigProfile(), null, 2);
@@ -1839,6 +1854,7 @@ function App() {
       ["Text k", currentProfileSnapshot.textTopk, pinned.textTopk],
       ["Audio t", currentProfileSnapshot.audioTemp, pinned.audioTemp],
       ["Audio k", currentProfileSnapshot.audioTopk, pinned.audioTopk],
+      ["Persona CFG", currentProfileSnapshot.personaCfgGamma, pinned.personaCfgGamma ?? DEFAULTS.personaCfgGamma],
       ["Rep", currentProfileSnapshot.repPenalty, pinned.repPenalty],
       ["Rep ctx", currentProfileSnapshot.repContext, pinned.repContext],
       ["Pad", currentProfileSnapshot.padBonus, pinned.padBonus],
@@ -3676,6 +3692,7 @@ function App() {
       audioTopk: clampInferenceValue("audioTopk", audioTopk, DEFAULTS.audioTopk, "safe"),
       semanticTempCap: clampInferenceValue("semanticTempCap", semanticTempCap, DEFAULTS.semanticTempCap, "safe"),
       captionCfgGamma: clampInferenceValue("captionCfgGamma", captionCfgGamma, DEFAULTS.captionCfgGamma, "safe"),
+      personaCfgGamma: clampInferenceValue("personaCfgGamma", personaCfgGamma, DEFAULTS.personaCfgGamma, "safe"),
       repPenalty: clampInferenceValue("repPenalty", repPenalty, DEFAULTS.repPenalty, "safe"),
       repContext: clampInferenceValue("repContext", repContext, DEFAULTS.repContext, "safe"),
       padBonus: clampInferenceValue("padBonus", padBonus, DEFAULTS.padBonus, "safe"),
@@ -3689,6 +3706,8 @@ function App() {
     setAudioTopk(next.audioTopk);
     setSemanticTempCap(next.semanticTempCap);
     setCaptionCfgGamma(next.captionCfgGamma);
+    // Connect-time only: not part of the live payload below.
+    setPersonaCfgGamma(next.personaCfgGamma);
     setRepPenalty(next.repPenalty);
     setRepContext(next.repContext);
     setPadBonus(next.padBonus);
@@ -3714,6 +3733,7 @@ function App() {
     audioTemp,
     audioTopk,
     captionCfgGamma,
+    personaCfgGamma,
     maxTurn,
     padBonus,
     repContext,
@@ -3723,6 +3743,7 @@ function App() {
     setAudioTemp,
     setAudioTopk,
     setCaptionCfgGamma,
+    setPersonaCfgGamma,
     setMaxTurn,
     setPadBonus,
     setRepContext,
@@ -3747,6 +3768,7 @@ function App() {
     setAudioTopk(modelDefaults.audioTopk);
     setSemanticTempCap(modelDefaults.semanticTempCap);
     setCaptionCfgGamma(modelDefaults.captionCfgGamma);
+    setPersonaCfgGamma(modelDefaults.personaCfgGamma);
     setRepPenalty(modelDefaults.repPenalty);
     setRepContext(modelDefaults.repContext);
     setPadBonus(modelDefaults.padBonus);
@@ -3777,6 +3799,7 @@ function App() {
     setAudioTemp,
     setAudioTopk,
     setCaptionCfgGamma,
+    setPersonaCfgGamma,
     setMaxTurn,
     setPadBonus,
     setRepContext,
@@ -5907,6 +5930,7 @@ function App() {
                     <MiniSlider label="Temperature" info="txtTemp" value={textTemp} onChange={(value) => { setTextTemp(value); setSessionProfileId("custom"); }} onCommit={guardedTuningCommit("textTemp", setTextTemp, (v) => ({ text_temperature: Number(v) }))} min={tuningRanges.textTemp.min} max={tuningRanges.textTemp.max} step={tuningRanges.textTemp.step} format={(v) => fmt(v, 2)} />
                     <MiniSlider label="Top-k" info="txtTopK" value={textTopk} onChange={(value) => { setTextTopk(value); setSessionProfileId("custom"); }} onCommit={guardedTuningCommit("textTopk", setTextTopk, (v) => ({ text_topk: Number.parseInt(v, 10) }))} min={tuningRanges.textTopk.min} max={tuningRanges.textTopk.max} step={tuningRanges.textTopk.step} format={(v) => fmt(v, 0)} />
                     <MiniSlider label="Min-p" info="txtMinP" value={textMinP} onChange={(value) => { setTextMinP(value); setSessionProfileId("custom"); }} onCommit={guardedTuningCommit("textMinP", setTextMinP, (v) => ({ text_min_p: Number(v) }))} min={tuningRanges.textMinP.min} max={tuningRanges.textMinP.max} step={tuningRanges.textMinP.step} format={(v) => fmt(v, 2)} />
+                    <MiniSlider label="Persona guidance" info="personaCfg" value={personaCfgGamma} onChange={(value) => { setPersonaCfgGamma(value); setSessionProfileId("custom"); }} min={tuningRanges.personaCfgGamma.min} max={tuningRanges.personaCfgGamma.max} step={tuningRanges.personaCfgGamma.step} format={(v) => (Number(v) > 1 ? fmt(v, 1) : "off")} />
                   </RailColumn>
                   <RailColumn title="AUDIO" aggregate={`t ${fmt(audioTemp, 2)} · k ${audioTopk}`}>
                     <MiniSlider label="Temperature" info="audTemp" value={audioTemp} onChange={(value) => { setAudioTemp(value); setSessionProfileId("custom"); }} onCommit={guardedTuningCommit("audioTemp", setAudioTemp, (v) => ({ audio_temperature: Number(v) }))} min={tuningRanges.audioTemp.min} max={tuningRanges.audioTemp.max} step={tuningRanges.audioTemp.step} format={(v) => fmt(v, 2)} />

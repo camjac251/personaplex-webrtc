@@ -80,6 +80,7 @@ def _run() -> dict:
             "inject_silence_rms": 0.004,
             "inject_silence_streak": 8,
             "caption_cfg_gamma": 2.0,
+            "persona_cfg_gamma": 1.0,
             "text_prompt_sha256": "f" * 64,
             "text_prompt_chars": 120,
             "system_prompt_sha256": "7" * 64,

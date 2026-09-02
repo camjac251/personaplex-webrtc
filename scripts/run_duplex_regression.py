@@ -108,6 +108,7 @@ APPLIED_CONFIG_KEYS = (
     "inject_silence_rms",
     "inject_silence_streak",
     "caption_cfg_gamma",
+    "persona_cfg_gamma",
 )
 OPERATIONAL_EVENT_TYPES = {
     "action_cancelled",

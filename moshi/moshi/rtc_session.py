@@ -913,9 +913,15 @@ class SessionConfig:
     inject_silence_rms: float = INJECT_SILENCE_RMS_DEFAULT
     inject_silence_streak: int = INJECT_SILENCE_STREAK_DEFAULT
     # Caption-CFG guidance boost applied when a context packet finishes
-    # delivering, decaying back to the neutral 1.0 between packets. Only
+    # delivering, decaying back to the guidance floor between packets. Only
     # meaningful on servers started in caption-CFG mode; ignored otherwise.
     caption_cfg_gamma: float = 2.0
+    # Persona-CFG: above 1.0, the unconditional row is primed without the
+    # persona text and text logits are guided toward the persona-conditioned
+    # row at this strength for the whole session (the floor caption boosts
+    # decay back to). Connect-time only, since it decides how the second row
+    # is primed; 1.0 leaves the rows primed identically.
+    persona_cfg_gamma: float = 1.0
     # Overlap ownership: native keeps barge-in with the model, assisted
     # force-stops the assistant on sustained server-observed overlap.
     turn_handling: str = "native"
@@ -1008,6 +1014,9 @@ def parse_session_config(payload: dict) -> SessionConfig:
         ),
         caption_cfg_gamma=clamp_caption_cfg_gamma(
             payload.get("caption_cfg_gamma", defaults.caption_cfg_gamma)
+        ),
+        persona_cfg_gamma=clamp_caption_cfg_gamma(
+            payload.get("persona_cfg_gamma", defaults.persona_cfg_gamma)
         ),
         turn_handling=clamp_turn_handling(
             payload.get("turn_handling", defaults.turn_handling)

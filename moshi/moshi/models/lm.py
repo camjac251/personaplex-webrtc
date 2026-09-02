@@ -849,6 +849,16 @@ class LMGen(StreamingModule[_LMGenState]):
         # and read once per frame outside the CUDA graphs, like
         # padding_bonus.
         self.cfg_gamma: float = 1.0
+        # Persona-CFG extends the two-row split to the t=0 text prompt: row 1
+        # receives PAD in every text-prompt frame, so the rows also differ
+        # by the persona and the guided delta amplifies role adherence, not
+        # only injected captions. Set at connect time before priming, never
+        # live: it decides what the unconditional row is primed with.
+        self.persona_cfg: bool = False
+        # The value cfg_gamma relaxes back to after a caption boost and is
+        # reset to on restore. 1.0 without persona-CFG; the session's persona
+        # guidance strength with it.
+        self.cfg_gamma_floor: float = 1.0
         self._non_pad_streak = 0
         self._turn_pad_streak = 0
         self._pad_force_remaining = 0
@@ -1860,13 +1870,29 @@ class LMGen(StreamingModule[_LMGenState]):
             if is_alive is not None and not await is_alive():
                 break
 
+    def _prompt_text_token(self, text_prompt_token: int):
+        """Per-row text token for one t=0 prompt frame.
+
+        Under persona-CFG the conditional row 0 receives the prompt token
+        and the unconditional row 1 receives PAD in the same slot, so the
+        two KV timelines stay frame-aligned and differ only by the persona
+        text. Otherwise the scalar broadcasts across every row.
+        """
+        if not (self.caption_cfg and self.persona_cfg):
+            return text_prompt_token
+        return torch.tensor(
+            [int(text_prompt_token), self.lm_model.text_padding_token_id],
+            dtype=torch.long,
+            device=self.lm_model.device,
+        )
+
     def _step_text_prompt_core(self) -> Iterator[None]:
         # text_prompt_tokens defaults to None; treat that as no prompt.
         for text_prompt_token in self.text_prompt_tokens or []:
             yield
             self.step(
                 moshi_tokens=self._encode_zero_frame(),
-                text_token=text_prompt_token,
+                text_token=self._prompt_text_token(text_prompt_token),
                 input_tokens=self._encode_sine_frame(),
             )
         logger.info("done loading text prompt")

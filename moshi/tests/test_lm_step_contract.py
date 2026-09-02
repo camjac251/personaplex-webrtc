@@ -141,12 +141,59 @@ def test_caption_cfg_natural_step_shares_one_sampled_token() -> None:
     assert torch.equal(out[0, 1:9], out[1, 1:9])
 
 
+def _kv_rows(gen: LMGen) -> torch.Tensor:
+    """Stack the main transformer's KV caches as [rows, everything else]."""
+    caches = []
+    for layer in gen.lm_model.transformer.layers:
+        cache = layer.self_attn._streaming_state.kv_cache.cache  # [2, B, H, T, D]
+        caches.append(cache.transpose(0, 1).flatten(1))
+    return torch.cat(caches, dim=1)
+
+
+def _primed(*, persona_cfg: bool, prompt: list[int]) -> LMGen:
+    gen = _tiny_lm_gen(caption_cfg=True)
+    # The shipped silence/sine codes exceed the tiny model's 64-entry
+    # cardinality; any fixed in-range codes exercise the same ritual.
+    gen._zero_codes = torch.zeros(1, 8, 1, dtype=torch.long)
+    gen._sine_codes = torch.ones(1, 8, 1, dtype=torch.long)
+    gen.persona_cfg = persona_cfg
+    gen.text_prompt_tokens = prompt
+    gen.step_system_prompts(None)
+    return gen
+
+
+def test_persona_cfg_priming_splits_the_rows_by_prompt_text_only() -> None:
+    prompt = [21, 22, 23, 24]
+
+    # Without persona-CFG both rows prime identically, so the transformer
+    # state is row-symmetric after the whole ritual.
+    gen = _primed(persona_cfg=False, prompt=prompt)
+    kv = _kv_rows(gen)
+    assert torch.equal(kv[0], kv[1])
+
+    # With it, row 1 saw PAD where row 0 saw the persona: the KV timelines
+    # differ, the text slots of the token cache hold [token, PAD], and the
+    # audio slots still match because the ritual's audio is shared.
+    gen = _primed(persona_cfg=True, prompt=prompt)
+    kv = _kv_rows(gen)
+    assert not torch.equal(kv[0], kv[1])
+    cache = gen._streaming_state.cache
+    assert torch.equal(cache[0, 1:9], cache[1, 1:9])
+    # The silence hold after the prompt forced PAD on both rows, so read the
+    # slot the last prompt frame wrote: one step per frame, text delay 0.
+    ct = cache.shape[2]
+    slot = (gen._streaming_state.offset - 1 - gen.audio_silence_frame_cnt) % ct
+    assert int(cache[0, 0, slot]) == prompt[-1]
+    assert int(cache[1, 0, slot]) == PAD_ID
+
+
 if __name__ == "__main__":
     tests = (
         test_returned_text_slot_lags_the_step_by_max_delay,
         test_natural_text_is_sampled_when_nothing_is_forced,
         test_caption_cfg_rows_share_audio_and_split_forced_text,
         test_caption_cfg_natural_step_shares_one_sampled_token,
+        test_persona_cfg_priming_splits_the_rows_by_prompt_text_only,
     )
     for test in tests:
         print(f"{test.__name__} ...")

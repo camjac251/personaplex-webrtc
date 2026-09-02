@@ -204,6 +204,7 @@ def test_parse_session_config_clamps_finite_values() -> None:
             "inject_silence_rms": 0,
             "inject_silence_streak": 999,
             "seed": SEED_MAX + 10,
+            "persona_cfg_gamma": 0.2,
         }
     )
     assert cfg.audio_temperature == TEMPERATURE_MIN
@@ -222,6 +223,7 @@ def test_parse_session_config_clamps_finite_values() -> None:
     assert cfg.inject_silence_rms == INJECT_SILENCE_RMS_MIN
     assert cfg.inject_silence_streak == INJECT_SILENCE_STREAK_MAX
     assert cfg.seed == SEED_MAX
+    assert cfg.persona_cfg_gamma == CAPTION_CFG_GAMMA_MIN
 
 
 def test_parse_session_config_rejects_non_finite_values() -> None:
@@ -239,6 +241,7 @@ def test_parse_session_config_rejects_non_finite_values() -> None:
         "vision_cost_per_call_usd",
         "inject_silence_rms",
         "caption_cfg_gamma",
+        "persona_cfg_gamma",
     )
     int_fields = (
         "seed",
@@ -296,6 +299,7 @@ def test_parse_session_config_preserves_valid_wire_values() -> None:
             "session_timeout_sec": "3600",
             "vision_cost_limit_usd": "2.5",
             "vision_cost_per_call_usd": "0.00012",
+            "persona_cfg_gamma": "1.5",
         }
     )
     assert cfg.voice_prompt == "voice.pt"
@@ -315,6 +319,7 @@ def test_parse_session_config_preserves_valid_wire_values() -> None:
     assert cfg.session_timeout_sec == 3600
     assert cfg.vision_cost_limit_usd == 2.5
     assert cfg.vision_cost_per_call_usd == 0.00012
+    assert cfg.persona_cfg_gamma == 1.5
 
 
 def test_turn_handling_contract() -> None:

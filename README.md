@@ -82,14 +82,17 @@ If you deploy behind NAT and need STUN to discover a server-reflexive candidate,
 | `PERSONAPLEX_HF_REPO` | Custom model repository override (optional) |
 | `PERSONAPLEX_HF_REVISION` | Override the pinned model revision (optional; required with a custom repo) |
 | `PERSONAPLEX_PERIODIC_SNAPSHOTS` | `0` by default; set `1` to enable 60 s snapshot refreshes for long-session auto-rewind |
-| `PERSONAPLEX_CAPTION_CFG` | `0` by default; set `1` for two-row caption guidance (roughly doubles temporal-LM compute) |
+| `PERSONAPLEX_CAPTION_CFG` | `0` by default; set `1` for two-row guidance (roughly doubles temporal-LM compute): caption guidance on injected context, and the dashboard's **Persona guidance** slider, which primes the second row without the persona and pushes text sampling toward the persona-conditioned row for the whole session (connect-time, off at 1.0) |
 | `PERSONAPLEX_KV_SINK_FRAMES` | `0` by default; the production profile uses `8` startup-time anchor frames |
 | `PERSONAPLEX_SNAPSHOT_GPU_BUDGET_GIB` | GPU snapshot budget, `6` by default |
 | `PERSONAPLEX_SNAPSHOT_GPU_FREE_FLOOR_GIB` | VRAM preserved across a GPU snapshot capture, `2` by default |
 | `PERSONAPLEX_SNAPSHOT_HOST_BUDGET_GIB` | CPU snapshot budget, `24` by default |
 | `PERSONAPLEX_SNAPSHOT_HOST_FREE_FLOOR_GIB` | Available host RAM preserved across capture, `4` by default |
 | `PERSONAPLEX_DEPFORMER_EARLY_EXIT` | Experimental codebook shortcut, `0` (off) by default; do not deploy without quality qualification |
-| `PERSONAPLEX_VOICE_PICKER` | `0` by default; set `1` with the `voice-selection` extra to enable CPU-only representative-window selection |
+| `PERSONAPLEX_VOICE_PICKER` | `0` by default; set `1` with transformers installed to enable CPU-only representative-window selection |
+| `PERSONAPLEX_ENABLE_ASR` | Supervisor-only (`scripts/run-personaplex.sh`): `1` passes `--enable-asr` to moshi-server for user-speech transcription; needs faster-whisper in the environment (`uv pip install "faster-whisper>=1.0"`) |
+| `PERSONAPLEX_ASR_MODEL` | Supervisor-only: faster-whisper model id passed as `--asr-model` when ASR is enabled (`small` by default) |
+| `PERSONAPLEX_RECORD_SESSIONS` | Supervisor-only: `1` passes `--record-sessions` so the assistant's audio is saved under `<voice-prompt-dir>/recordings` and served at `/api/recording/<session_id>` |
 | `SERVER_BUILD` | Optional immutable deployment identity: a full 40-64 character commit digest or `sha256:<64 hex>`; invalid labels report as `unknown` |
 | `WEBRTC_STUN_URLS` | Optional comma-separated STUN URLs for NAT'd hosts; empty means fully direct |
 

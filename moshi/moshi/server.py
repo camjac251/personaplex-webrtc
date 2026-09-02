@@ -3896,15 +3896,19 @@ class ServerState:
         lm_elapsed = 0.0
         with self._tracked_inference_lock():
             _rtf_t0 = time.perf_counter()
-            if self.caption_cfg and self.lm_gen.cfg_gamma > 1.0:
-                # Guidance relaxes toward the neutral conditional between
-                # packets; a completed packet re-boosts it below. Snap to
-                # exactly 1.0 near the floor so steady-state frames skip
-                # this branch entirely.
-                relaxed = 1.0 + (
-                    self.lm_gen.cfg_gamma - 1.0
-                ) * CAPTION_CFG_GAMMA_DECAY
-                self.lm_gen.cfg_gamma = relaxed if relaxed > 1.01 else 1.0
+            if self.caption_cfg:
+                # Guidance relaxes toward its floor between packets (1.0, or
+                # the persona-CFG strength); a completed packet re-boosts it
+                # below. Snap to the floor when close so steady-state frames
+                # skip the arithmetic entirely.
+                floor = self.lm_gen.cfg_gamma_floor
+                if self.lm_gen.cfg_gamma > floor:
+                    relaxed = floor + (
+                        self.lm_gen.cfg_gamma - floor
+                    ) * CAPTION_CFG_GAMMA_DECAY
+                    self.lm_gen.cfg_gamma = (
+                        relaxed if relaxed > floor + 0.01 else floor
+                    )
             if (
                 (user_turn_ended or stop_user_turn_ended)
                 and self._stop_response_latched
@@ -4283,8 +4287,10 @@ class ServerState:
                 self._inject_seal_remaining = CONTEXT_SEAL_HOLD_FRAMES
                 if self.caption_cfg:
                     # A fully delivered caption earns its guidance boost;
-                    # the per-frame decay above walks it back to 1.0.
-                    self.lm_gen.cfg_gamma = self._caption_cfg_gamma
+                    # the per-frame decay above walks it back to the floor.
+                    self.lm_gen.cfg_gamma = max(
+                        self._caption_cfg_gamma, self.lm_gen.cfg_gamma_floor
+                    )
                 # Require a new natural boundary before promoting another
                 # packet; the just-forced frames are not evidence of silence.
                 self._vision_pad_streak = 0
@@ -5301,8 +5307,9 @@ class ServerState:
         self._inject_seal_remaining = 0
         # The restored state predates whichever caption boosted guidance,
         # so an elevated gamma must not amplify a caption the restored KV
-        # never saw.
-        self.lm_gen.cfg_gamma = 1.0
+        # never saw. The persona floor stays: both rows were primed at t=0
+        # and the restored KV carries that split.
+        self.lm_gen.cfg_gamma = self.lm_gen.cfg_gamma_floor
         # The restored LM state predates any injected caption, so the
         # dedupe key must not keep treating that caption as delivered.
         self._last_injected_vision_key = ""
@@ -6119,6 +6126,10 @@ class ServerState:
             "inject_silence_streak": int(self._inject_silence_streak),
             "caption_cfg": bool(self.caption_cfg),
             "caption_cfg_gamma": float(self._caption_cfg_gamma),
+            # The floor as applied: 1.0 when persona-CFG is off or the
+            # process runs single-row, so the client can see a request that
+            # could not take effect.
+            "persona_cfg_gamma": float(self.lm_gen.cfg_gamma_floor),
         }
 
     def _fit_vision_context(self, caption: str) -> tuple[str, list[int]]:
@@ -7334,12 +7345,23 @@ class ServerState:
                     )
                 )
                 # Adopt this session's caption-CFG boost target and start
-                # from the neutral conditional; only completed packets
-                # raise the live gamma.
+                # from the guidance floor; only completed packets raise the
+                # live gamma above it. Persona-CFG decides, before priming,
+                # whether the unconditional row is primed without the
+                # persona; its strength is the floor.
                 self._caption_cfg_gamma = clamp_caption_cfg_gamma(
                     getattr(cfg, "caption_cfg_gamma", 2.0)
                 )
-                self.lm_gen.cfg_gamma = 1.0
+                persona_cfg_gamma = clamp_caption_cfg_gamma(
+                    getattr(cfg, "persona_cfg_gamma", 1.0)
+                )
+                self.lm_gen.persona_cfg = (
+                    self.caption_cfg and persona_cfg_gamma > 1.0
+                )
+                self.lm_gen.cfg_gamma_floor = (
+                    persona_cfg_gamma if self.lm_gen.persona_cfg else 1.0
+                )
+                self.lm_gen.cfg_gamma = self.lm_gen.cfg_gamma_floor
                 try:
                     session.send_config_applied(
                         self._applied_config_snapshot(),

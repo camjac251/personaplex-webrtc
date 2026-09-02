@@ -152,6 +152,7 @@ SESSION_FLOAT_FIELDS = {
     "vision_cost_per_call_usd",
     "inject_silence_rms",
     "caption_cfg_gamma",
+    "persona_cfg_gamma",
 }
 SESSION_HASH_FIELDS = {
     "text_prompt_sha256",
