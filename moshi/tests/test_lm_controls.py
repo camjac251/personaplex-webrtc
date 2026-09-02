@@ -16,6 +16,7 @@ sys.path.insert(0, "moshi")
 
 from moshi.models.lm import (  # noqa: E402
     DEFAULT_SEMANTIC_TEMPERATURE_CAP,
+    DENSE_TEXT_COLLAPSE_FRAMES,
     REPETITION_TURN_BREAK_FRAMES,
     LMGen,
     trim_boundary_silence,
@@ -259,11 +260,7 @@ def test_interrupt_force_window_works_with_turn_cap_disabled() -> None:
 
 
 def test_turn_cap_counts_across_short_natural_pauses() -> None:
-    lm_gen = LMGen.__new__(LMGen)
-    lm_gen.max_turn_text_tokens = 3
-    lm_gen._non_pad_streak = 0
-    lm_gen._turn_pad_streak = 0
-    lm_gen._pad_force_remaining = 0
+    lm_gen = _cap_lm_gen(3)
 
     def account(token: int, *, forced_text: bool = False) -> None:
         lm_gen._update_turn_cap(
@@ -296,6 +293,73 @@ def test_turn_cap_counts_across_short_natural_pauses() -> None:
     # External text injection/Stop padding never advances either counter.
     account(24, forced_text=True)
     assert lm_gen._non_pad_streak == 1
+
+
+def _cap_lm_gen(max_turn: int) -> LMGen:
+    lm_gen = LMGen.__new__(LMGen)
+    lm_gen.max_turn_text_tokens = max_turn
+    lm_gen._non_pad_streak = 0
+    lm_gen._turn_pad_streak = 0
+    lm_gen._dense_text_streak = 0
+    lm_gen._pad_force_remaining = 0
+    lm_gen._pad_force_reason = ""
+    return lm_gen
+
+
+def _account(lm_gen: LMGen, token: int, *, forced_text: bool = False) -> None:
+    lm_gen._update_turn_cap(
+        torch.tensor([token], dtype=torch.long),
+        3,
+        text_was_forced=forced_text,
+        turn_pad_forced=False,
+    )
+
+
+def test_runaway_text_trips_regardless_of_the_length_cap() -> None:
+    # Cap effectively off: a token on every frame still arms the PAD
+    # window once the dense streak is reached, and names the reason.
+    lm_gen = _cap_lm_gen(2000)
+    for _ in range(DENSE_TEXT_COLLAPSE_FRAMES - 1):
+        _account(lm_gen, 17)
+    assert lm_gen._pad_force_remaining == 0
+    _account(lm_gen, 17)
+    assert lm_gen._pad_force_remaining == REPETITION_TURN_BREAK_FRAMES
+    assert lm_gen._pad_force_reason == "dense"
+    assert lm_gen._dense_text_streak == 0
+
+    # Cap disabled entirely (server-built configs): the detector still runs.
+    lm_gen = _cap_lm_gen(0)
+    for _ in range(DENSE_TEXT_COLLAPSE_FRAMES):
+        _account(lm_gen, 17)
+    assert lm_gen._pad_force_reason == "dense"
+
+
+def test_speech_with_pads_between_words_never_reads_as_runaway() -> None:
+    lm_gen = _cap_lm_gen(2000)
+    # Two-token words separated by a single PAD frame, well past the
+    # dense limit in total tokens: the streak resets at every PAD.
+    for _ in range(3 * DENSE_TEXT_COLLAPSE_FRAMES):
+        _account(lm_gen, 11)
+        _account(lm_gen, 12)
+        _account(lm_gen, 3)
+    assert lm_gen._pad_force_remaining == 0
+    assert lm_gen._pad_force_reason == ""
+    # Forced context frames are excluded: a 32-token drip is not speech.
+    for _ in range(DENSE_TEXT_COLLAPSE_FRAMES):
+        _account(lm_gen, 41, forced_text=True)
+    assert lm_gen._dense_text_streak == 0
+    assert lm_gen._pad_force_remaining == 0
+
+
+def test_length_cap_trip_is_labelled_cap() -> None:
+    lm_gen = _cap_lm_gen(3)
+    _account(lm_gen, 11)
+    _account(lm_gen, 3)
+    _account(lm_gen, 12)
+    _account(lm_gen, 3)
+    _account(lm_gen, 13)
+    assert lm_gen._pad_force_remaining == REPETITION_TURN_BREAK_FRAMES
+    assert lm_gen._pad_force_reason == "cap"
 
 
 def test_boundary_silence_trim_keeps_guarded_speech() -> None:
@@ -364,6 +428,8 @@ def _bias_lm_gen() -> LMGen:
     lm_gen.turn_onset_bias = 0.0
     lm_gen.max_turn_text_tokens = 120
     lm_gen._non_pad_streak = 0
+    lm_gen._dense_text_streak = 0
+    lm_gen._pad_force_reason = ""
     lm_gen._forced_text_recent = False
     return lm_gen
 
@@ -611,6 +677,9 @@ if __name__ == "__main__":
         test_new_turn_clears_history_before_penalty,
         test_interrupt_force_window_works_with_turn_cap_disabled,
         test_turn_cap_counts_across_short_natural_pauses,
+        test_runaway_text_trips_regardless_of_the_length_cap,
+        test_speech_with_pads_between_words_never_reads_as_runaway,
+        test_length_cap_trip_is_labelled_cap,
         test_turn_onset_bias_lands_on_epad_logit,
         test_padding_bonus_is_continuation_only,
         test_padding_bonus_ungated_when_turn_cap_disabled,

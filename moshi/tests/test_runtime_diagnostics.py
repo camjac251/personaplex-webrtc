@@ -1128,35 +1128,45 @@ def test_outbound_gate_fades_at_mute_boundaries() -> None:
     assert np.array_equal(settled, ones)
 
 
-def test_cap_trips_below_default_do_not_feed_auto_rewind() -> None:
+def test_only_runaway_text_trips_feed_auto_rewind() -> None:
     class _Lm:
-        max_turn_text_tokens = 40
+        max_turn_text_tokens = 240
+        _pad_force_reason = "cap"
 
     state = ServerState.__new__(ServerState)
     state.lm_gen = _Lm()
     state._collapse_triggers = deque()
-    state._schedule_turn_cap_event = lambda _frames: None
+    events: list[tuple[int, str]] = []
+    state._schedule_turn_cap_event = lambda frames, reason="cap": events.append(
+        (frames, reason)
+    )
 
-    for now in (100.0, 110.0, 120.0):
+    # Reply-length cap trips are long answers, whatever the cap value.
+    for now, cap in ((100.0, 40), (110.0, 240), (120.0, 2000)):
+        state.lm_gen.max_turn_text_tokens = cap
         state._note_pad_force_edge(12, now=now)
     assert list(state._collapse_triggers) == []
+    assert events == [(12, "cap")] * 3
 
-    state.lm_gen.max_turn_text_tokens = 120
+    # A runaway text stream counts even with the cap effectively off.
+    state.lm_gen._pad_force_reason = "dense"
     state._note_pad_force_edge(12, now=130.0)
     assert len(state._collapse_triggers) == 1
+    assert events[-1] == (12, "dense")
     # Inside the qualifying gap: same-turn continuation, not new evidence.
     state._note_pad_force_edge(12, now=132.0)
     assert len(state._collapse_triggers) == 1
 
 
-def test_three_spaced_cap_trips_at_default_schedule_auto_rewind() -> None:
+def test_three_spaced_runaway_trips_schedule_auto_rewind() -> None:
     class _Lm:
-        max_turn_text_tokens = 120
+        max_turn_text_tokens = 2000
+        _pad_force_reason = "dense"
 
     state = ServerState.__new__(ServerState)
     state.lm_gen = _Lm()
     state._collapse_triggers = deque()
-    state._schedule_turn_cap_event = lambda _frames: None
+    state._schedule_turn_cap_event = lambda _frames, _reason="cap": None
     state._last_rewind_at = None
     state._active_session_id = "sid"
     state._session_snapshots = {"sid": [(0.0, {})]}
@@ -1179,7 +1189,8 @@ def test_collapse_without_snapshot_reports_instead_of_staying_silent() -> None:
     """Three spaced trips with no usable snapshot emit one collapse event."""
 
     class _Lm:
-        max_turn_text_tokens = 120
+        max_turn_text_tokens = 240
+        _pad_force_reason = "dense"
 
     class _Session:
         def __init__(self) -> None:
@@ -1196,7 +1207,7 @@ def test_collapse_without_snapshot_reports_instead_of_staying_silent() -> None:
         state = ServerState.__new__(ServerState)
         state.lm_gen = _Lm()
         state._collapse_triggers = deque()
-        state._schedule_turn_cap_event = lambda _frames: None
+        state._schedule_turn_cap_event = lambda _frames, _reason="cap": None
         state._last_rewind_at = None
         state._active_session_id = "sid"
         state._session_snapshots = {"sid": snapshots}
@@ -1216,7 +1227,7 @@ def test_collapse_without_snapshot_reports_instead_of_staying_silent() -> None:
     assert len(stale._active_session.events) == 1
     kind, text, level, data = stale._active_session.events[0]
     assert (kind, level) == ("collapse", "warn")
-    assert "3 turn caps" in text
+    assert "3 runaway text streams" in text
     assert data == {
         "triggers": 3,
         "window_sec": 30.0,
@@ -1262,9 +1273,14 @@ def test_turn_cap_event_reports_applied_limit() -> None:
     callback, kind, text, level, data = state._main_loop.called
     assert callback == state._active_session.send_event
     assert kind == "turn_cap"
-    assert "yielding" in text
+    assert "Maximum turn length" in text
     assert level == "warn"
-    assert data == {"max_turn_text_tokens": 80, "forced_frames": 12}
+    assert data == {"max_turn_text_tokens": 80, "forced_frames": 12, "reason": "cap"}
+
+    state._schedule_turn_cap_event(12, "dense")
+    _callback, _kind, text, _level, data = state._main_loop.called
+    assert "Runaway text stream" in text
+    assert data["reason"] == "dense"
 
 
 def test_stop_latch_releases_only_at_a_new_turn_boundary() -> None:
@@ -1411,7 +1427,7 @@ def test_auto_recovery_replaces_extreme_tuning() -> None:
     assert state.lm_gen.repetition_penalty == 1.0
     assert state.lm_gen.repetition_penalty_context == 64
     assert state.lm_gen.padding_bonus == 0.0
-    assert state.lm_gen.max_turn_text_tokens == 120
+    assert state.lm_gen.max_turn_text_tokens == 240
     assert state.lm_gen.repetition_reset is True
 
 
@@ -1467,8 +1483,8 @@ if __name__ == "__main__":
         test_context_seal_token_derivation_prefers_plain_period,
         test_stop_latch_hold_ceiling_releases_a_starved_latch,
         test_outbound_gate_fades_at_mute_boundaries,
-        test_cap_trips_below_default_do_not_feed_auto_rewind,
-        test_three_spaced_cap_trips_at_default_schedule_auto_rewind,
+        test_only_runaway_text_trips_feed_auto_rewind,
+        test_three_spaced_runaway_trips_schedule_auto_rewind,
         test_collapse_without_snapshot_reports_instead_of_staying_silent,
         test_turn_cap_event_reports_applied_limit,
         test_stop_latch_releases_only_at_a_new_turn_boundary,

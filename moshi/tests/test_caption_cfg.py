@@ -65,7 +65,9 @@ def _cfg_lm_gen(depth_rows: torch.Tensor) -> LMGen:
     lm_gen.max_turn_text_tokens = 0
     lm_gen._non_pad_streak = 0
     lm_gen._turn_pad_streak = 0
+    lm_gen._dense_text_streak = 0
     lm_gen._pad_force_remaining = 0
+    lm_gen._pad_force_reason = ""
     lm_gen.report_loss = False
     lm_gen.return_logits = False
     lm_gen._audio_temperature = torch.full((DEP_Q,), 0.8)

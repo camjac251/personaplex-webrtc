@@ -212,7 +212,7 @@ Vision path (when `GEMINI_API_KEY` is set and the user enables it):
 
 These come from the upstream model, not this packaging:
 
-- **Response looping**: under certain prompts the model can repeat itself. Native RL defaults leave repetition and PAD bias off so they do not distort learned turn timing; max-turn and auto-rewind remain circuit breakers, and the Advanced panel exposes anti-loop overrides.
+- **Response looping**: under certain prompts the model can repeat itself. Native RL defaults leave repetition and PAD bias off so they do not distort learned turn timing; the runaway-text detector (a token on every frame, which speech never produces) forces a pause and feeds auto-rewind independently of the max-turn length cap, and the Advanced panel exposes anti-loop overrides.
 - **Research checkpoint**: the default RL model is non-commercial and its published evaluation is automated. Conversation-data style can affect safety behavior; review the model card before deploying it beyond research or personal evaluation.
 - **Pipeline efficiency**: GPU utilisation is occasionally spiky; some kernels are not yet optimised.
 

@@ -121,7 +121,7 @@ def test_defaults_match_stable_conversation_tuning() -> None:
     assert defaults.repetition_penalty_context == 64
     assert defaults.padding_bonus == 0.0
     assert defaults.turn_onset_bias == 0.0
-    assert defaults.max_turn_text_tokens == 120
+    assert defaults.max_turn_text_tokens == 240
 
 
 def test_inject_silence_clamps() -> None:
@@ -156,10 +156,12 @@ def test_all_numeric_hard_bounds() -> None:
     assert clamp_repetition_penalty(10) == REPETITION_PENALTY_MAX
     assert clamp_repetition_penalty_context(-1) == REPETITION_PENALTY_CONTEXT_MIN
     assert clamp_repetition_penalty_context(10_000) == REPETITION_PENALTY_CONTEXT_MAX
-    assert clamp_padding_bonus(-1) == PADDING_BONUS_MIN
+    assert clamp_padding_bonus(-5) == PADDING_BONUS_MIN
     assert clamp_padding_bonus(10) == PADDING_BONUS_MAX
-    # The onset bias is the one signed clamp: negatives inside the band
-    # survive, only the extremes pin.
+    # Both biases are signed clamps: negatives inside the band survive,
+    # only the extremes pin. A negative padding bonus is the faster-pacing
+    # half of the dial.
+    assert clamp_padding_bonus(-0.5) == -0.5
     assert clamp_turn_onset_bias(-10) == TURN_ONSET_BIAS_MIN
     assert clamp_turn_onset_bias(10) == TURN_ONSET_BIAS_MAX
     assert clamp_turn_onset_bias(-1.5) == -1.5

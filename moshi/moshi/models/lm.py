@@ -64,6 +64,13 @@ MAX_REPETITION_CONTEXT = 256
 # there so the penalty suppresses within-turn token loops without
 # penalizing the next turn's natural opening words.
 REPETITION_TURN_BREAK_FRAMES = 12
+# Consecutive natural non-PAD text frames that mark a runaway text stream.
+# Speech puts PAD frames between words (about 3 tokens/s against the
+# 12.5 Hz frame rate), so a token on every frame for this long (3.2 s) is
+# the degenerate single-token loop signature. The detector forces the same
+# turn-break PAD window as the length cap and is what collapse detection
+# keys on, so the reply-length cap can be set for reply length alone.
+DENSE_TEXT_COLLAPSE_FRAMES = 40
 SILENCE_TOKENS = np.array([948, 243, 1178, 546, 1736, 1030, 1978, 2008], dtype=np.int64)
 
 # Floor for the acoustic sampling temperature tensor. The depformer divides
@@ -861,7 +868,12 @@ class LMGen(StreamingModule[_LMGenState]):
         self.cfg_gamma_floor: float = 1.0
         self._non_pad_streak = 0
         self._turn_pad_streak = 0
+        # Consecutive natural non-PAD frames; the runaway-text detector.
+        self._dense_text_streak = 0
         self._pad_force_remaining = 0
+        # Why the current forced-PAD window was armed: "cap" (reply length)
+        # or "dense" (runaway text). Only the latter is collapse evidence.
+        self._pad_force_reason = ""
         # True from a forced-text frame until the next naturally sampled
         # text token; holds the continuation-only padding bonus off while
         # the frozen _non_pad_streak still reads positive.
@@ -1578,12 +1590,9 @@ class LMGen(StreamingModule[_LMGenState]):
         turn_pad_forced: bool,
     ) -> None:
         event = getattr(self, "_turn_cap_token_event", None)
-        if (
-            event is None
-            or text_was_forced
-            or turn_pad_forced
-            or self.max_turn_text_tokens <= 0
-        ):
+        # The runaway-text detector needs the token even with the length
+        # cap disabled, so only forced frames skip the copy.
+        if event is None or text_was_forced or turn_pad_forced:
             return
         self._turn_cap_token_host.copy_(
             next_text_token[:1], non_blocking=True
@@ -1620,10 +1629,19 @@ class LMGen(StreamingModule[_LMGenState]):
         """
         self._non_pad_streak = 0
         self._turn_pad_streak = 0
+        self._dense_text_streak = 0
         self._pad_force_remaining = 0
+        self._pad_force_reason = ""
         self._forced_text_recent = False
         self._turn_cap_token_pending = False
         self._turn_cap_token_recorded = False
+
+    def _arm_pad_force(self, reason: str) -> None:
+        """Force the turn-break PAD window and record why."""
+        self._pad_force_remaining = REPETITION_TURN_BREAK_FRAMES
+        self._pad_force_reason = reason
+        self._non_pad_streak = 0
+        self._dense_text_streak = 0
 
     def _update_turn_cap(
         self,
@@ -1633,7 +1651,12 @@ class LMGen(StreamingModule[_LMGenState]):
         text_was_forced: bool,
         turn_pad_forced: bool,
     ) -> None:
-        """Count text across brief pauses, resetting at a real turn break."""
+        """Count text across brief pauses, resetting at a real turn break.
+
+        Two detectors share the read: the reply-length cap counts natural
+        tokens across short pauses, and the runaway-text detector counts
+        consecutive frames without a PAD, which speech never sustains.
+        """
         if text_was_forced:
             # The freeze keeps the cap count across the window; the flag
             # keeps the frozen streak from reading as text underway to the
@@ -1643,23 +1666,27 @@ class LMGen(StreamingModule[_LMGenState]):
         if turn_pad_forced:
             self._non_pad_streak = 0
             self._turn_pad_streak = 0
-            return
-        if self.max_turn_text_tokens <= 0:
-            self._non_pad_streak = 0
-            self._turn_pad_streak = 0
+            self._dense_text_streak = 0
             return
         token = self._read_turn_cap_token(next_text_token)
         if token in (0, pad_id):
+            self._dense_text_streak = 0
             self._turn_pad_streak += 1
             if self._turn_pad_streak >= REPETITION_TURN_BREAK_FRAMES:
                 self._non_pad_streak = 0
             return
         self._turn_pad_streak = 0
-        self._non_pad_streak += 1
         self._forced_text_recent = False
-        if self._non_pad_streak >= self.max_turn_text_tokens:
-            self._pad_force_remaining = REPETITION_TURN_BREAK_FRAMES
+        self._dense_text_streak += 1
+        if self._dense_text_streak >= DENSE_TEXT_COLLAPSE_FRAMES:
+            self._arm_pad_force("dense")
+            return
+        if self.max_turn_text_tokens <= 0:
             self._non_pad_streak = 0
+            return
+        self._non_pad_streak += 1
+        if self._non_pad_streak >= self.max_turn_text_tokens:
+            self._arm_pad_force("cap")
 
     def reset_repetition_state(self) -> None:
         """Clear turn-scoped repetition history without reallocating tensors."""

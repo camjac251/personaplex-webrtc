@@ -461,9 +461,13 @@ REPETITION_PENALTY_MIN = 1.0
 REPETITION_PENALTY_MAX = 2.0
 REPETITION_PENALTY_CONTEXT_MIN = 0
 REPETITION_PENALTY_CONTEXT_MAX = 256
-PADDING_BONUS_MIN = 0.0
-# The bonus adds directly to the PAD logit every step, so 2.0 is already
-# a ~7x yield bias; larger values effectively mute response onset.
+# The bonus adds directly to the mid-turn PAD logit every step. Positive
+# values pace words apart (above ~1.5 the voice hesitates and repeats to
+# fill the gaps); negative values suppress mid-turn pauses for a denser,
+# faster delivery. Turn ends are safe at -1.0: PAD dominates there by far
+# more than one logit. 2.0 is already a ~7x yield bias; larger values
+# effectively mute the reply.
+PADDING_BONUS_MIN = -1.0
 PADDING_BONUS_MAX = 2.0
 # Additive logit bias on the EPAD onset marker: negative delays speech
 # onset (more patient), positive hastens it (more eager). 4.0 already
@@ -476,11 +480,12 @@ TURN_ONSET_BIAS_MAX = 4.0
 # mode. "assisted" additionally arms the server-side sustained-overlap
 # detector in the frame loop.
 TURN_HANDLING_MODES = ("native", "assisted")
-# Keep the truncation circuit breaker meaningful for every user-supplied
-# configuration. Caps below the server's collapse-signal floor truncate
-# without feeding auto-rewind (see server.COLLAPSE_SIGNAL_MIN_TURN_TOKENS).
-# LMGen still supports 0 internally so manual interrupt force windows
-# remain independently testable.
+# Keep the reply-length cap meaningful for every user-supplied
+# configuration: below 40 tokens ordinary answers are truncated
+# mid-sentence. The cap is a length limit only; loop detection is the
+# server's runaway-text detector and does not depend on this value, so the
+# top of the range is effectively no cap. LMGen still supports 0 internally
+# so manual interrupt force windows remain independently testable.
 MAX_TURN_TEXT_TOKENS_MIN = 40
 MAX_TURN_TEXT_TOKENS_MAX = 2000
 SESSION_TIMEOUT_SEC_MIN = 0
@@ -894,7 +899,7 @@ class SessionConfig:
     # speech onset (more patient), positive hastens it (more eager). 0
     # disables it.
     turn_onset_bias: float = 0.0
-    max_turn_text_tokens: int = 120
+    max_turn_text_tokens: int = 240
     # Session length cap in seconds; 0 disables the watchdog (no time bound).
     # The client sends minutes converted to seconds, so the server stores and
     # compares seconds directly. Named for duration, not idle, so a future

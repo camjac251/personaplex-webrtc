@@ -118,7 +118,7 @@ export const DEFAULTS = {
   repContext: 64,
   padBonus: 0,
   turnOnsetBias: 0,
-  maxTurn: 120,
+  maxTurn: 240,
   turnHandling: "native",
   injectSilenceRms: 0.01,
   injectSilenceStreak: 6,
@@ -148,7 +148,7 @@ export const INFERENCE_RANGES = {
     repContext: { min: 0, max: 128, step: 8, integer: true },
     padBonus: { min: 0, max: 1, step: 0.1 },
     turnOnsetBias: { min: -1, max: 1, step: 0.1 },
-    maxTurn: { min: 40, max: 240, step: 10, integer: true },
+    maxTurn: { min: 40, max: 600, step: 10, integer: true },
   },
   // Expert bounds mirror the server clamps in moshi/rtc_session.py; a wider
   // slider would only promise values the server silently clamps away.
@@ -163,7 +163,7 @@ export const INFERENCE_RANGES = {
     personaCfgGamma: { min: 1, max: 4, step: 0.1 },
     repPenalty: { min: 1, max: 2, step: 0.05 },
     repContext: { min: 0, max: 256, step: 8, integer: true },
-    padBonus: { min: 0, max: 2, step: 0.1 },
+    padBonus: { min: -1, max: 2, step: 0.1 },
     turnOnsetBias: { min: -4, max: 4, step: 0.1 },
     maxTurn: { min: 40, max: 2000, step: 10, integer: true },
     injectSilenceRms: { min: 0.001, max: 0.02, step: 0.001 },
@@ -205,7 +205,9 @@ export const SESSION_PROFILES = [
     repPenalty: 1.0,
     repContext: 64,
     padBonus: 0,
-    maxTurn: 120,
+    // Upstream has no length cap at all; the top of the range is the
+    // closest the wire contract allows.
+    maxTurn: 2000,
     echoCancel: false,
     noiseSupp: false,
     autoGain: false,
@@ -222,10 +224,10 @@ export const SESSION_PROFILES = [
     presetId: "assistant",
     voice: "NATF1",
     turnHandling: "assisted",
-    // Cooler text sampling yields sooner; the persona text asks for short
-    // turns. No repetition penalty and the shipped cap: a penalty taxes the
-    // names and terms a task reply must repeat, and caps below 120 tokens
-    // force a pause into ordinary substantive answers.
+    // Cooler text sampling yields sooner, and the cap is the one profile
+    // value deliberately below the default: it is the short-answer limit
+    // (about a hundred words), not a loop guard. No repetition penalty: it
+    // taxes the names and terms a task reply must repeat.
     textTemp: 0.55,
     textTopk: 18,
     audioTemp: 0.65,
@@ -265,7 +267,7 @@ export const SESSION_PROFILES = [
     repPenalty: 1.0,
     repContext: 64,
     padBonus: 0,
-    maxTurn: 120,
+    maxTurn: 240,
     echoCancel: false,
     noiseSupp: false,
     autoGain: false,
@@ -477,14 +479,15 @@ export const PARAM_INFO = {
     title: "Padding bonus",
     body: (
       <>
-        Adds a logit boost to the silence/PAD token while the model is
-        mid-turn, so a running reply wraps up sooner. Onset is untouched: the
-        boost never competes with the model starting its reply (use Turn
-        onset bias for that). Default is <b>0</b> (off). It is also a pacing
-        control: the boost slows the text stream between words, and above
-        about <b>1.5</b> the voice hesitates and repeats words to fill the
-        gaps, which reads as stammering; high values can also cut replies
-        short.
+        A logit bias on the silence/PAD token while the model is mid-turn,
+        which makes it a pacing control. Positive values space words apart
+        and wrap replies up sooner; above about <b>1.5</b> the voice
+        hesitates and repeats words to fill the gaps, which reads as
+        stammering. Negative values (Expert, down to <b>-1</b>) suppress
+        mid-turn pauses for a denser, faster delivery. Onset is untouched
+        either way (use Turn onset bias for that), and turn ends stay safe:
+        PAD dominates there by far more than one logit. Default <b>0</b>{" "}
+        (off).
       </>
     ),
   },
@@ -504,14 +507,15 @@ export const PARAM_INFO = {
     title: "Max turn length",
     body: (
       <>
-        Hard cap for consecutive non-silence text tokens; it does nothing
-        until a reply reaches it, then forces about a second of silence.
-        Default <b>120</b> is roughly a hundred words (about 40 s of speech);
-        a degenerate loop emitting a token every frame reaches it in under
-        10 s, which is what collapse detection relies on. Caps of <b>120</b>{" "}
-        or more feed that detection (auto-rewind, when snapshots are enabled);
-        lower caps only truncate. The floor is <b>40</b> even in Expert mode,
-        and the Expert maximum of <b>2000</b> is effectively no cap.
+        Reply-length cap on consecutive non-silence text tokens; it does
+        nothing until a reply reaches it, then forces about a second of
+        silence. Default <b>240</b> is roughly two hundred words (about 80 s
+        of continuous speech), room for a full explanation while still
+        bounding a monologue. Loop detection does not depend on this value:
+        the server watches for a token on every frame, which speech never
+        produces, and that is what feeds auto-rewind. The floor is <b>40</b>{" "}
+        even in Expert mode, and the Expert maximum of <b>2000</b> is
+        effectively no cap.
       </>
     ),
   },

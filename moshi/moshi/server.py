@@ -877,16 +877,11 @@ PAD_STREAK_REREQUEST_EVERY = 62
 # Auto-rewind: if the LM safety net (max_turn_text_tokens) triggers this
 # many times within COLLAPSE_WINDOW_SEC, treat that as a sign the model
 # is wobbling and restore the latest snapshot in-place. The thresholds
-# are conservative; healthy sessions never get close.
+# are conservative; healthy sessions never get close. Only runaway-text
+# trips (a token on every frame, see DENSE_TEXT_COLLAPSE_FRAMES) count;
+# reply-length cap trips are long answers, not wobble, whatever the cap.
 COLLAPSE_TRIGGER_THRESHOLD = 3
 COLLAPSE_WINDOW_SEC = 30.0
-# A cap trip only counts as collapse evidence when the active cap is at
-# least the shipped default. Below that, ordinary replies trip the cap on
-# every substantive answer, so the "three in thirty seconds" calibration
-# would auto-rewind healthy conversations; a lowered cap is deliberate
-# truncation tuning, not wobble. The cap itself still forces PAD at any
-# configured value.
-COLLAPSE_SIGNAL_MIN_TURN_TOKENS = 120
 
 # Cooldown between auto-rewinds. Without this, a wobbling model state
 # can re-trigger pad-force right after a restore (the snapshotted state
@@ -2624,9 +2619,9 @@ class ServerState:
                     MAX_REPETITION_CONTEXT,
                 ),
             )
-            self.lm_gen.padding_bonus = max(0.0, cfg.padding_bonus)
-            # Negative values are valid (they delay onset), so re-clamp with
-            # the shared helper instead of flooring at zero.
+            # Both biases are signed, so re-clamp with the shared helpers
+            # instead of flooring at zero.
+            self.lm_gen.padding_bonus = clamp_padding_bonus(cfg.padding_bonus)
             self.lm_gen.turn_onset_bias = clamp_turn_onset_bias(
                 cfg.turn_onset_bias
             )
@@ -6325,18 +6320,19 @@ class ServerState:
     def _note_pad_force_edge(
         self, pad_force: int, now: Optional[float] = None
     ) -> None:
-        """Account one turn-cap firing for collapse detection.
+        """Account one forced-PAD firing for collapse detection.
 
-        Three qualifying trips inside COLLAPSE_WINDOW_SEC mean the model is
-        wobbling; restore the latest snapshot in place. Runs under the
-        inference lock the frame loop already holds.
+        Three qualifying runaway-text trips inside COLLAPSE_WINDOW_SEC mean
+        the model is wobbling; restore the latest snapshot in place. Runs
+        under the inference lock the frame loop already holds.
         """
         if now is None:
             now = time.monotonic()
-        self._schedule_turn_cap_event(pad_force)
-        if self.lm_gen.max_turn_text_tokens < COLLAPSE_SIGNAL_MIN_TURN_TOKENS:
-            # A user-lowered cap trips on ordinary replies; counting those
-            # as wobble would auto-rewind healthy conversations.
+        reason = getattr(self.lm_gen, "_pad_force_reason", "") or "cap"
+        self._schedule_turn_cap_event(pad_force, reason)
+        if reason != "dense":
+            # A reply-length cap trip is a long answer, not evidence of a
+            # loop; counting it would auto-rewind healthy conversations.
             return
         cutoff = now - COLLAPSE_WINDOW_SEC
         while self._collapse_triggers and self._collapse_triggers[0] < cutoff:
@@ -6423,7 +6419,7 @@ class ServerState:
         if snapshot_age_sec is not None:
             data["snapshot_age_sec"] = round(float(snapshot_age_sec), 1)
         text = (
-            f"Collapse detected ({trigger_count} turn caps in "
+            f"Collapse detected ({trigger_count} runaway text streams in "
             f"{COLLAPSE_WINDOW_SEC:.0f} s) with no recent snapshot to rewind "
             "to; enable periodic snapshots or lower the sampling heat"
         )
@@ -6442,6 +6438,7 @@ class ServerState:
         """Start a new cap accounting window without cancelling an interrupt."""
         self.lm_gen._non_pad_streak = 0
         self.lm_gen._turn_pad_streak = 0
+        self.lm_gen._dense_text_streak = 0
         # Any in-flight token copy belongs to the accounting window being
         # discarded; a stale pending flag would otherwise satisfy the next
         # read with an abandoned frame's token.
@@ -6453,23 +6450,29 @@ class ServerState:
         # state as already observed so it cannot manufacture a new cap edge.
         self._prev_pad_force_remaining = self.lm_gen._pad_force_remaining
 
-    def _schedule_turn_cap_event(self, pad_force: int) -> None:
-        """Surface a cap transition from the inference worker safely."""
+    def _schedule_turn_cap_event(self, pad_force: int, reason: str = "cap") -> None:
+        """Surface a forced-PAD transition from the inference worker safely."""
         sess = self._active_session
         loop = self._main_loop
         if sess is None or loop is None:
             return
+        text = (
+            "Runaway text stream (a token every frame); yielding"
+            if reason == "dense"
+            else "Maximum turn length reached; yielding"
+        )
         try:
             loop.call_soon_threadsafe(
                 sess.send_event,
                 "turn_cap",
-                "Maximum turn length reached; yielding",
+                text,
                 "warn",
                 {
                     "max_turn_text_tokens": int(
                         self.lm_gen.max_turn_text_tokens
                     ),
                     "forced_frames": int(pad_force),
+                    "reason": reason,
                 },
             )
         except Exception as exc:
@@ -6551,7 +6554,7 @@ class ServerState:
         self.lm_gen.padding_bonus = 0.0
         self.lm_gen.turn_onset_bias = 0.0
         self.lm_gen.min_p_text = 0.0
-        self.lm_gen.max_turn_text_tokens = 120
+        self.lm_gen.max_turn_text_tokens = 240
         self.lm_gen.reset_repetition_state()
         self._reset_turn_cap_tracking_for_config_change()
 
