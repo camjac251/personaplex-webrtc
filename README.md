@@ -82,7 +82,7 @@ If you deploy behind NAT and need STUN to discover a server-reflexive candidate,
 | `PERSONAPLEX_HF_REPO` | Custom model repository override (optional) |
 | `PERSONAPLEX_HF_REVISION` | Override the pinned model revision (optional; required with a custom repo) |
 | `PERSONAPLEX_PERIODIC_SNAPSHOTS` | `0` by default; set `1` to enable 60 s snapshot refreshes for long-session auto-rewind |
-| `PERSONAPLEX_CAPTION_CFG` | `0` by default; set `1` for two-row guidance (roughly doubles temporal-LM compute): caption guidance on injected context, and the dashboard's **Persona guidance** slider, which primes the second row without the persona and pushes text sampling toward the persona-conditioned row for the whole session (connect-time, off at 1.0) |
+| `PERSONAPLEX_CAPTION_CFG` | `0` by default; set `1` for two-row guidance (roughly doubles temporal-LM compute): caption guidance on injected context, and the dashboard's **Persona guidance** slider, which primes the second row without the persona and pushes text sampling toward the persona-conditioned row for the whole session (connect-time, default 1.5, off at 1.0) |
 | `PERSONAPLEX_KV_SINK_FRAMES` | `0` by default; the production profile uses `256` so the whole t=0 prefix (voice frames, two silence holds, one frame per prompt token; 73 to 193 for the shipped presets) stays pinned past the 3000-frame context. Anchor keys are re-positioned to their within-cache RoPE phase after eviction; the server warns when a session's prefix outgrows the sink. Each pinned frame comes out of the rolling window |
 | `PERSONAPLEX_SNAPSHOT_GPU_BUDGET_GIB` | GPU snapshot budget, `6` by default |
 | `PERSONAPLEX_SNAPSHOT_GPU_FREE_FLOOR_GIB` | VRAM preserved across a GPU snapshot capture, `2` by default |

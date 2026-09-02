@@ -925,8 +925,10 @@ class SessionConfig:
     # persona text and text logits are guided toward the persona-conditioned
     # row at this strength for the whole session (the floor caption boosts
     # decay back to). Connect-time only, since it decides how the second row
-    # is primed; 1.0 leaves the rows primed identically.
-    persona_cfg_gamma: float = 1.0
+    # is primed; 1.0 leaves the rows primed identically. 1.5 is the usual
+    # prompt-guidance strength on language models and the dashboard default;
+    # it is inert on a single-row (non caption-CFG) server.
+    persona_cfg_gamma: float = 1.5
     # Overlap ownership: native keeps barge-in with the model, assisted
     # force-stops the assistant on sustained server-observed overlap.
     turn_handling: str = "native"

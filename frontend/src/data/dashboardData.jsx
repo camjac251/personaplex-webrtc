@@ -113,7 +113,10 @@ export const DEFAULTS = {
   audioTopk: 250,
   semanticTempCap: 0.7,
   captionCfgGamma: 2.0,
-  personaCfgGamma: 1.0,
+  // 1.5 is the value prompt-guidance work on language models converges on
+  // (adherence up, fluency intact); it is untested on this model and 1.0
+  // turns it off.
+  personaCfgGamma: 1.5,
   repPenalty: 1.0,
   repContext: 64,
   padBonus: 0,
@@ -205,8 +208,9 @@ export const SESSION_PROFILES = [
     repPenalty: 1.0,
     repContext: 64,
     padBonus: 0,
-    // Upstream has no length cap at all; the top of the range is the
-    // closest the wire contract allows.
+    // Upstream has no guidance and no length cap at all; the top of the
+    // range is the closest the wire contract allows for the cap.
+    personaCfgGamma: 1.0,
     maxTurn: 2000,
     echoCancel: false,
     noiseSupp: false,
@@ -365,11 +369,12 @@ export const PARAM_INFO = {
         second streaming row is primed without the persona text, and the
         text logits are pushed toward the persona-conditioned row by this
         factor for the whole session: the model's word choices follow the
-        role more firmly. <b>1.0</b> (default) is off and leaves sampling
-        untouched; <b>1.5</b> is the usual starting point for prompt guidance
-        on language models. Higher values can flatten phrasing or repeat.
-        Set at connect time because it decides how the second row is primed;
-        needs a server started with caption-CFG.
+        role more firmly. Default <b>1.5</b>, the usual value for prompt
+        guidance on language models; <b>1.0</b> is off and leaves the model's
+        own sampling untouched (the Upstream profile). Higher values can
+        flatten phrasing or repeat. Set at connect time because it decides
+        how the second row is primed; needs a server started with
+        caption-CFG.
       </>
     ),
   },
