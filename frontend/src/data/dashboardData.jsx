@@ -480,8 +480,11 @@ export const PARAM_INFO = {
         Adds a logit boost to the silence/PAD token while the model is
         mid-turn, so a running reply wraps up sooner. Onset is untouched: the
         boost never competes with the model starting its reply (use Turn
-        onset bias for that). Default is <b>0</b> (off); high values can cut
-        replies short.
+        onset bias for that). Default is <b>0</b> (off). It is also a pacing
+        control: the boost slows the text stream between words, and above
+        about <b>1.5</b> the voice hesitates and repeats words to fill the
+        gaps, which reads as stammering; high values can also cut replies
+        short.
       </>
     ),
   },
@@ -501,11 +504,14 @@ export const PARAM_INFO = {
     title: "Max turn length",
     body: (
       <>
-        Hard cap for consecutive non-silence text tokens. Default <b>120</b> is
-        about ten seconds of sustained talk. Caps of <b>120</b> or more also
-        feed collapse detection (auto-rewind, when periodic snapshots are
-        enabled); lower caps only truncate the turn. The floor is <b>40</b>
-        even in Expert mode.
+        Hard cap for consecutive non-silence text tokens; it does nothing
+        until a reply reaches it, then forces about a second of silence.
+        Default <b>120</b> is roughly a hundred words (about 40 s of speech);
+        a degenerate loop emitting a token every frame reaches it in under
+        10 s, which is what collapse detection relies on. Caps of <b>120</b>{" "}
+        or more feed that detection (auto-rewind, when snapshots are enabled);
+        lower caps only truncate. The floor is <b>40</b> even in Expert mode,
+        and the Expert maximum of <b>2000</b> is effectively no cap.
       </>
     ),
   },
