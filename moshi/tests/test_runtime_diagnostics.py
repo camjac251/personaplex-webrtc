@@ -1153,9 +1153,12 @@ def test_only_runaway_text_trips_feed_auto_rewind() -> None:
     state._note_pad_force_edge(12, now=130.0)
     assert len(state._collapse_triggers) == 1
     assert events[-1] == (12, "dense")
-    # Inside the qualifying gap: same-turn continuation, not new evidence.
-    state._note_pad_force_edge(12, now=132.0)
+    # Inside the qualifying gap: a double-count of the same trip, not new
+    # evidence; one full runaway cycle later (about 4.2 s) it counts.
+    state._note_pad_force_edge(12, now=131.0)
     assert len(state._collapse_triggers) == 1
+    state._note_pad_force_edge(12, now=134.2)
+    assert len(state._collapse_triggers) == 2
 
 
 def test_three_spaced_runaway_trips_schedule_auto_rewind() -> None:

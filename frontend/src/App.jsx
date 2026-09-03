@@ -507,6 +507,7 @@ function App() {
     reconnects: 0,
     interrupts: 0,
     turnCaps: 0,
+    runaways: 0,
   });
   // Typed startup receipt for the current transport leg: proves whether the
   // voice and text prompt were actually primed, or the leg resumed.
@@ -2668,9 +2669,14 @@ function App() {
           }));
         }
         if (message.kind === "turn_cap") {
+          // A runaway text stream (a token every frame) is the collapse
+          // signal; a length-cap trip is just a long answer. Keep them apart
+          // so a false runaway trip during normal speech is visible.
+          const runaway = message.data?.reason === "dense";
           setRuntimeCounters((counters) => ({
             ...counters,
-            turnCaps: counters.turnCaps + 1,
+            turnCaps: counters.turnCaps + (runaway ? 0 : 1),
+            runaways: counters.runaways + (runaway ? 1 : 0),
           }));
         }
         if (message.kind === "rewind" && message.level === "ok") {
@@ -3073,7 +3079,7 @@ function App() {
     userSpokeAtRef.current = 0;
     setNotices([]);
     setSessionTimeline([]);
-    setRuntimeCounters({ recoveries: 0, reconnects: 0, interrupts: 0, turnCaps: 0 });
+    setRuntimeCounters({ recoveries: 0, reconnects: 0, interrupts: 0, turnCaps: 0, runaways: 0 });
     setLifecycleReceipt(null);
     setStarvation({ frames: 0, episodes: 0 });
     setServerRecording(null);
@@ -4534,6 +4540,7 @@ function App() {
       reconnects: runtimeCounters.reconnects,
       interrupts: runtimeCounters.interrupts,
       turn_caps: runtimeCounters.turnCaps,
+      runaway_text_trips: runtimeCounters.runaways,
       text_starved_episodes: starvation.episodes,
       rewinds: totals.rewinds,
       errors: totals.errors,
@@ -6023,9 +6030,9 @@ function App() {
             <Row label="Auto-recoveries" value={runtimeCounters.recoveries} dot={runtimeCounters.recoveries > 0 ? "warn" : ""} />
             <Row label="Reconnects · interrupts" value={`${runtimeCounters.reconnects} · ${runtimeCounters.interrupts}`} />
             <Row
-              label="Turn caps · text-starved"
-              value={`${runtimeCounters.turnCaps} · ${starvation.episodes}`}
-              dot={runtimeCounters.turnCaps > 0 || starvation.episodes > 0 ? "warn" : ""}
+              label="Turn caps · runaway · text-starved"
+              value={`${runtimeCounters.turnCaps} · ${runtimeCounters.runaways} · ${starvation.episodes}`}
+              dot={runtimeCounters.runaways > 0 ? "err" : runtimeCounters.turnCaps > 0 || starvation.episodes > 0 ? "warn" : ""}
             />
             <Row label="Vision" value={visionOn ? (visionPaused ? "paused" : `live · ${visionAge ?? "idle"} s`) : visionEnabledFromServer ? "available" : "disabled"} />
             {serverRecording && (

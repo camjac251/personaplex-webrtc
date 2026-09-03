@@ -6337,10 +6337,11 @@ class ServerState:
         cutoff = now - COLLAPSE_WINDOW_SEC
         while self._collapse_triggers and self._collapse_triggers[0] < cutoff:
             self._collapse_triggers.popleft()
-        # Qualifying gap: long natural turns can pulse _pad_force_remaining
-        # back-to-back without any wobble. Require >= 4 s since the prior
-        # trigger so three consecutive normal turns don't spuriously trip.
-        qualifying_gap_sec = 4.0
+        # Qualifying gap: one runaway episode re-trips every 52 frames
+        # (40 dense + 12 forced PAD, about 4.2 s) if the loop resumes at
+        # once, so the gap only has to merge a double-count of the same
+        # trip, not separate natural turns (those never reach here).
+        qualifying_gap_sec = 2.0
         if (
             self._collapse_triggers
             and (now - self._collapse_triggers[-1]) < qualifying_gap_sec
