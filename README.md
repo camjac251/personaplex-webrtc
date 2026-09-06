@@ -104,7 +104,23 @@ Periodic full-state snapshots are on by default: a fresh session keeps one recen
 
 The dashboard includes checkpoint-aware **Balanced**, **Upstream**, **Concise**, **Expressive**, and **Clinical intake** profiles. The persona textarea is the whole system prompt: the server wraps it in the `<system>` markers and collapses line breaks to spaces (the text tokenizer has no newline piece), and nothing is appended to it. Upstream pins the NVIDIA/Kyutai reference operating point (text 0.7 / top-k 25, audio 0.8 / top-k 250 on every level, no repetition penalty) as an A/B baseline. No built-in profile enables the repetition penalty or a turn cap below the 120-token default: the penalty taxes the names and terms a task reply must repeat, and lower caps force a pause into ordinary answers. Expressive keeps text at 0.7 (the text stream decides turn timing) and takes its colour from the tested VARF4 voice and acoustic temperature 0.9; it selects Native duplex only for the aligned checkpoint, while Base and unknown checkpoints use Assisted overlap handling. The selected mode travels to the server as `turn_handling` in the session config, so the server enforces it: Native rejects any client-sourced barge-in, and Assisted arms a server-side sustained-overlap stop keyed to the shared user-speech floor rather than the browser's much higher level meter, with mid-session toggles applied live. The semantic codebook (Mimi level 0) has its own temperature slider, independent of the acoustic levels, defaulting to 0.7 where upstream samples 0.8. Raw sampling controls remain available under Advanced.
 
+**Turn handling** is live-switchable: **Native duplex** leaves overlap decisions to the RL model; **Gentle yield** adds a server-only stop after about 1.2 seconds of voiced overlap; **Assisted** keeps the faster browser/server intervention. Gentle bridges up to 160 ms of quiet gaps without counting them, so a short interjection followed by the activity detector's silence hangover does not trigger it. Native remains the default.
+
+**Reply target** is sentence-aware: after the selected token target, the model may finish at sentence-ending punctuation, with at most 24 additional natural text tokens before a hard stop. Punctuation detection is approximate. Length-limit events never count as collapse, and PAD/onset pacing is preserved.
+
+**Automatic recovery** prefers explicitly eligible recent checkpoints, with a still-fresh session baseline as fallback. Periodic captures wait during user speech, Stop, forced yielding, context delivery, and for eight seconds after a detected runaway. A bad capture therefore does not replace the last eligible point. The 90-second age ceiling and memory budgets still apply; an ineligible recent point is reported rather than restored automatically. Manual bookmarks and rewinds keep their existing semantics.
+
 The diagnostics rail reports model/build identity, the seed the server drew for the session (the Seed section shows the same value with a **Reuse** button that locks it for the next session), the priming receipt for the current leg (voice frames, prompt tokens, complete or resumed without re-prime; the prompt panel repeats it as **Primed**), RTF, WebRTC jitter/loss, input queue pressure, discarded buffered audio, reconnects, confirmed interrupts, auto-recoveries, and the turn-cap and text-starved counters that separate floor-holding from voice collapse. Runtime summaries also expose bounded numeric snapshot capture time, bytes, failures, admission rejections, and CPU/GPU residency inventory. **Export bug report** downloads a bounded JSON trace with the applied seed, numeric configuration, prompt hashes, timing, and structured events. It deliberately excludes transcript text, prompt text, audio, images, SDP/ICE addresses, session/device IDs, URLs, and credentials.
+
+**Speak now** requests speech from the current conversation without resetting the model, voice, or seed. It can release Stop, but rejects requests while the user or assistant is speaking or context is pending. **Voice reset** restores the whole session-start conversation state, not just the voice; later context is discarded.
+
+**Context notes** are experimental and may be repeated aloud. They are not private memory or typed user turns. Notes over 180 characters or 32 model tokens are rejected rather than clipped, and a waiting manual note cannot be overwritten. The input keeps an unsent or rejected draft and only clears an unchanged draft after the server queues it. Startup-only `<system>` wrappers are removed from live notes.
+
+Automatic recovery returns sampling and reply-length controls to checkpoint defaults while preserving your padding bonus and onset bias, so deliberate hesitant pacing is not erased.
+
+Camera source changes cancel only camera-owned context. Typed notes and persona reinforcement retain their independent lifetimes; partially delivered vision packets report interruption rather than silently disappearing.
+
+Startup keeps cuDNN autotuning off and uses its heuristic kernel selection. On the RTX 6000 Ada with cached weights, measured process warmup fell from about 15 seconds to 4.5–5 seconds, with similar realtime frame cost. Weight loading remains about five seconds. Algorithm selection differs from the previous autotuned path, so exact seeded audio can change; this is not a bit-identical or speech-quality claim.
 
 To inspect connectivity while a session is live, open `chrome://webrtc-internals` in another tab. The active pair under `selectedCandidatePairId` should show a `host` candidate over UDP pointing at the server's public address.
 
@@ -204,9 +220,9 @@ Single-session: `self.lock` in `ServerState` enforces one peer connection at a t
 Vision path (when `GEMINI_API_KEY` is set and the user enables it):
 
 1. Browser motion-gates each captured frame and sends a base64 JPEG over the `control` DataChannel.
-2. Server forwards the frame to Gemini 3.5 Flash via the Interactions API. Conversation state chains turn-to-turn through `previous_interaction_id`, so the model has long-term memory of prior frames.
+2. Server sends each frame to Gemini 3.8 Flash via a stateless Interactions request (`store=false`); it does not chain prior frames into persistent vision memory.
 3. The one-sentence description is mirrored to the browser as a subtitle and added to the rolling history log. In the default Captions-only mode it never enters PersonaPlex.
-4. Unsafe Ambient react may tokenise and queue the caption in `ServerState._vision_pending`. `_process_audio_frame` drains one token per Mimi frame only at a confirmed silent boundary, with outbound PCM gated for the duration.
+4. Unsafe Ambient react may queue a camera-owned packet in `ServerState._context`. `_process_audio_frame` drains one token per Mimi frame only at a confirmed silent boundary, with outbound PCM gated for the duration.
 
 ## Known issues
 

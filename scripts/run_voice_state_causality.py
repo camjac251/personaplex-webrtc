@@ -180,15 +180,11 @@ def _assert_snapshot_isolated(module: Any, snapshot: Mapping[str, Any]) -> None:
 
 
 def _set_fixed_controls(lm_gen: LMGen) -> None:
-    lm_gen.set_audio_sampling(0.8, 250)
-    lm_gen.temp_text = 0.7
-    lm_gen.top_k_text = 25
-    lm_gen.min_p_text = 0.0
-    lm_gen.repetition_penalty = 1.0
-    lm_gen.repetition_penalty_context = 64
-    lm_gen.padding_bonus = 0.0
-    lm_gen.max_turn_text_tokens = 120
-    lm_gen.semantic_temperature_cap = 0.7
+    lm_gen.apply_sampling(
+        temp=0.8, top_k=250, temp_text=0.7, top_k_text=25, min_p_text=0.0,
+        repetition_penalty=1.0, repetition_penalty_context=64,
+        padding_bonus=0.0, max_turn_text_tokens=120, semantic_temperature_cap=0.7,
+    )
     lm_gen.cfg_gamma = 1.0
     lm_gen.voice_prompt_strength = 1.0
     lm_gen.reset_turn_cap_tracking()

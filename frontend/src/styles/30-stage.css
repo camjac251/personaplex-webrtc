@@ -453,11 +453,22 @@
   }
   .context-note-row {
     display: flex;
+    flex-wrap: wrap;
     gap: 8px;
     padding: 8px 16px;
     border-top: 1px solid var(--line);
     background: var(--bg-2);
   }
+  .context-note-help,
+  .context-note-error {
+    flex-basis: 100%;
+    margin: 0;
+    color: var(--ink-3);
+    font-size: 14px;
+    line-height: 1.4;
+  }
+  .context-note-error { color: var(--red); }
+  .context-note-input[aria-invalid="true"] { border-color: var(--red); }
   .context-note-input {
     flex: 1;
     min-width: 0;

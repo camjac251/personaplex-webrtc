@@ -474,18 +474,18 @@ PADDING_BONUS_MAX = 2.0
 # swings the onset odds ~55x, so wider values pin the behavior.
 TURN_ONSET_BIAS_MIN = -4.0
 TURN_ONSET_BIAS_MAX = 4.0
-# Who owns overlap handling. "native" leaves barge-in to the aligned
-# model's own duplex behavior; the server then rejects client-sourced
-# barge_in interrupts so a stale or modified client cannot bypass the
-# mode. "assisted" additionally arms the server-side sustained-overlap
-# detector in the frame loop.
-TURN_HANDLING_MODES = ("native", "assisted")
-# Keep the reply-length cap meaningful for every user-supplied
-# configuration: below 40 tokens ordinary answers are truncated
-# mid-sentence. The cap is a length limit only; loop detection is the
-# server's runaway-text detector and does not depend on this value, so the
-# top of the range is effectively no cap. LMGen still supports 0 internally
-# so manual interrupt force windows remain independently testable.
+# Who owns overlap handling. "native" leaves barge-in to the model.
+# "gentle" adds a server-owned sustained user-audio overlap detector;
+# "assisted" uses faster server detection and accepts browser barge_in.
+# Native and Gentle reject client-sourced barge_in interrupts so stale
+# or modified clients cannot bypass the selected mode.
+TURN_HANDLING_MODES = ("native", "gentle", "assisted")
+# Reply-length target in natural text tokens. LMGen stops at sentence-ending
+# punctuation once the target is reached, or after at most 24 extra tokens.
+# The 40-token floor leaves room for ordinary replies. This is a length
+# control, independent from recovery; 2000 is a deliberately high target.
+# LMGen still supports 0 internally so manual interrupt force windows remain
+# independently testable.
 MAX_TURN_TEXT_TOKENS_MIN = 40
 MAX_TURN_TEXT_TOKENS_MAX = 2000
 SESSION_TIMEOUT_SEC_MIN = 0
@@ -891,9 +891,8 @@ class SessionConfig:
     # Keep these aligned with the embedded client's advanced slider defaults.
     # Padding bonus defaults off and applies only mid-turn (the server's turn
     # accounting shows text underway), so it shortens rambling without taxing
-    # response onset, where PAD competes directly with EPAD. The max-turn cap
-    # remains a circuit breaker; repetition penalty is available as an opt-in
-    # fallback.
+    # response onset, where PAD competes directly with EPAD. Reply length is
+    # controlled separately by the sentence-aware text target.
     padding_bonus: float = 0.0
     # Live-tunable additive bias on the EPAD onset logit: negative delays
     # speech onset (more patient), positive hastens it (more eager). 0
@@ -929,8 +928,8 @@ class SessionConfig:
     # prompt-guidance strength on language models and the dashboard default;
     # it is inert on a single-row (non caption-CFG) server.
     persona_cfg_gamma: float = 1.5
-    # Overlap ownership: native keeps barge-in with the model, assisted
-    # force-stops the assistant on sustained server-observed overlap.
+    # Native leaves overlap to the model; Gentle adds server-only sustained
+    # yielding, while Assisted permits faster browser/server interruption.
     turn_handling: str = "native"
 
 

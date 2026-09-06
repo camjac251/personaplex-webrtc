@@ -59,6 +59,8 @@ from aiortc import RTCSessionDescription
 from huggingface_hub import hf_hub_download
 
 from .models import LMGen, MimiModel, loaders
+from .context import ContextLifecycle, ContextOrigin, context_key
+from .recovery import RestoreIntent, restore_snapshot
 from .models.lm import (
     AUDIO_TOKENS_PER_STREAM,
     DEFAULT_SEMANTIC_TEMPERATURE_CAP,
@@ -533,7 +535,8 @@ def seed_all(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.backends.cudnn.deterministic = False
-    torch.backends.cudnn.benchmark = True  # Enable cuDNN auto-tuning for better performance
+    # Heuristic selection avoids repeated startup searches and large workspaces.
+    torch.backends.cudnn.benchmark = False
 
 
 def _resolve_session_seed(requested: Optional[int]) -> int:
@@ -587,13 +590,6 @@ def _strip_system_tags(text: str) -> str:
     if cleaned.endswith("<system>"):
         cleaned = cleaned[: -len("<system>")]
     return cleaned.strip()
-
-
-def _can_replace_vision_context(current_source: str, incoming_source: str) -> bool:
-    """Return whether an incoming context packet may replace a queued one."""
-    current = VISION_CONTEXT_PRIORITY.get(current_source or "", 0)
-    incoming = VISION_CONTEXT_PRIORITY.get(incoming_source or "", 0)
-    return incoming >= current
 
 
 def _context_status_text(text: str, limit: int = 360) -> str:
@@ -794,16 +790,6 @@ VISION_SENTENCE_MIN_CHARS = 30
 # made injects audible as dead air.
 VISION_QUEUE_MAX = 32
 
-# Context packets share a single Moshi text-token drip queue. Higher
-# priority sources can replace lower priority packets while they wait for
-# the silence gate; lower priority sources must not overwrite a manual or
-# user-turn grounding packet that has not injected yet.
-VISION_CONTEXT_PRIORITY = {
-    "": -1,
-    "ambient": 0,
-    "user_turn": 1,
-    "manual": 2,
-}
 
 # Captions may arrive every second, but each ambient injection can occupy
 # roughly two seconds of model time. Bound model-side reaction duty cycle;
@@ -895,8 +881,6 @@ AUTO_RECOVERY_CONFIG_KEYS = (
     "audio_topk",
     "repetition_penalty",
     "repetition_penalty_context",
-    "padding_bonus",
-    "turn_onset_bias",
     "max_turn_text_tokens",
     "text_min_p",
     "semantic_temp_cap",
@@ -1023,22 +1007,21 @@ VISION_AUTO_DISABLE_THRESHOLD = 3
 GEMINI_TRANSIENT_STATUSES = frozenset({429, 500, 502, 503, 504})
 GEMINI_TRANSIENT_COOLDOWN_SEC = 5.0
 GEMINI_TRANSIENT_COOLDOWN_MAX_SEC = 60.0
-GEMINI_VISION_MODEL = "gemini-3.5-flash"
+GEMINI_VISION_MODEL = "gemini-3.8-flash"
 
 # Bound each Gemini request so one stuck HTTP call cannot hold the
 # per-session _vision_in_flight guard and silently stop future captures.
 GEMINI_REQUEST_TIMEOUT_SEC = 12.0
 
-# Caption generation budget for a routine live frame. Kept tight so the
-# steady cadence stays cheap and TTFT stays low (minimal thinking).
-VISION_OUTPUT_TOKENS = 80
+# Gemini shares this generation budget between thinking and caption text.
+# At 80, low-thinking calls can exhaust it before emitting any JSON. The
+# caption stays short through the prompt; spare budget is not billed usage.
+VISION_OUTPUT_TOKENS = 1024
 
 # Caption generation budget for a user-requested detail re-detail of a
-# held historical frame. Higher ceiling and a fuller thinking level buy a
-# richer description for the one-off call; operator-tunable for the
-# cost/latency trade described in the vision-ceiling concern.
-VISION_DETAIL_OUTPUT_TOKENS = 320
-VISION_DETAIL_THINKING_LEVEL = "low"
+# held historical frame. The larger output budget allows a richer
+# description; both paths use Gemini 3.8's lowest supported thinking level.
+VISION_DETAIL_OUTPUT_TOKENS = 2048
 
 # How much assistant audio the session recorder holds in RAM before
 # spilling the oldest buffered audio to disk. Mono 24 kHz float32 is
@@ -1105,6 +1088,11 @@ USER_TURN_END_SILENCE_STREAK = 7
 # like yielding rather than talking over.
 ASSISTED_BARGE_OVERLAP_FRAMES = 10
 ASSISTED_BARGE_ASSISTANT_QUIET_STREAK = 2
+# Gentle counts 1.2 seconds of voiced overlap, bridging at most 160 ms gaps.
+GENTLE_BARGE_OVERLAP_FRAMES = 15
+GENTLE_BARGE_GAP_FRAMES = 2
+# Leave the last clean recovery point intact after a detected runaway.
+AUTO_RECOVERY_STABILITY_SEC = 8.0
 # Stop uses a separate, deliberately shorter speech gate. A one- or two-word
 # reply can occupy only two 80 ms outer frames, so requiring the normal four
 # voiced frames leaves the latched assistant muted after "yes", "no", or
@@ -1710,6 +1698,12 @@ class ServerState:
         # size (2 rows) at startup warmup and are never recaptured live.
         self.caption_cfg = bool(caption_cfg)
         self.text_tokenizer = text_tokenizer
+        # SentencePiece boundaries are approximate; the decoder also enforces
+        # a fixed token grace ceiling. Build membership once, never per frame.
+        self.lm_gen.set_sentence_end_tokens(
+            token for token in range(text_tokenizer.get_piece_size())
+            if text_tokenizer.id_to_piece(token).rstrip("\"'”’)]}").endswith((".", "!", "?"))
+        )
         self.device = device
         self.voice_prompt_dir = voice_prompt_dir
         self.uploads_dir = uploads_dir
@@ -1858,25 +1852,14 @@ class ServerState:
         # Per-session vision dispatch and grounding tasks. We hold strong
         # refs so teardown can cancel and drain stragglers before another
         # session opens. Otherwise a late response from session A can
-        # overwrite session B's _vision_pending under _infer_lock.
+        # overwrite session B's waiting context under _infer_lock.
         self._vision_tasks: dict[str, set[asyncio.Task]] = {}
         # Subset tied to the current live source. Historical inspector calls
         # stay in _vision_tasks but survive a camera or screen-share switch.
         self._vision_live_tasks: dict[str, set[asyncio.Task]] = {}
-        # Vision-context inject state. _vision_pending holds tokens waiting
-        # to be drip-fed into the model's text channel during pad streaks.
-        # _vision_pad_streak counts how many recent natural text emissions
-        # have been PAD; once it crosses LIVE_PROMPT_BOUNDARY_STREAK we
-        # start consuming the queue one token per outer audio frame, with
-        # outbound audio gated to silence for those frames. Reset on each
-        # new session in _run_rtc_session.
-        self._vision_pending: deque[int] = deque()
-        # Once a waiting packet is promoted, it becomes immutable: new Gemini
-        # responses may replace only _vision_pending, never the active suffix.
-        # This prevents two scene descriptions from being spliced mid-stream.
-        self._vision_active: deque[int] = deque()
-        self._vision_active_source: str = ""
-        self._vision_active_meta: dict = {}
+        # Packet origin, priority and camera generation remain attached
+        # through waiting, immutable delivery, and completion holds.
+        self._context = ContextLifecycle(VISION_QUEUE_MAX, VISION_AMBIENT_MIN_INTERVAL_SEC)
         self._vision_pad_streak: int = 0
         # Consecutive frames the model's own decoded audio has been below
         # INJECT_SILENCE_RMS. The end-of-thought gate reads this so a
@@ -1901,10 +1884,6 @@ class ServerState:
         # the writes are atomic scalar rebinds.
         self._inject_silence_rms: float = INJECT_SILENCE_RMS_DEFAULT
         self._inject_silence_streak: int = INJECT_SILENCE_STREAK_DEFAULT
-        self._vision_inject_steps: int = 0
-        # Frames left in the post-drip PAD hold that seals a completed
-        # context packet; see CONTEXT_SEAL_HOLD_FRAMES.
-        self._inject_seal_remaining: int = 0
         # Per-session caption-CFG guidance boost target, applied to
         # lm_gen.cfg_gamma when a context packet completes and decayed back
         # toward 1.0 per frame. Read only when caption_cfg is on.
@@ -1912,7 +1891,7 @@ class ServerState:
         # Persona-reinforce state, sharing the vision drip machinery.
         # _reinforce_enabled is the connect-time flag.
         # _reinforce_prompt_tokens is the bare (no <system>) persona body,
-        # tokenized once at connect. _reinforce_pending holds a waiting
+        # tokenized once at connect. The context lifecycle holds its waiting
         # packet; promotion makes its active suffix immutable so preemption
         # can seal that packet before a higher-priority context starts.
         # _last_reinforce_at is the wall-clock start of the last window.
@@ -1920,12 +1899,6 @@ class ServerState:
         self._reinforce_enabled: bool = False
         self._reinforce_prompt_tokens: list[int] = []
         self._reinforce_prompt_text: str = ""
-        self._reinforce_pending: deque[int] = deque()
-        self._reinforce_active: deque[int] = deque()
-        self._reinforce_active_meta: dict = {}
-        self._reinforce_seal_pending: bool = False
-        self._reinforce_seal_meta: dict = {}
-        self._reinforce_inject_steps: int = 0
         self._last_reinforce_at: float = 0.0
         # Last connect-time text prompt body accepted from the client. The
         # model actually receives wrap_with_system_tags(_active_text_prompt)
@@ -2003,24 +1976,9 @@ class ServerState:
         self._latest_vision_caption: str = ""
         self._latest_vision_at: float = 0.0
         self._latest_vision_frame_id: str = ""
-        self._last_injected_vision_key: str = ""
-        self._last_ambient_context_queued_at: float = 0.0
-        self._vision_source_generation: int = 0
-        self._vision_source_active: bool = False
         self._vision_context_after_next_caption: Optional[
             tuple[str, str, str, float, int]
         ] = None
-        # Source of the currently queued _vision_pending tokens:
-        # ambient, user_turn, manual, or empty. Lets live toggles clear only
-        # their own queue instead of deleting an explicit one-shot request.
-        self._vision_pending_source: str = ""
-        self._vision_pending_meta: dict = {}
-        self._reinforce_pending_meta: dict = {}
-        self._active_context_meta: dict = {}
-        # Inject-window edge detection: track transitions so we can
-        # notify the client ("Injecting context...") and log on open/close.
-        self._inject_active: bool = False
-        self._inject_end_status: str = "complete"
         # User-speech recognition turn tracking (only used when self.asr is
         # set). _asr_assistant_silent mirrors whether the model is currently
         # in a text-pad streak; the falling edge (assistant resumes after
@@ -2243,14 +2201,55 @@ class ServerState:
     def _recent_auto_rewind_snapshot(
         self, session_id: str, now: Optional[float] = None
     ) -> Optional[dict]:
+        now = time.monotonic() if now is None else now
         snapshots = self._session_snapshots.get(session_id, [])
-        if not snapshots:
-            return None
-        captured_at, snapshot = snapshots[-1]
-        age_sec = max(0.0, (time.monotonic() if now is None else now) - captured_at)
-        if age_sec > AUTO_REWIND_SNAPSHOT_MAX_AGE_SEC:
-            return None
-        return snapshot
+        for captured_at, snapshot in reversed(snapshots):
+            if (
+                snapshot.get("auto_recovery_eligible") is True
+                and 0.0 <= now - captured_at <= AUTO_REWIND_SNAPSHOT_MAX_AGE_SEC
+            ):
+                return snapshot
+        baseline = getattr(self, "_session_baselines", {}).get(session_id)
+        if baseline is not None:
+            captured_at, snapshot = baseline
+            if (
+                snapshot.get("auto_recovery_eligible") is True
+                and 0.0 <= now - captured_at <= AUTO_REWIND_SNAPSHOT_MAX_AGE_SEC
+            ):
+                return snapshot
+        return None
+
+    def _auto_recovery_block_reason(self, now: float, *, baseline: bool = False) -> str:
+        """Conservative capture eligibility, not a semantic health classifier."""
+        if (
+            self._context.injecting
+            or self._context.notes.active.tokens
+            or self._context.persona.waiting.tokens
+            or self._context.persona.active.tokens
+            or self._context.seal_packet is not None
+            or self._context.hold_remaining > 0
+        ):
+            return "context_active"
+        if getattr(self, "_stop_response_latched", False):
+            return "stopped"
+        if (
+            getattr(self, "_interrupt_gate_remaining", 0) > 0
+            or self.lm_gen.controls.pad_force_remaining > 0
+            or getattr(self, "_auto_rewind_pending", False)
+        ):
+            return "forced_yield"
+        last_trip = getattr(self, "_last_dense_trip_at", None)
+        if last_trip is not None and now - last_trip < AUTO_RECOVERY_STABILITY_SEC:
+            return "recent_runaway"
+        if not baseline and (
+            getattr(self, "_user_audio_active", False)
+            or getattr(self, "_user_audio_attack_streak", 0) > 0
+            or getattr(self, "_vision_pad_streak", 0) < LIVE_PROMPT_BOUNDARY_STREAK
+            or getattr(self, "_audio_silence_streak", 0)
+            < getattr(self, "_inject_silence_streak", INJECT_SILENCE_STREAK_DEFAULT)
+        ):
+            return "not_quiet"
+        return ""
 
     def _init_forced_text_buffers(self) -> None:
         """Allocate the device tensors the frame loop forces onto the text channel.
@@ -2549,6 +2548,8 @@ class ServerState:
                 cfg.session_timeout_sec
             )
             self._active_text_prompt = cfg.text_prompt or ""
+            self._last_dense_trip_at = None
+            self._barge_tracking_mode = None
             self._active_turn_handling = getattr(
                 cfg, "turn_handling", "native"
             )
@@ -2596,51 +2597,27 @@ class ServerState:
 
             self._active_seed = _resolve_session_seed(cfg.seed)
             seed_all(self._active_seed)
-            self.lm_gen.temp_text = cfg.text_temperature
-            self.lm_gen.top_k_text = min(
-                max(1, cfg.text_topk), self.lm_gen.lm_model.text_card
-            )
-            audio_top_k = min(
-                max(1, cfg.audio_topk), self.lm_gen.lm_model.card
-            )
-            # Set the cap before the sampling write so the per-level
-            # temperature vector is built against the session's value.
-            self.lm_gen.semantic_temperature_cap = cfg.semantic_temp_cap
-            audio_top_k_changed = self.lm_gen.set_audio_sampling(
-                cfg.audio_temperature, audio_top_k
-            )
-            self.lm_gen.repetition_penalty = max(
-                1.0, cfg.repetition_penalty
-            )
-            self.lm_gen.repetition_penalty_context = max(
-                0,
-                min(
-                    cfg.repetition_penalty_context,
-                    MAX_REPETITION_CONTEXT,
-                ),
-            )
-            # Both biases are signed, so re-clamp with the shared helpers
-            # instead of flooring at zero.
-            self.lm_gen.padding_bonus = clamp_padding_bonus(cfg.padding_bonus)
-            self.lm_gen.turn_onset_bias = clamp_turn_onset_bias(
-                cfg.turn_onset_bias
-            )
-            self.lm_gen.min_p_text = max(0.0, cfg.text_min_p)
-            self.lm_gen.max_turn_text_tokens = max(
-                MAX_TURN_TEXT_TOKENS_MIN, cfg.max_turn_text_tokens
+            audio_top_k_changed = self.lm_gen.apply_sampling(
+                temp_text=cfg.text_temperature,
+                top_k_text=min(max(1, cfg.text_topk), self.lm_gen.lm_model.text_card),
+                temp=cfg.audio_temperature,
+                top_k=min(max(1, cfg.audio_topk), self.lm_gen.lm_model.card),
+                semantic_temperature_cap=cfg.semantic_temp_cap,
+                repetition_penalty=max(1.0, cfg.repetition_penalty),
+                repetition_penalty_context=max(0, min(cfg.repetition_penalty_context, MAX_REPETITION_CONTEXT)),
+                padding_bonus=clamp_padding_bonus(cfg.padding_bonus),
+                turn_onset_bias=clamp_turn_onset_bias(cfg.turn_onset_bias),
+                min_p_text=max(0.0, cfg.text_min_p),
+                max_turn_text_tokens=max(MAX_TURN_TEXT_TOKENS_MIN, cfg.max_turn_text_tokens),
             )
             self.lm_gen.reset_turn_cap_tracking()
             self.mimi.reset_streaming()
             self.lm_gen.reset_streaming()
             self._reset_pending_text_flags()
 
-            self._clear_vision_pending()
+            self._context.clear()
             self._vision_pad_streak = 0
             self._audio_silence_streak = 0
-            self._vision_inject_steps = 0
-            self._clear_reinforce_pending()
-            self._reinforce_inject_steps = 0
-            self._active_context_meta = {}
             self._last_reinforce_at = time.monotonic()
             self._rtf_ema = 0.0
             self._rtf_last = 0.0
@@ -2664,9 +2641,9 @@ class ServerState:
             self._latest_vision_caption = ""
             self._latest_vision_at = 0.0
             self._latest_vision_frame_id = ""
-            self._last_injected_vision_key = ""
-            self._vision_source_generation = 0
-            self._vision_source_active = False
+            self._context.last_injected_key = ""
+            self._context.camera_generation = 0
+            self._context.camera_active = False
             self._user_audio_active = False
             self._user_audio_attack_streak = 0
             self._user_audio_active_frames = 0
@@ -2678,7 +2655,7 @@ class ServerState:
             "voice_description": voice_description,
             "voice_conditioning_sha256": voice_conditioning_sha256,
             "text_prompt_tokens": len(self.lm_gen.text_prompt_tokens),
-            "audio_top_k": audio_top_k,
+            "audio_top_k": self.lm_gen.top_k,
             "audio_top_k_changed": audio_top_k_changed,
         }
 
@@ -3187,14 +3164,6 @@ class ServerState:
         status = 200 if result == "deleted" else 404 if result == "not_found" else 400
         return web.json_response({"status": result}, status=status)
 
-    @staticmethod
-    def _clone_preview_value(value):
-        if isinstance(value, torch.Tensor):
-            return value.detach().clone()
-        if isinstance(value, np.ndarray):
-            return value.copy()
-        return copy.deepcopy(value)
-
     def _resolve_voice_preview_reference(self, voice: str, mode: str) -> dict:
         """Resolve and hash preview inputs on the serialized voice worker."""
         if voice.startswith(UPLOAD_PREFIX):
@@ -3256,61 +3225,17 @@ class ServerState:
         conditioned_interval = (0, 0)
 
         with self._infer_lock:
-            lm_attrs = (
-                "use_sampling",
-                "temp",
-                "temp_text",
-                "top_k",
-                "top_k_text",
-                "min_p_text",
-                "repetition_penalty",
-                "repetition_penalty_context",
-                "padding_bonus",
-                "turn_onset_bias",
-                "semantic_temperature_cap",
-                "max_turn_text_tokens",
-                "cfg_gamma",
-                "text_prompt_tokens",
-                "voice_prompt_strength",
-                "voice_selection_interval",
-                "_non_pad_streak",
-                "_turn_pad_streak",
-                "_pad_force_remaining",
-                "_turn_cap_token_pending",
-                "_turn_cap_token_recorded",
-            )
+            lm_controls = self.lm_gen.capture_preview_state()
             server_attrs = (
                 "_active_seed",
                 "_active_voice_blend_mix",
                 "_active_clone_strength",
                 "_active_voice_conditioning_sha256",
             )
-            lm_values = {
-                name: self._clone_preview_value(getattr(self.lm_gen, name))
-                for name in lm_attrs
-                if hasattr(self.lm_gen, name)
-            }
-            pointer_attrs = (
-                "voice_prompt",
-                "voice_prompt_audio",
-                "voice_prompt_cache",
-                "voice_prompt_embeddings",
-                "voice_prompt_full_state",
-            )
-            pointer_values = {
-                name: getattr(self.lm_gen, name)
-                for name in pointer_attrs
-                if hasattr(self.lm_gen, name)
-            }
             server_values = {
-                name: self._clone_preview_value(getattr(self, name))
+                name: getattr(self, name)
                 for name in server_attrs
                 if hasattr(self, name)
-            }
-            control_tensors = {
-                name: getattr(self.lm_gen, name).detach().clone()
-                for name in ("_audio_temperature", "_audio_top_k")
-                if hasattr(self.lm_gen, name)
             }
             lm_stream = self._clone_streaming_state(
                 self.lm_gen,
@@ -3351,31 +3276,21 @@ class ServerState:
                 self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(
                     wrap_with_system_tags(PREVIEW_SAMPLE_TEXT)
                 )
-                self.lm_gen.use_sampling = PREVIEW_FIXED_CONTROLS["use_sampling"]
-                self.lm_gen.temp_text = PREVIEW_FIXED_CONTROLS["text_temperature"]
-                self.lm_gen.top_k_text = PREVIEW_FIXED_CONTROLS["text_top_k"]
-                self.lm_gen.min_p_text = PREVIEW_FIXED_CONTROLS["text_min_p"]
-                self.lm_gen.padding_bonus = PREVIEW_FIXED_CONTROLS["padding_bonus"]
-                self.lm_gen.turn_onset_bias = PREVIEW_FIXED_CONTROLS[
-                    "turn_onset_bias"
-                ]
-                self.lm_gen.repetition_penalty = PREVIEW_FIXED_CONTROLS[
-                    "repetition_penalty"
-                ]
-                self.lm_gen.repetition_penalty_context = PREVIEW_FIXED_CONTROLS[
-                    "repetition_penalty_context"
-                ]
-                self.lm_gen.semantic_temperature_cap = PREVIEW_FIXED_CONTROLS[
-                    "semantic_temperature_cap"
-                ]
-                self.lm_gen.cfg_gamma = PREVIEW_FIXED_CONTROLS["cfg_gamma"]
-                self.lm_gen.max_turn_text_tokens = PREVIEW_FIXED_CONTROLS[
-                    "max_turn_text_tokens"
-                ]
-                self.lm_gen.set_audio_sampling(
-                    PREVIEW_FIXED_CONTROLS["audio_temperature"],
-                    PREVIEW_FIXED_CONTROLS["audio_top_k"],
+                self.lm_gen.apply_sampling(
+                    use_sampling=PREVIEW_FIXED_CONTROLS["use_sampling"],
+                    temp_text=PREVIEW_FIXED_CONTROLS["text_temperature"],
+                    top_k_text=PREVIEW_FIXED_CONTROLS["text_top_k"],
+                    min_p_text=PREVIEW_FIXED_CONTROLS["text_min_p"],
+                    padding_bonus=PREVIEW_FIXED_CONTROLS["padding_bonus"],
+                    turn_onset_bias=PREVIEW_FIXED_CONTROLS["turn_onset_bias"],
+                    repetition_penalty=PREVIEW_FIXED_CONTROLS["repetition_penalty"],
+                    repetition_penalty_context=PREVIEW_FIXED_CONTROLS["repetition_penalty_context"],
+                    semantic_temperature_cap=PREVIEW_FIXED_CONTROLS["semantic_temperature_cap"],
+                    max_turn_text_tokens=PREVIEW_FIXED_CONTROLS["max_turn_text_tokens"],
+                    temp=PREVIEW_FIXED_CONTROLS["audio_temperature"],
+                    top_k=PREVIEW_FIXED_CONTROLS["audio_top_k"],
                 )
+                self.lm_gen.cfg_gamma = PREVIEW_FIXED_CONTROLS["cfg_gamma"]
                 self.lm_gen.reset_turn_cap_tracking()
                 torch.manual_seed(PREVIEW_DEFAULT_SEED)
                 if cuda_rng is not None:
@@ -3431,34 +3346,13 @@ class ServerState:
                     attempt(lambda: torch.cuda.set_rng_state_all(cuda_rng))
                 attempt(lambda: random.setstate(python_rng))
                 attempt(lambda: np.random.set_state(numpy_rng))
-                for name, value in control_tensors.items():
-                    attempt(
-                        lambda name=name, value=value: getattr(
-                            self.lm_gen, name
-                        ).copy_(value)
-                    )
-                for name, value in lm_values.items():
-                    attempt(
-                        lambda name=name, value=value: setattr(
-                            self.lm_gen,
-                            name,
-                            self._clone_preview_value(value),
-                        )
-                    )
-                for name, value in pointer_values.items():
-                    attempt(
-                        lambda name=name, value=value: setattr(
-                            self.lm_gen,
-                            name,
-                            value,
-                        )
-                    )
+                attempt(lambda: self.lm_gen.restore_preview_state(lm_controls))
                 for name, value in server_values.items():
                     attempt(
                         lambda name=name, value=value: setattr(
                             self,
                             name,
-                            self._clone_preview_value(value),
+                            value,
                         )
                     )
                 if restore_errors:
@@ -3663,30 +3557,50 @@ class ServerState:
 
     def _apply_interrupt_locked(self, reason: str) -> None:
         """Apply an interrupt's model-state mutations; caller holds the lock."""
-        self.lm_gen._pad_force_remaining = max(
-            self.lm_gen._pad_force_remaining,
-            INTERRUPT_YIELD_FRAMES,
-        )
-        self.lm_gen._non_pad_streak = 0
-        self.lm_gen._turn_pad_streak = 0
-        # A user stop is a real turn boundary, unlike the automatic
-        # max-turn cap. Do not carry abandoned response words into the
-        # next reply's penalty.
-        self.lm_gen.reset_repetition_state()
+        self.lm_gen.interrupt(INTERRUPT_YIELD_FRAMES)
         self._prev_pad_force_remaining = (
-            self.lm_gen._pad_force_remaining
+            self.lm_gen.controls.pad_force_remaining
         )
         self._interrupt_gate_remaining = max(
             self._interrupt_gate_remaining,
             INTERRUPT_YIELD_FRAMES,
         )
         self._arm_stop_response_latch_locked(reason)
-        self._clear_vision_pending()
-        self._vision_inject_steps = 0
-        self._clear_reinforce_pending()
-        self._reinforce_inject_steps = 0
-        self._active_context_meta = {}
-        self._inject_active = False
+        self._context.clear()
+
+    def _maybe_yield_on_overlap_locked(self, chunk_rms: float, inbound_speaking: bool) -> None:
+        """Yield only in an opted-in mode; silence hangover is not gentle evidence."""
+        mode = getattr(self, "_active_turn_handling", "native")
+        if mode != getattr(self, "_barge_tracking_mode", None):
+            self._assisted_barge_streak = 0
+            self._gentle_barge_quiet_streak = 0
+            self._barge_tracking_mode = mode
+        eligible = (
+            mode in ("assisted", "gentle")
+            and inbound_speaking
+            and not self._stop_response_latched
+            and self._interrupt_gate_remaining <= 0
+            and not self._context.injecting
+            and not self._context.notes.active.tokens
+            and not self._context.persona.active.tokens
+            and self._audio_silence_streak < ASSISTED_BARGE_ASSISTANT_QUIET_STREAK
+        )
+        if not eligible:
+            self._assisted_barge_streak = 0
+            self._gentle_barge_quiet_streak = 0
+            return
+        if mode == "gentle" and chunk_rms < USER_TURN_SPEECH_RMS:
+            self._gentle_barge_quiet_streak = getattr(self, "_gentle_barge_quiet_streak", 0) + 1
+            if self._gentle_barge_quiet_streak > GENTLE_BARGE_GAP_FRAMES:
+                self._assisted_barge_streak = 0
+            return
+        self._gentle_barge_quiet_streak = 0
+        self._assisted_barge_streak = getattr(self, "_assisted_barge_streak", 0) + 1
+        threshold = GENTLE_BARGE_OVERLAP_FRAMES if mode == "gentle" else ASSISTED_BARGE_OVERLAP_FRAMES
+        if self._assisted_barge_streak >= threshold and self._active_session_id is not None:
+            self._assisted_barge_streak = 0
+            self._apply_interrupt_locked("barge_in")
+            self._notify_assisted_barge(self._active_session_id)
 
     def _notify_assisted_barge(self, session_id: str) -> None:
         """Tell the client the server itself force-stopped the reply."""
@@ -3891,6 +3805,8 @@ class ServerState:
         lm_elapsed = 0.0
         with self._tracked_inference_lock():
             _rtf_t0 = time.perf_counter()
+            if chunk_rms >= USER_TURN_SPEECH_RMS or self._user_audio_active:
+                self.lm_gen.cancel_speech()
             if self.caption_cfg:
                 # Guidance relaxes toward its floor between packets (1.0, or
                 # the persona-CFG strength); a completed packet re-boosts it
@@ -3932,49 +3848,23 @@ class ServerState:
             inbound_speaking = (
                 chunk_rms >= USER_TURN_SPEECH_RMS or self._user_audio_active
             )
-            # Server-owned assisted barge-in: sustained real user speech
-            # while the assistant is audibly mid-reply force-stops the
-            # answer with the same mutation set as a client interrupt.
-            # Runs inline: this loop already executes under _infer_lock on
-            # the single inference worker.
-            if (
-                getattr(self, "_active_turn_handling", "native") == "assisted"
-                and inbound_speaking
-                and not self._stop_response_latched
-                and self._interrupt_gate_remaining <= 0
-                and not self._inject_active
-                and not self._vision_active
-                and not self._reinforce_active
-                and self._audio_silence_streak
-                < ASSISTED_BARGE_ASSISTANT_QUIET_STREAK
-            ):
-                self._assisted_barge_streak = (
-                    getattr(self, "_assisted_barge_streak", 0) + 1
-                )
-                if self._assisted_barge_streak >= ASSISTED_BARGE_OVERLAP_FRAMES:
-                    barge_session_id = self._active_session_id
-                    if barge_session_id is not None:
-                        self._assisted_barge_streak = 0
-                        self._apply_interrupt_locked("barge_in")
-                        self._notify_assisted_barge(barge_session_id)
-            else:
-                self._assisted_barge_streak = 0
+            self._maybe_yield_on_overlap_locked(chunk_rms, inbound_speaking)
             # Decide once per outer call whether to inject this frame.
             inject_token: Optional[int] = None
             inject_meta: dict = {}
             vision_packet_completed = False
-            if self._reinforce_active and (
-                self._vision_active
-                or self._vision_pending
+            if self._context.persona.active.tokens and (
+                self._context.notes.active.tokens
+                or self._context.notes.waiting.tokens
                 or inbound_speaking
                 or self._interrupt_gate_remaining > 0
                 or self._stop_response_latched
                 or not self._reinforce_enabled
                 or not self._reinforce_prompt_tokens
                 or not model_silent
-                or self._reinforce_inject_steps >= LIVE_PROMPT_MAX_STEPS
+                or self._context.persona.active.emitted >= LIVE_PROMPT_MAX_STEPS
             ):
-                self._inject_end_status = (
+                self._context.end_status = (
                     "interrupted"
                     if (
                         inbound_speaking
@@ -3983,7 +3873,7 @@ class ServerState:
                     )
                     else "dropped"
                 )
-                self._defer_reinforce_seal()
+                self._context.defer_persona_seal(self._context_seal_token)
             # The deferred seal fires on the first quiet frame even inside
             # the post-user-turn inject holdoff: reply formation is exactly
             # when a dangling persona clause would mislead the model, and
@@ -3991,60 +3881,60 @@ class ServerState:
             # mid-reply instead of at its onset.
             if (
                 inject_token is None
-                and self._reinforce_seal_pending
+                and self._context.seal_packet is not None
                 and not inbound_speaking
                 and self._interrupt_gate_remaining <= 0
                 and not self._stop_response_latched
             ):
                 inject_token = self._context_seal_token
-                inject_meta = dict(self._reinforce_seal_meta)
-                self._reinforce_seal_pending = False
-                self._reinforce_seal_meta = {}
+                self._context.current = self._context.seal_packet
+                inject_meta = dict(self._context.seal_packet.meta)
+                self._context.seal_packet = None
 
-            if self._vision_active and inbound_speaking:
+            if self._context.notes.active.tokens and inbound_speaking:
                 logger.info("vision inject aborted by user speech")
-                self._active_context_meta = dict(self._vision_active_meta)
-                self._inject_end_status = "interrupted"
+                self._context.status_meta = dict(self._context.notes.active.meta)
+                self._context.end_status = "interrupted"
                 if (
-                    self._vision_inject_steps > 0
+                    self._context.notes.active.emitted > 0
                     and self._context_seal_token is not None
                 ):
                     # Close the half-delivered sentence so the model's own
                     # history doesn't keep a dangling clause it may later
                     # try to finish aloud.
                     inject_token = self._context_seal_token
-                    inject_meta = dict(self._vision_active_meta)
-                self._clear_vision_active()
+                    inject_meta = dict(self._context.notes.active.meta)
+                self._context.notes.clear_active()
                 self._vision_pad_streak = 0
                 self._audio_silence_streak = 0
             if (
                 inject_token is None
-                and not self._vision_active
-                and self._vision_pending
+                and not self._context.notes.active.tokens
+                and self._context.notes.waiting.tokens
                 and model_silent
                 and not inbound_speaking
                 and self._post_turn_inject_holdoff <= 0
                 and self._interrupt_gate_remaining <= 0
                 and not self._stop_response_latched
             ):
-                self._promote_vision_context()
+                self._context.promote_notes()
             if (
                 inject_token is None
-                and self._vision_active
+                and self._context.notes.active.tokens
                 and not inbound_speaking
             ):
-                if self._vision_inject_steps < LIVE_PROMPT_MAX_STEPS:
-                    inject_token = self._vision_active.popleft()
-                    self._vision_inject_steps += 1
-                    inject_meta = dict(self._vision_active_meta)
-                    vision_packet_completed = not self._vision_active
+                if self._context.notes.active.emitted < LIVE_PROMPT_MAX_STEPS:
+                    inject_token = self._context.notes.active.tokens.popleft()
+                    self._context.notes.active.emitted += 1
+                    inject_meta = dict(self._context.notes.active.meta)
+                    vision_packet_completed = not self._context.notes.active.tokens
                 else:
-                    self._active_context_meta = dict(self._vision_active_meta)
-                    self._inject_end_status = "dropped"
+                    self._context.status_meta = dict(self._context.notes.active.meta)
+                    self._context.end_status = "dropped"
                     if self._context_seal_token is not None:
                         inject_token = self._context_seal_token
-                        inject_meta = dict(self._vision_active_meta)
-                    self._clear_vision_active()
+                        inject_meta = dict(self._context.notes.active.meta)
+                    self._context.notes.clear_active()
                     self._vision_pad_streak = 0
                     self._audio_silence_streak = 0
 
@@ -4055,17 +3945,17 @@ class ServerState:
             # than a clause the model should continue aloud. Mirrors the
             # t=0 post-prompt silence slots; user speech, a latched Stop,
             # or an interrupt gate abandons the hold immediately.
-            if inject_token is None and self._inject_seal_remaining > 0:
+            if inject_token is None and self._context.hold_remaining > 0:
                 if (
                     inbound_speaking
                     or self._stop_response_latched
                     or self._interrupt_gate_remaining > 0
                 ):
-                    self._inject_seal_remaining = 0
+                    self._context.hold_remaining = 0
                 else:
                     inject_token = pad_id
-                    inject_meta = dict(self._active_context_meta)
-                    self._inject_seal_remaining -= 1
+                    inject_meta = dict(self._context.status_meta)
+                    self._context.hold_remaining -= 1
 
             # Persona reinforcement reuses the same drip slot but yields to
             # vision. A waiting packet becomes immutable once promoted, so
@@ -4073,8 +3963,8 @@ class ServerState:
             # without letting two context packets interleave.
             if (
                 inject_token is None
-                and not self._vision_active
-                and not self._vision_pending
+                and not self._context.notes.active.tokens
+                and not self._context.notes.waiting.tokens
                 and not inbound_speaking
                 and self._interrupt_gate_remaining <= 0
                 and not self._stop_response_latched
@@ -4082,40 +3972,40 @@ class ServerState:
                 and self._reinforce_prompt_tokens
             ):
                 now = time.monotonic()
-                if not self._reinforce_pending and not self._reinforce_active:
+                if not self._context.persona.waiting.tokens and not self._context.persona.active.tokens:
                     if (
                         model_silent
                         and self._post_turn_inject_holdoff <= 0
                         and (now - self._last_reinforce_at)
                         >= REINFORCE_MIN_INTERVAL_SEC
                     ):
-                        self._reinforce_pending.extend(
-                            self._reinforce_prompt_tokens
+                        self._context.queue_persona(
+                            self._reinforce_prompt_tokens,
+                            {
+                                "source": "reinforce",
+                                "reason": "silence",
+                                "text": self._reinforce_prompt_text,
+                                "tokens": len(self._reinforce_prompt_tokens),
+                            },
                         )
-                        self._reinforce_pending_meta = {
-                            "source": "reinforce",
-                            "reason": "silence",
-                            "text": self._reinforce_prompt_text,
-                            "tokens": len(self._reinforce_prompt_tokens),
-                        }
                         self._last_reinforce_at = now
-                if self._reinforce_pending and not self._reinforce_active:
-                    self._promote_reinforce_context()
-                if self._reinforce_active:
-                    inject_token = self._reinforce_active.popleft()
-                    self._reinforce_inject_steps += 1
-                    inject_meta = dict(self._reinforce_active_meta)
-                    if not self._reinforce_active:
-                        self._active_context_meta = dict(
-                            self._reinforce_active_meta
+                if self._context.persona.waiting.tokens and not self._context.persona.active.tokens:
+                    self._context.promote_persona()
+                if self._context.persona.active.tokens:
+                    inject_token = self._context.persona.active.tokens.popleft()
+                    self._context.persona.active.emitted += 1
+                    inject_meta = dict(self._context.persona.active.meta)
+                    if not self._context.persona.active.tokens:
+                        self._context.status_meta = dict(
+                            self._context.persona.active.meta
                         )
-                        self._clear_reinforce_active()
-                        self._inject_end_status = "complete"
-                        self._inject_seal_remaining = CONTEXT_SEAL_HOLD_FRAMES
+                        self._context.persona.clear_active()
+                        self._context.end_status = "complete"
+                        self._context.hold_remaining = CONTEXT_SEAL_HOLD_FRAMES
             else:
                 # A waiting packet has emitted nothing and needs no seal.
                 # Active packets are abandoned by the preemption block above.
-                self._clear_reinforce_waiting()
+                self._context.persona.clear_waiting()
 
             injected_this_frame = inject_token is not None
             # Context tokens ride the t=0 conditioning ritual: every trained
@@ -4273,13 +4163,11 @@ class ServerState:
                 results.append((pcm_np, text))
 
             if vision_packet_completed:
-                self._last_injected_vision_key = self._vision_context_key(
-                    self._vision_active_meta
-                )
-                self._active_context_meta = dict(self._vision_active_meta)
-                self._inject_end_status = "complete"
-                self._clear_vision_active()
-                self._inject_seal_remaining = CONTEXT_SEAL_HOLD_FRAMES
+                self._context.last_injected_key = context_key(self._context.notes.active.meta)
+                self._context.status_meta = dict(self._context.notes.active.meta)
+                self._context.end_status = "complete"
+                self._context.notes.clear_active()
+                self._context.hold_remaining = CONTEXT_SEAL_HOLD_FRAMES
                 if self.caption_cfg:
                     # A fully delivered caption earns its guidance boost;
                     # the per-frame decay above walks it back to the floor.
@@ -4295,7 +4183,7 @@ class ServerState:
             # _pad_force_remaining transitions 0 -> >0 when the LM safety
             # net (max_turn_text_tokens) kicks in. Cheap, runs in the
             # lock we already hold.
-            pad_force = self.lm_gen._pad_force_remaining
+            pad_force = self.lm_gen.controls.pad_force_remaining
             if pad_force > 0 and self._prev_pad_force_remaining == 0:
                 self._note_pad_force_edge(pad_force)
             self._prev_pad_force_remaining = pad_force
@@ -4306,42 +4194,42 @@ class ServerState:
             # server log records what the user is hearing.
             now_inject_active = (
                 injected_this_frame
-                or bool(self._vision_active)
-                or bool(self._reinforce_active)
-                or self._reinforce_inject_steps > 0
-                or self._reinforce_seal_pending
-                or self._inject_seal_remaining > 0
+                or bool(self._context.notes.active.tokens)
+                or bool(self._context.persona.active.tokens)
+                or self._context.persona.active.emitted > 0
+                or self._context.seal_packet is not None
+                or self._context.hold_remaining > 0
             )
-            if now_inject_active != self._inject_active:
-                self._inject_active = now_inject_active
+            if now_inject_active != self._context.injecting:
+                self._context.injecting = now_inject_active
                 reinforce_opened = False
                 if now_inject_active:
                     active_source = str(inject_meta.get("source", ""))
                     if active_source == "reinforce":
                         reinforce_opened = True
-                        self._active_context_meta = dict(inject_meta)
-                        self._active_context_meta["remaining_tokens"] = len(
-                            self._reinforce_active
+                        self._context.status_meta = dict(inject_meta)
+                        self._context.status_meta["remaining_tokens"] = len(
+                            self._context.persona.active.tokens
                         )
                         logger.info(
                             "reinforce inject window opened (%d tokens queued)",
-                            len(self._reinforce_active),
+                            len(self._context.persona.active.tokens),
                         )
                     else:
-                        self._active_context_meta = dict(
-                            inject_meta or self._vision_active_meta
+                        self._context.status_meta = dict(
+                            inject_meta or self._context.notes.active.meta
                         )
-                        self._active_context_meta["remaining_tokens"] = len(
-                            self._vision_active
+                        self._context.status_meta["remaining_tokens"] = len(
+                            self._context.notes.active.tokens
                         )
                         logger.info(
                             "vision inject window opened (%d tokens queued)",
-                            len(self._vision_active),
+                            len(self._context.notes.active.tokens),
                         )
                 else:
-                    logger.info("inject window %s", self._inject_end_status)
-                    if self._active_context_meta:
-                        self._active_context_meta["remaining_tokens"] = 0
+                    logger.info("inject window %s", self._context.end_status)
+                    if self._context.status_meta:
+                        self._context.status_meta["remaining_tokens"] = 0
                 sess = self._active_session
                 loop = self._main_loop
                 if sess is not None and loop is not None:
@@ -4354,9 +4242,9 @@ class ServerState:
                             (
                                 "injecting"
                                 if now_inject_active
-                                else self._inject_end_status
+                                else self._context.end_status
                             ),
-                            self._context_payload(self._active_context_meta),
+                            self._context_payload(self._context.status_meta),
                         )
                         # Surface persona re-assertions on the diagnostics
                         # rail. DataChannel.send is not thread-safe, so
@@ -4376,12 +4264,13 @@ class ServerState:
                             exc,
                         )
                 if not now_inject_active:
-                    self._active_context_meta = {}
-                    self._inject_end_status = "complete"
-                    if not self._vision_pending:
-                        self._clear_vision_pending()
-                    if not self._reinforce_pending:
-                        self._clear_reinforce_pending()
+                    self._context.status_meta = {}
+                    self._context.current = None
+                    self._context.end_status = "complete"
+                    if not self._context.notes.waiting.tokens:
+                        self._context.notes.clear()
+                    if not self._context.persona.waiting.tokens:
+                        self._context.clear_persona()
 
             # --- server-driven vision cadence ------------------------
             # When the model just entered a pad streak (silence), ask the
@@ -4482,11 +4371,11 @@ class ServerState:
         """
         if (
             session_id != self._active_session_id
-            or not self._vision_source_active
+            or not self._context.camera_active
             or (source == "user_turn" and not self._vision_ground_user_turns)
         ):
             return False
-        source_generation = self._vision_source_generation
+        source_generation = self._context.camera_generation
         sess = self._active_session
         caption, age, frame_id = self._fresh_vision_context()
         if not caption:
@@ -4545,17 +4434,15 @@ class ServerState:
             with self._infer_lock:
                 if (
                     session_id != self._active_session_id
-                    or not self._vision_source_active
-                    or source_generation != self._vision_source_generation
+                    or not self._context.camera_active
+                    or source_generation != self._context.camera_generation
                     or (
                         source == "user_turn"
                         and not self._vision_ground_user_turns
                     )
                 ):
                     return
-                ok, blocked_by, duplicate = self._queue_waiting_vision_context(
-                    tokens, source, meta
-                )
+                ok, blocked_by, duplicate = self._context.queue_note(tokens, source, meta, origin=ContextOrigin.VISION, now=time.monotonic(), camera_generation=self._context.camera_generation)
                 queued["ok"] = ok
                 queued["blocked_by"] = blocked_by
                 queued["duplicate"] = duplicate
@@ -4564,8 +4451,8 @@ class ServerState:
         if (
             sess is not None
             and session_id == self._active_session_id
-            and self._vision_source_active
-            and source_generation == self._vision_source_generation
+            and self._context.camera_active
+            and source_generation == self._context.camera_generation
             and (source != "user_turn" or self._vision_ground_user_turns)
         ):
             if not queued["ok"]:
@@ -4980,33 +4867,20 @@ class ServerState:
             with self._infer_lock:
                 lock_acquired_at = time.perf_counter()
                 if (
-                    getattr(self, "_inject_active", False)
-                    or getattr(self, "_vision_active", ())
-                    or getattr(self, "_reinforce_pending", ())
-                    or getattr(self, "_reinforce_active", ())
-                    or getattr(self, "_reinforce_seal_pending", False)
+                    self._context.injecting
+                    or self._context.notes.active.tokens
+                    or self._context.persona.waiting.tokens
+                    or self._context.persona.active.tokens
+                    or self._context.seal_packet is not None
                 ):
                     raise SnapshotDeferred(
                         "context injection is active; retry at the next boundary"
                     )
-                if kind == "periodic" and not (
-                    getattr(self, "_vision_pad_streak", 0)
-                    >= LIVE_PROMPT_BOUNDARY_STREAK
-                    and getattr(self, "_audio_silence_streak", 0)
-                    >= getattr(
-                        self,
-                        "_inject_silence_streak",
-                        INJECT_SILENCE_STREAK_DEFAULT,
-                    )
-                ):
-                    # A periodic clone stalls the frame loop for its
-                    # synchronize, so only capture in the same quiet
-                    # boundary the inject gate trusts. The cadence task
-                    # retries quickly, so the rolling recovery point stays
-                    # fresh without ever stalling audible output.
-                    raise SnapshotDeferred(
-                        "no quiet boundary; periodic capture waits for silence"
-                    )
+                recovery_block = self._auto_recovery_block_reason(
+                    time.monotonic(), baseline=kind == "baseline"
+                )
+                if kind == "periodic" and recovery_block:
+                    raise SnapshotDeferred(f"recovery capture deferred: {recovery_block}")
                 lm_tensors, lm_metadata = self._flatten_live_streaming_state(
                     self.lm_gen
                 )
@@ -5062,6 +4936,7 @@ class ServerState:
                 snapshot = {
                     "version": 2,
                     "captured_at": time.monotonic(),
+                    "auto_recovery_eligible": not recovery_block,
                     "residency": residency,
                     "tensor_count": tensor_count,
                     "tensor_bytes": tensor_bytes,
@@ -5253,53 +5128,14 @@ class ServerState:
             )
             return None, "rejected"
 
-    def _restore_snapshot_locked(self, snapshot: dict) -> None:
-        """Restore a versioned snapshot while _infer_lock is held."""
-        if not isinstance(snapshot, dict):
-            raise TypeError("session snapshot must be a dictionary")
-        if snapshot.get("version") != 2:
-            raise ValueError("unsupported session snapshot version")
-        mimi_state = snapshot.get("mimi")
-        lm_state = snapshot.get("lm")
-        if not isinstance(mimi_state, dict) or not isinstance(lm_state, dict):
-            raise TypeError("session snapshot LM and Mimi states must be dictionaries")
-
-        rng_cpu = snapshot.get("rng_cpu")
-        current_rng_cpu = torch.get_rng_state()
-        self._validate_snapshot_rng("rng_cpu", rng_cpu, current_rng_cpu)
-        rng_cuda = snapshot.get("rng_cuda")
-        if rng_cuda is not None:
-            if self.device.type != "cuda" or not torch.cuda.is_available():
-                raise RuntimeError("CUDA RNG state cannot be restored without CUDA")
-            current_rng_cuda = torch.cuda.get_rng_state(
-                _cuda_device_index(self.device)
-            )
-            self._validate_snapshot_rng("rng_cuda", rng_cuda, current_rng_cuda)
-
-        # Preflight the complete logical recovery point before either module
-        # or RNG stream changes. The apply calls still copy into existing
-        # graph-owned tensors and consume only their shallow dictionary copy.
-        self.mimi.validate_streaming_state(dict(mimi_state))
-        self.lm_gen.validate_streaming_state(dict(lm_state))
-
-        self.mimi.set_streaming_state_inplace(dict(mimi_state))
-        self.lm_gen.set_streaming_state_inplace(dict(lm_state))
-        torch.set_rng_state(rng_cpu)
-        if rng_cuda is not None:
-            torch.cuda.set_rng_state(
-                rng_cuda, device=_cuda_device_index(self.device)
-            )
-        if self.device.type == "cuda" and torch.cuda.is_available():
-            torch.cuda.synchronize(_cuda_device_index(self.device))
+    def _apply_restore_policy_locked(self, intent: RestoreIntent) -> None:
+        """Reset abandoned-turn policy after a validated in-place restore."""
         # Turn caps and collapse detectors describe the abandoned execution
         # path, not the conversation state being restored. Carrying them over
         # can manufacture an immediate forced-silence edge after rewind.
         self.lm_gen.reset_turn_cap_tracking()
         self._reset_pending_text_flags()
-        self._clear_vision_pending()
-        self._clear_reinforce_pending()
-        self._active_context_meta = {}
-        self._inject_seal_remaining = 0
+        self._context.clear()
         # The restored state predates whichever caption boosted guidance,
         # so an elevated gamma must not amplify a caption the restored KV
         # never saw. The persona floor stays: both rows were primed at t=0
@@ -5307,8 +5143,8 @@ class ServerState:
         self.lm_gen.cfg_gamma = self.lm_gen.cfg_gamma_floor
         # The restored LM state predates any injected caption, so the
         # dedupe key must not keep treating that caption as delivered.
-        self._last_injected_vision_key = ""
-        self._last_ambient_context_queued_at = 0.0
+        self._context.last_injected_key = ""
+        self._context.last_ambient_queued_at = 0.0
         self._vision_pad_streak = 0
         self._audio_silence_streak = 0
         self._text_starved_streak = 0
@@ -5325,26 +5161,9 @@ class ServerState:
         self._user_audio_silence_streak = 0
         self._asr_user_active = False
         self._asr_assistant_silent = False
-        self._inject_active = False
-        self._inject_end_status = "complete"
+        if intent is RestoreIntent.AUTO:
+            self._apply_auto_recovery_tuning_locked()
 
-    @staticmethod
-    def _validate_snapshot_rng(
-        name: str,
-        candidate: object,
-        reference: torch.Tensor,
-    ) -> None:
-        if not isinstance(candidate, torch.Tensor):
-            raise TypeError(f"session snapshot {name} must be a tensor")
-        if (
-            candidate.device.type != "cpu"
-            or candidate.dtype != reference.dtype
-            or tuple(candidate.shape) != tuple(reference.shape)
-        ):
-            raise ValueError(
-                f"session snapshot {name} must have shape "
-                f"{tuple(reference.shape)}, dtype {reference.dtype}, on CPU"
-            )
 
     async def _restore_session_snapshot(
         self,
@@ -5352,9 +5171,11 @@ class ServerState:
         session_id: str,
         snapshot: dict,
         *,
-        auto_recovery: bool = False,
+        intent: RestoreIntent,
     ) -> bool:
         """Restore at an RTC frame boundary and flush stale transport data."""
+        if not isinstance(intent, RestoreIntent):
+            raise TypeError("restore intent must be explicit")
         operation_started_at = time.perf_counter()
         generation = await session.pause_and_flush_audio()
         loop = asyncio.get_event_loop()
@@ -5371,9 +5192,8 @@ class ServerState:
                     ) * 1000.0
                     if session_id != self._active_session_id:
                         return
-                    self._restore_snapshot_locked(snapshot)
-                    if auto_recovery:
-                        self._apply_auto_recovery_tuning_locked()
+                    restore_snapshot(self.mimi, self.lm_gen, snapshot, self.device)
+                    self._apply_restore_policy_locked(intent)
                     timing["restore_ms"] = (
                         time.perf_counter() - restore_started_at
                     ) * 1000.0
@@ -5407,7 +5227,7 @@ class ServerState:
                 # and cannot repair a dashboard left in "injecting" state.
                 session.send_inject_status(False)
                 session.send_context_status("complete", {})
-                if auto_recovery:
+                if intent is RestoreIntent.AUTO:
                     session.send_config_applied(
                         self._applied_config_snapshot(),
                         source="auto_recovery",
@@ -5416,6 +5236,143 @@ class ServerState:
             return restored["ok"]
         finally:
             session.resume_audio(generation)
+
+    async def _handle_speak(
+        self,
+        session: "RTCSession",
+        session_id: str,
+        clog: ColorizedLog,
+    ) -> None:
+        """Request one audible onset without restoring or re-priming state."""
+        loop = asyncio.get_running_loop()
+        result = {"reason": "session_ended"}
+
+        def _request() -> None:
+            with self._infer_lock:
+                if session_id != self._active_session_id:
+                    return
+                if self._user_audio_active or self._stop_user_audio_active:
+                    result["reason"] = "user_speaking"
+                elif (
+                    self._context.injecting
+                    or self._context.notes.waiting.tokens
+                    or self._context.notes.active.tokens
+                    or self._context.persona.waiting.tokens
+                    or self._context.persona.active.tokens
+                    or self._context.seal_packet is not None
+                    or self._context.hold_remaining > 0
+                ):
+                    result["reason"] = "context_busy"
+                elif (
+                    not self._stop_response_latched
+                    and self._audio_silence_streak < self._inject_silence_streak
+                ):
+                    result["reason"] = "assistant_speaking"
+                else:
+                    self._release_stop_response_latch_locked("speak")
+                    self.lm_gen.request_speech()
+                    self._interrupt_gate_remaining = 0
+                    self._prev_pad_force_remaining = 0
+                    result["reason"] = ""
+
+        await loop.run_in_executor(self._infer_executor, _request)
+        reason = result["reason"]
+        if reason:
+            messages = {
+                "session_ended": "Start a session before requesting speech",
+                "user_speaking": "Finish speaking before requesting a reply",
+                "assistant_speaking": "The assistant is already speaking",
+                "context_busy": "Wait for context delivery before requesting speech",
+            }
+            session.send_event(
+                "speak", messages[reason], "warn",
+                {"status": "rejected", "reason": reason},
+            )
+            return
+        session.send_event(
+            "speak", "Speech requested without resetting the conversation", "ok",
+            {"status": "requested"},
+        )
+        clog.log("info", "speech onset requested; conversation state preserved")
+
+    async def _handle_context_note(
+        self,
+        session: "RTCSession",
+        session_id: str,
+        note_raw: object,
+        clog: ColorizedLog,
+    ) -> None:
+        """Queue a complete typed note, or reject it without truncating."""
+        note = (
+            " ".join(_strip_system_tags(note_raw).split())
+            if isinstance(note_raw, str) else ""
+        )
+        if not note:
+            session.send_event(
+                "context_note", "Enter a context note first", "warn",
+                {"status": "rejected", "reason": "empty"},
+            )
+            return
+        context = _vision_context_note(note)
+        tokens = (
+            self.text_tokenizer.encode(f" {context}")
+            if len(note) <= VISION_CONTEXT_MAX_CHARS else []
+        )
+        if len(note) > VISION_CONTEXT_MAX_CHARS or len(tokens) > VISION_QUEUE_MAX:
+            session.send_event(
+                "context_note",
+                "Context note is too long; shorten it and send again",
+                "warn",
+                {
+                    "status": "rejected", "reason": "too_long",
+                    "max_chars": VISION_CONTEXT_MAX_CHARS,
+                    "max_tokens": VISION_QUEUE_MAX,
+                },
+            )
+            return
+        if not tokens:
+            session.send_event(
+                "context_note", "Context note could not be tokenized", "warn",
+                {"status": "rejected", "reason": "empty"},
+            )
+            return
+        meta = {
+            "source": "manual", "reason": "typed_note",
+            "text": context, "caption": context.rstrip(".!?"),
+            "tokens": len(tokens), "remaining_tokens": len(tokens),
+        }
+        result = {"ok": False, "reason": "session_ended", "blocked_by": ""}
+
+        def _queue_note() -> None:
+            with self._infer_lock:
+                if session_id != self._active_session_id:
+                    return
+                ok, blocked_by, _duplicate = self._context.queue_note(
+                    tokens, "manual", meta, origin=ContextOrigin.MANUAL,
+                    now=time.monotonic(),
+                )
+                result["ok"] = ok
+                result["reason"] = "" if ok else "busy"
+                result["blocked_by"] = blocked_by
+
+        await asyncio.get_running_loop().run_in_executor(
+            self._infer_executor, _queue_note
+        )
+        if result["ok"]:
+            self._send_context_status("queued", meta, sess=session)
+            session.send_event(
+                "context_note", "Complete context note queued for a quiet boundary",
+                "ok", {"status": "queued", "tokens": len(tokens)},
+            )
+            clog.log("info", f"context note queued ({len(tokens)} tokens)")
+        else:
+            session.send_event(
+                "context_note", "Context note not queued; keep the draft and retry",
+                "warn", {
+                    "status": "rejected", "reason": result["reason"],
+                    "blocked_by": result["blocked_by"],
+                },
+            )
 
     async def _handle_voice_reset(
         self,
@@ -5457,6 +5414,7 @@ class ServerState:
             session,
             session_id,
             state_dict,
+            intent=RestoreIntent.VOICE_RESET,
         )
         if not restored:
             return
@@ -5495,7 +5453,7 @@ class ServerState:
                         session,
                         session_id,
                         snapshot,
-                        auto_recovery=True,
+                        intent=RestoreIntent.AUTO,
                     )
                     if not restored:
                         return
@@ -5642,8 +5600,8 @@ class ServerState:
         if session_id != self._active_session_id:
             return
         if not historical_detail and (
-            not self._vision_source_active
-            or source_generation != self._vision_source_generation
+            not self._context.camera_active
+            or source_generation != self._context.camera_generation
         ):
             return
 
@@ -5786,9 +5744,7 @@ class ServerState:
             max_output_tokens = (
                 VISION_DETAIL_OUTPUT_TOKENS if detail else VISION_OUTPUT_TOKENS
             )
-            thinking_level = (
-                VISION_DETAIL_THINKING_LEVEL if detail else "minimal"
-            )
+            thinking_level = "low"
             payload = {
                 "model": GEMINI_VISION_MODEL,
                 "system_instruction": system_instruction,
@@ -5808,10 +5764,8 @@ class ServerState:
                             "caption": {
                                 "type": "string",
                                 "description": (
-                                    "One factual sentence of no more than 20 words, "
-                                    "beginning exactly with 'In your current view,' "
-                                    "and containing no label or source-medium "
-                                    "reference."
+                                    "Visible facts in plain text, following the "
+                                    "supplied system instruction without a label."
                                 ),
                             }
                         },
@@ -5836,8 +5790,8 @@ class ServerState:
                     interaction_status = data.get("status")
                     provider_error = data.get("error")
                     if not historical_detail and (
-                        not self._vision_source_active
-                        or source_generation != self._vision_source_generation
+                        not self._context.camera_active
+                        or source_generation != self._context.camera_generation
                     ):
                         clog.log(
                             "info",
@@ -5933,7 +5887,7 @@ class ServerState:
                             time.monotonic() - requested_at
                             <= VISION_CONTEXT_MAX_AGE_SEC
                             and requested_generation
-                            == self._vision_source_generation
+                            == self._context.camera_generation
                             and requested_generation == source_generation
                         ):
                             await self._queue_latest_vision_context(
@@ -5984,15 +5938,13 @@ class ServerState:
                             if session_id != self._active_session_id:
                                 return
                             if (
-                                not self._vision_source_active
+                                not self._context.camera_active
                                 or source_generation
-                                != self._vision_source_generation
+                                != self._context.camera_generation
                             ):
                                 return
                             ok, blocked_by, duplicate = (
-                                self._queue_waiting_vision_context(
-                                    ambient_tokens, "ambient", ambient_meta
-                                )
+                                self._context.queue_note(ambient_tokens, "ambient", ambient_meta, origin=ContextOrigin.VISION, now=time.monotonic(), camera_generation=self._context.camera_generation)
                             )
                             ambient_queued["ok"] = ok
                             ambient_queued["blocked_by"] = blocked_by
@@ -6140,133 +6092,56 @@ class ServerState:
             words.pop()
         return "", []
 
-    @staticmethod
-    def _vision_context_key(meta: Optional[dict]) -> str:
-        if not meta:
-            return ""
-        # Key on the fitted inject text ("text"), not the display caption:
-        # the ambient path stores the unfitted caption while the grounding
-        # path stores the fitted one, so keying on "caption" lets the same
-        # scene slip past the duplicate guard when it crosses paths.
-        caption = str(meta.get("text") or meta.get("caption") or "")
-        return " ".join(caption.lower().split()).rstrip(".!?")
-
-    def _queue_waiting_vision_context(
-        self,
-        tokens: list[int],
-        source: str,
-        meta: dict,
-    ) -> tuple[bool, str, bool]:
-        """Install a waiting packet without mutating an active packet.
-
-        Must be called while holding _infer_lock. Returns
-        (queued, blocking_source, duplicate).
-        """
-        incoming_key = self._vision_context_key(meta)
-        if source == "ambient":
-            now = time.monotonic()
-            last_queued = getattr(self, "_last_ambient_context_queued_at", 0.0)
-            if (
-                last_queued > 0.0
-                and now - last_queued < VISION_AMBIENT_MIN_INTERVAL_SEC
-            ):
-                return False, "rate_limit", False
-        if source != "manual" and incoming_key:
-            existing_keys = {
-                self._last_injected_vision_key,
-                self._vision_context_key(self._vision_active_meta),
-                self._vision_context_key(self._vision_pending_meta),
-            }
-            if incoming_key in existing_keys:
-                return False, "", True
-        current_source = self._vision_pending_source if self._vision_pending else ""
-        if current_source and not _can_replace_vision_context(
-            current_source, source
-        ):
-            return False, current_source, False
-        self._clear_vision_waiting()
-        self._vision_pending.extend(tokens)
-        self._vision_pending_source = source
-        self._vision_pending_meta = dict(meta)
-        if source == "ambient":
-            self._last_ambient_context_queued_at = time.monotonic()
-        return True, "", False
-
-    def _promote_vision_context(self) -> bool:
-        """Move the waiting packet into the immutable active slot."""
-        if self._vision_active or not self._vision_pending:
-            return False
-        self._vision_active.extend(self._vision_pending)
-        self._vision_active_source = self._vision_pending_source
-        self._vision_active_meta = dict(self._vision_pending_meta)
-        self._clear_vision_waiting()
-        self._vision_inject_steps = 0
-        return True
-
-    def _clear_vision_waiting(self) -> None:
-        self._vision_pending.clear()
-        self._vision_pending_source = ""
-        self._vision_pending_meta = {}
-
-    def _clear_vision_active(self) -> None:
-        self._vision_active.clear()
-        self._vision_active_source = ""
-        self._vision_active_meta = {}
-        self._vision_inject_steps = 0
-
-    def _clear_vision_pending(self) -> None:
-        self._clear_vision_waiting()
-        self._clear_vision_active()
-
-    def _clear_vision_source(self, source: str) -> tuple[bool, bool]:
-        """Clear only waiting or active packets owned by ``source``."""
-        waiting_cleared = self._vision_pending_source == source
-        active_cleared = self._vision_active_source == source
-        if waiting_cleared:
-            self._clear_vision_waiting()
-        if active_cleared:
-            self._active_context_meta = dict(self._vision_active_meta)
-            self._inject_end_status = "dropped"
-            self._clear_vision_active()
+    def _cancel_camera_context_source(self, source: str) -> tuple[bool, bool]:
+        """Cancel one camera feed class without changing manual/persona work."""
+        waiting, active = self._context.clear_note_source(source)
+        if active:
             self._vision_pad_streak = 0
             self._audio_silence_streak = 0
-        return waiting_cleared, active_cleared
+        return waiting, active
 
-    def _promote_reinforce_context(self) -> bool:
-        """Move the waiting persona packet into its immutable active slot."""
-        if self._reinforce_active or not self._reinforce_pending:
+    async def _handle_vision_source(
+        self, session: "RTCSession", session_id: str, generation: int, active: bool,
+    ) -> bool:
+        """Invalidate camera-owned work, never typed notes or persona packets."""
+        if generation < self._context.camera_generation or (
+            generation == self._context.camera_generation and active
+        ):
             return False
-        self._reinforce_active.extend(self._reinforce_pending)
-        self._reinforce_active_meta = dict(self._reinforce_pending_meta)
-        self._clear_reinforce_waiting()
-        self._reinforce_inject_steps = 0
+        tasks = list(self._vision_live_tasks.get(session_id, set()))
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        def transition():
+            with self._infer_lock:
+                if session_id != self._active_session_id:
+                    return None
+                # Re-check inside the serialized mutation: another handler
+                # may have advanced the camera while this one was waiting.
+                result = self._context.transition_camera(generation, active)
+                if result is None:
+                    return None
+                self._latest_vision_caption = ""
+                self._latest_vision_at = 0.0
+                self._latest_vision_frame_id = ""
+                self._vision_context_after_next_caption = None
+                # A camera change does not reset quiet-boundary accounting
+                # for an unrelated note or persona still being delivered.
+                return result
+
+        result = await asyncio.get_running_loop().run_in_executor(
+            self._infer_executor, transition
+        )
+        if result is None or session_id != self._active_session_id:
+            return False
+        for cancelled in result.cancelled:
+            self._send_context_status(cancelled.status, cancelled.meta, sess=session)
+        if result.close_inject:
+            session.send_inject_status(False)
         return True
 
-    def _clear_reinforce_waiting(self) -> None:
-        self._reinforce_pending.clear()
-        self._reinforce_pending_meta = {}
-
-    def _clear_reinforce_active(self) -> None:
-        self._reinforce_active.clear()
-        self._reinforce_active_meta = {}
-        self._reinforce_inject_steps = 0
-
-    def _defer_reinforce_seal(self) -> None:
-        if (
-            self._reinforce_inject_steps > 0
-            and self._context_seal_token is not None
-            and not self._reinforce_seal_pending
-        ):
-            self._reinforce_seal_pending = True
-            self._reinforce_seal_meta = dict(self._reinforce_active_meta)
-        self._active_context_meta = dict(self._reinforce_active_meta)
-        self._clear_reinforce_active()
-
-    def _clear_reinforce_pending(self) -> None:
-        self._clear_reinforce_waiting()
-        self._clear_reinforce_active()
-        self._reinforce_seal_pending = False
-        self._reinforce_seal_meta = {}
 
     def _gate_outbound_pcm(self, pcm_np: np.ndarray, muted: bool) -> np.ndarray:
         """Silence gated outbound audio with a short ramp at each boundary.
@@ -6328,12 +6203,13 @@ class ServerState:
         """
         if now is None:
             now = time.monotonic()
-        reason = getattr(self.lm_gen, "_pad_force_reason", "") or "cap"
+        reason = self.lm_gen.controls.pad_force_reason or "cap"
         self._schedule_turn_cap_event(pad_force, reason)
         if reason != "dense":
             # A reply-length cap trip is a long answer, not evidence of a
             # loop; counting it would auto-rewind healthy conversations.
             return
+        self._last_dense_trip_at = now
         cutoff = now - COLLAPSE_WINDOW_SEC
         while self._collapse_triggers and self._collapse_triggers[0] < cutoff:
             self._collapse_triggers.popleft()
@@ -6387,8 +6263,8 @@ class ServerState:
             if snapshots:
                 snapshot_age = max(0.0, now - snapshots[-1][0])
                 logger.warning(
-                    "auto-rewind skipped: latest snapshot is "
-                    "%.0fs old (limit %.0fs)",
+                    "auto-rewind skipped: no eligible recovery point; latest "
+                    "snapshot age %.0fs (limit %.0fs)",
                     snapshot_age,
                     AUTO_REWIND_SNAPSHOT_MAX_AGE_SEC,
                 )
@@ -6411,7 +6287,11 @@ class ServerState:
         loop = getattr(self, "_main_loop", None)
         if sess is None or loop is None:
             return
-        reason = "stale_snapshot" if snapshot_age_sec is not None else "no_snapshot"
+        reason = (
+            "no_snapshot" if snapshot_age_sec is None
+            else "stale_snapshot" if snapshot_age_sec > AUTO_REWIND_SNAPSHOT_MAX_AGE_SEC
+            else "ineligible_snapshot"
+        )
         data: dict[str, object] = {
             "triggers": int(trigger_count),
             "window_sec": float(COLLAPSE_WINDOW_SEC),
@@ -6421,8 +6301,8 @@ class ServerState:
             data["snapshot_age_sec"] = round(float(snapshot_age_sec), 1)
         text = (
             f"Collapse detected ({trigger_count} runaway text streams in "
-            f"{COLLAPSE_WINDOW_SEC:.0f} s) with no recent snapshot to rewind "
-            "to; enable periodic snapshots or lower the sampling heat"
+            f"{COLLAPSE_WINDOW_SEC:.0f} s), but no eligible recent recovery "
+            "point is available; waiting for a clean checkpoint"
         )
         try:
             loop.call_soon_threadsafe(
@@ -6437,19 +6317,12 @@ class ServerState:
 
     def _reset_turn_cap_tracking_for_config_change(self) -> None:
         """Start a new cap accounting window without cancelling an interrupt."""
-        self.lm_gen._non_pad_streak = 0
-        self.lm_gen._turn_pad_streak = 0
-        self.lm_gen._dense_text_streak = 0
-        # Any in-flight token copy belongs to the accounting window being
-        # discarded; a stale pending flag would otherwise satisfy the next
-        # read with an abandoned frame's token.
-        self.lm_gen._turn_cap_token_pending = False
-        self.lm_gen._turn_cap_token_recorded = False
+        self.lm_gen.reset_turn_cap_accounting()
         self._collapse_triggers.clear()
         # A live update may land during the shared forced-PAD window used by
         # manual interruption. Preserve that window and mark its current
         # state as already observed so it cannot manufacture a new cap edge.
-        self._prev_pad_force_remaining = self.lm_gen._pad_force_remaining
+        self._prev_pad_force_remaining = self.lm_gen.controls.pad_force_remaining
 
     def _schedule_turn_cap_event(self, pad_force: int, reason: str = "cap") -> None:
         """Surface a forced-PAD transition from the inference worker safely."""
@@ -6497,6 +6370,9 @@ class ServerState:
                 "without a clear user turn"
             )
             level = "warn"
+        elif reason == "speak":
+            text = "Stop hold released by Speak now"
+            level = "ok"
         else:
             text = "Stop hold released; new user turn heard"
             level = "ok"
@@ -6543,19 +6419,19 @@ class ServerState:
     def _apply_auto_recovery_tuning_locked(self) -> None:
         """Replace collapse-causing live tuning after an automatic rewind."""
         is_base = self.model_identity.get("model_variant") == "base"
-        self.lm_gen.temp_text = 0.7
-        self.lm_gen.top_k_text = min(25, self.lm_gen.lm_model.text_card)
-        self.lm_gen.semantic_temperature_cap = DEFAULT_SEMANTIC_TEMPERATURE_CAP
-        self.lm_gen.set_audio_sampling(
-            0.7 if is_base else 0.8,
-            min(250, self.lm_gen.lm_model.card),
+        # Preserve deliberate PAD/onset pacing while replacing stochastic
+        # settings that can sustain collapse.
+        self.lm_gen.apply_sampling(
+            temp_text=0.7,
+            top_k_text=min(25, self.lm_gen.lm_model.text_card),
+            semantic_temperature_cap=DEFAULT_SEMANTIC_TEMPERATURE_CAP,
+            temp=0.7 if is_base else 0.8,
+            top_k=min(250, self.lm_gen.lm_model.card),
+            repetition_penalty=1.15 if is_base else 1.0,
+            repetition_penalty_context=64,
+            min_p_text=0.0,
+            max_turn_text_tokens=240,
         )
-        self.lm_gen.repetition_penalty = 1.15 if is_base else 1.0
-        self.lm_gen.repetition_penalty_context = 64
-        self.lm_gen.padding_bonus = 0.0
-        self.lm_gen.turn_onset_bias = 0.0
-        self.lm_gen.min_p_text = 0.0
-        self.lm_gen.max_turn_text_tokens = 240
         self.lm_gen.reset_repetition_state()
         self._reset_turn_cap_tracking_for_config_change()
 
@@ -7303,10 +7179,10 @@ class ServerState:
                 self._vision_request_force = False
                 self._vision_request_reason = "cadence"
                 self._vision_context_after_next_caption = None
-                self._last_ambient_context_queued_at = 0.0
-                self._inject_active = False
-                self._inject_end_status = "complete"
-                self._inject_seal_remaining = 0
+                self._context.last_ambient_queued_at = 0.0
+                self._context.injecting = False
+                self._context.end_status = "complete"
+                self._context.hold_remaining = 0
                 self._last_rewind_at = None
                 self._auto_rewind_pending = False
                 self._interrupt_gate_remaining = 0
@@ -7466,6 +7342,7 @@ class ServerState:
                             session,
                             session_id,
                             state_dict,
+                            intent=RestoreIntent.MANUAL,
                         )
                         if not restored:
                             return
@@ -7511,6 +7388,7 @@ class ServerState:
                         session,
                         session_id,
                         state_dict,
+                        intent=RestoreIntent.MANUAL,
                     )
                     if not restored:
                         return
@@ -7528,6 +7406,14 @@ class ServerState:
                             type(exc).__name__,
                             exc,
                         )
+                elif mtype == "speak":
+                    if not warmup_done.is_set():
+                        session.send_event(
+                            "speak", "Speech requests unavailable during warmup",
+                            "warn", {"status": "rejected", "reason": "warming_up"},
+                        )
+                        return
+                    await self._handle_speak(session, session_id, clog)
                 elif mtype == "voice_reset":
                     if not warmup_done.is_set():
                         try:
@@ -7931,7 +7817,7 @@ class ServerState:
                                     with self._infer_lock:
                                         if session_id != self._active_session_id:
                                             return
-                                        self._clear_vision_source("ambient")
+                                        self._cancel_camera_context_source("ambient")
 
                                 await loop.run_in_executor(
                                     self._infer_executor,
@@ -7953,7 +7839,7 @@ class ServerState:
                                     with self._infer_lock:
                                         if session_id != self._active_session_id:
                                             return
-                                        self._clear_vision_source("user_turn")
+                                        self._cancel_camera_context_source("user_turn")
 
                                 await loop.run_in_executor(
                                     self._infer_executor,
@@ -7998,9 +7884,17 @@ class ServerState:
                         if inject_silence_streak is not None:
                             self._inject_silence_streak = inject_silence_streak
                         if turn_handling_update is not None:
-                            # Plain attribute read by the interrupt paths;
-                            # the rebind is atomic in CPython.
-                            self._active_turn_handling = turn_handling_update
+                            def _set_turn_mode():
+                                with self._infer_lock:
+                                    if session_id != self._active_session_id:
+                                        return
+                                    if self._active_turn_handling != turn_handling_update:
+                                        self._active_turn_handling = turn_handling_update
+                                        self._barge_tracking_mode = None
+                                        self._assisted_barge_streak = 0
+                                        self._gentle_barge_quiet_streak = 0
+
+                            await loop.run_in_executor(self._infer_executor, _set_turn_mode)
                     applied = [k for k in live_keys if k in msg]
                     if not applied:
                         return
@@ -8026,25 +7920,14 @@ class ServerState:
                                     # caption; an active decay keeps its current
                                     # trajectory.
                                     self._caption_cfg_gamma = caption_cfg_gamma
+                                sampling_updates = dict(updates)
                                 if semantic_temp_cap is not None:
-                                    # Assign before the sampling write so the
-                                    # refreshed vector uses the new cap.
-                                    self.lm_gen.semantic_temperature_cap = (
-                                        semantic_temp_cap
-                                    )
-                                if (
-                                    audio_temperature is not None
-                                    or audio_top_k is not None
-                                    or semantic_temp_cap is not None
-                                ):
-                                    self.lm_gen.set_audio_sampling(
-                                        audio_temperature
-                                        if audio_temperature is not None
-                                        else self.lm_gen.temp,
-                                        audio_top_k
-                                        if audio_top_k is not None
-                                        else self.lm_gen.top_k,
-                                    )
+                                    sampling_updates["semantic_temperature_cap"] = semantic_temp_cap
+                                if audio_temperature is not None:
+                                    sampling_updates["temp"] = audio_temperature
+                                if audio_top_k is not None:
+                                    sampling_updates["top_k"] = audio_top_k
+                                self.lm_gen.apply_sampling(**sampling_updates)
                                 if (
                                     "repetition_penalty" in updates
                                     or "repetition_penalty_context" in updates
@@ -8054,8 +7937,6 @@ class ServerState:
                                     # tokens may be arbitrarily stale and a
                                     # wrapped ring's prefix is not the newest N.
                                     self.lm_gen.reset_repetition_state()
-                                for attr, val in updates.items():
-                                    setattr(self.lm_gen, attr, val)
 
                         await loop.run_in_executor(
                             self._infer_executor, _apply_live_config
@@ -8103,66 +7984,16 @@ class ServerState:
                         )
                     except (TypeError, ValueError, OverflowError):
                         return
-                    # The client reuses one generation for a start and the
-                    # stop that ends it, so stops may re-apply at an equal
-                    # generation but a start must be strictly newer: letting
-                    # an equal-generation start through would replay a stale
-                    # started after the stopped that shares its generation
-                    # and leave the source marked live with the camera off.
-                    if source_generation < self._vision_source_generation or (
-                        source_generation == self._vision_source_generation
-                        and mtype == "vision_source_started"
-                    ):
-                        return
-                    pending_tasks = list(
-                        self._vision_live_tasks.get(session_id, set())
+                    changed = await self._handle_vision_source(
+                        session, session_id, source_generation,
+                        mtype == "vision_source_started",
                     )
-                    for pending_task in pending_tasks:
-                        pending_task.cancel()
-                    if pending_tasks:
-                        await asyncio.gather(
-                            *pending_tasks, return_exceptions=True
+                    if changed:
+                        clog.log(
+                            "info",
+                            f"vision source {'started' if self._context.camera_active else 'stopped'} "
+                            f"generation={source_generation}",
                         )
-
-                    def _reset_vision_source() -> None:
-                        with self._infer_lock:
-                            if session_id != self._active_session_id:
-                                return
-                            # Re-check under the lock: handlers run as
-                            # separate tasks and suspend before this executor
-                            # job, so a stale transition can arrive here after
-                            # a newer one already applied. Letting it through
-                            # would roll the generation backward and silently
-                            # drop every frame the client sends afterwards.
-                            if source_generation < self._vision_source_generation or (
-                                source_generation == self._vision_source_generation
-                                and mtype == "vision_source_started"
-                            ):
-                                return
-                            self._vision_source_generation = source_generation
-                            self._vision_source_active = (
-                                mtype == "vision_source_started"
-                            )
-                            self._clear_vision_pending()
-                            self._clear_reinforce_pending()
-                            self._active_context_meta = {}
-                            self._latest_vision_caption = ""
-                            self._latest_vision_at = 0.0
-                            self._latest_vision_frame_id = ""
-                            self._last_injected_vision_key = ""
-                            self._last_ambient_context_queued_at = 0.0
-                            self._vision_context_after_next_caption = None
-                            self._vision_pad_streak = 0
-                            self._audio_silence_streak = 0
-
-                    await loop.run_in_executor(
-                        self._infer_executor, _reset_vision_source
-                    )
-                    clog.log(
-                        "info",
-                        f"vision source {'started' if self._vision_source_active else 'stopped'} "
-                        f"generation={source_generation}",
-                    )
                 elif mtype == "vision_frame":
                     base64_data = msg.get("data", "")
                     if base64_data:
@@ -8184,16 +8015,16 @@ class ServerState:
                                 int(
                                     msg.get(
                                         "source_generation",
-                                        self._vision_source_generation,
+                                        self._context.camera_generation,
                                     )
                                 ),
                             )
                         except (TypeError, ValueError, OverflowError):
                             return
                         if not historical_detail and (
-                            not self._vision_source_active
+                            not self._context.camera_active
                             or source_generation
-                            != self._vision_source_generation
+                            != self._context.camera_generation
                         ):
                             return
                         frame_id = str(msg.get("frame_id") or "")[:128]
@@ -8222,82 +8053,14 @@ class ServerState:
                         )
                 elif mtype == "context_note":
                     if not warmup_done.is_set():
-                        try:
-                            session.send_event(
-                                "context_note",
-                                "Context notes unavailable during warmup",
-                                "warn",
-                            )
-                        except Exception as exc:
-                            logger.warning(
-                                "context note warmup notify failed: %s: %s",
-                                type(exc).__name__,
-                                exc,
-                            )
+                        session.send_event(
+                            "context_note", "Context notes unavailable during warmup",
+                            "warn", {"status": "rejected", "reason": "warming_up"},
+                        )
                         return
-                    note_raw = msg.get("text")
-                    note = (
-                        " ".join(str(note_raw).split())
-                        if isinstance(note_raw, str)
-                        else ""
+                    await self._handle_context_note(
+                        session, session_id, msg.get("text"), clog
                     )
-                    if not note:
-                        session.send_event(
-                            "context_note", "Empty context note ignored", "warn"
-                        )
-                        return
-                    context, tokens = self._fit_vision_context(note)
-                    if not tokens:
-                        session.send_event(
-                            "context_note",
-                            "Context note could not be tokenized",
-                            "warn",
-                        )
-                        return
-                    note_meta = {
-                        "source": "manual",
-                        "reason": "typed_note",
-                        "text": context,
-                        "caption": context.rstrip(".!?"),
-                        "tokens": len(tokens),
-                        "remaining_tokens": len(tokens),
-                    }
-                    note_result = {"ok": False, "blocked_by": ""}
-
-                    def _queue_note() -> None:
-                        with self._infer_lock:
-                            if session_id != self._active_session_id:
-                                return
-                            ok, blocked_by, _dup = (
-                                self._queue_waiting_vision_context(
-                                    tokens, "manual", note_meta
-                                )
-                            )
-                            note_result["ok"] = ok
-                            note_result["blocked_by"] = blocked_by
-
-                    await loop.run_in_executor(
-                        self._infer_executor, _queue_note
-                    )
-                    if note_result["ok"]:
-                        self._send_context_status(
-                            "queued", note_meta, sess=session
-                        )
-                        session.send_event(
-                            "context_note",
-                            "Context note queued; it drips in at the next "
-                            "quiet boundary",
-                            "ok",
-                            {"tokens": len(tokens)},
-                        )
-                        clog.log("info", f"context note queued ({len(tokens)} tokens)")
-                    else:
-                        session.send_event(
-                            "context_note",
-                            "Context note not queued",
-                            "warn",
-                            {"blocked_by": note_result["blocked_by"]},
-                        )
                 elif mtype == "use_latest_vision":
                     if not warmup_done.is_set():
                         try:
@@ -8382,12 +8145,12 @@ class ServerState:
                         try:
                             snap = await asyncio.shield(snapshot_future)
                             snapshot_future = None
-                        except SnapshotDeferred:
+                        except SnapshotDeferred as exc:
                             snapshot_future = None
                             next_delay = 1.0
                             clog.log(
                                 "info",
-                                "periodic snapshot deferred during context inject",
+                                f"periodic snapshot deferred: {exc}",
                             )
                             continue
                         except Exception as exc:
@@ -8410,7 +8173,7 @@ class ServerState:
                         if history is None:
                             break
                         with self._snapshot_registry_lock:
-                            history[:] = [(time.monotonic(), snap)]
+                            history[:] = [(snap["captured_at"], snap)]
                         self._refresh_snapshot_inventory_metrics()
                 except asyncio.CancelledError:
                     if snapshot_future is not None and not snapshot_future.done():
@@ -8943,7 +8706,7 @@ class ServerState:
                 # Drain in-flight Gemini calls before the next session can
                 # acquire the lock. A stale handle_vision_frame still
                 # awaiting a response would otherwise overwrite the next
-                # session's _vision_pending under _infer_lock.
+                # session's waiting context under _infer_lock.
                 pending_vision = self._vision_tasks.pop(session_id, set())
                 self._vision_live_tasks.pop(session_id, None)
                 for vt in pending_vision:

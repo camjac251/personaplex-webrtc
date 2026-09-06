@@ -29,8 +29,8 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, fields, replace
 from functools import partial
 from os.path import splitext, exists
 import logging
@@ -52,6 +52,7 @@ from ..modules.transformer import (
     create_norm_fn,
 )
 from ..voice_select import select_voice_window
+from .lm_controls import LMControlState, LMPreviewState, LMSamplingSettings, SAMPLING_FIELDS
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,8 @@ MAX_REPETITION_CONTEXT = 256
 # there so the penalty suppresses within-turn token loops without
 # penalizing the next turn's natural opening words.
 REPETITION_TURN_BREAK_FRAMES = 12
+# Extra natural text tokens allowed to finish a sentence after the reply target.
+TURN_CAP_SENTENCE_GRACE_TOKENS = 24
 # Consecutive natural non-PAD text frames that mark a runaway text stream.
 # Speech puts PAD frames between words (about 3 tokens/s against the
 # 12.5 Hz frame rate), so a token on every frame for this long (3.2 s) is
@@ -826,6 +829,7 @@ class LMGen(StreamingModule[_LMGenState]):
         self.padding_bonus = padding_bonus
         self.turn_onset_bias = turn_onset_bias
         self.max_turn_text_tokens = max_turn_text_tokens
+        self._sentence_end_tokens: frozenset[int] = frozenset()
         self.semantic_temperature_cap = float(semantic_temperature_cap)
         # Min-p truncation for the text head only: keep tokens whose
         # probability is at least min_p_text of the step's maximum. 0
@@ -866,18 +870,7 @@ class LMGen(StreamingModule[_LMGenState]):
         # reset to on restore. 1.0 without persona-CFG; the session's persona
         # guidance strength with it.
         self.cfg_gamma_floor: float = 1.0
-        self._non_pad_streak = 0
-        self._turn_pad_streak = 0
-        # Consecutive natural non-PAD frames; the runaway-text detector.
-        self._dense_text_streak = 0
-        self._pad_force_remaining = 0
-        # Why the current forced-PAD window was armed: "cap" (reply length)
-        # or "dense" (runaway text). Only the latter is collapse evidence.
-        self._pad_force_reason = ""
-        # True from a forced-text frame until the next naturally sampled
-        # text token; holds the continuation-only padding bonus off while
-        # the frozen _non_pad_streak still reads positive.
-        self._forced_text_recent = False
+        self.controls = LMControlState()
         turn_cap_on_cuda = torch.device(self.lm_model.device).type == "cuda"
         self._turn_cap_token_host = torch.empty(
             1,
@@ -888,8 +881,6 @@ class LMGen(StreamingModule[_LMGenState]):
         self._turn_cap_token_event = (
             torch.cuda.Event() if turn_cap_on_cuda else None
         )
-        self._turn_cap_token_pending = False
-        self._turn_cap_token_recorded = False
         self.text_prompt_tokens = text_prompt_tokens
         self.audio_silence_frame_cnt = audio_silence_frame_cnt
         self.voice_prompt = None
@@ -1236,21 +1227,31 @@ class LMGen(StreamingModule[_LMGenState]):
 
         next_text_token = torch.where(provided_[:, 0, 0], target_[:, 0, 0], sampled_text_token)
 
-        # Hard cap on turn length. If the model emits N text tokens within a
-        # turn, force pad for ~1 s of text frames (12.5 Hz) so the audio
-        # decoder produces real silence and the turn actually yields. Brief
-        # PAD gaps between phrases do not reset the count; only a sustained
-        # natural PAD/EPAD run marks a new turn.
+        # Bound natural reply length, allowing sentence-terminal grace when
+        # tokenizer metadata is configured. At the boundary, force PAD for
+        # ~1 s (12.5 Hz) so the decoder yields. Brief PAD gaps do not reset
+        # the count; only a sustained natural PAD/EPAD run marks a new turn.
         # CUDA copies the sampled token to pinned host memory before the
         # depformer launch, then host accounting reads it after the frame's
-        # GPU work is submitted. A newly reached cap arms padding for the
-        # following frame, preserving the same maximum emitted-token count.
+        # GPU work is submitted. Padding starts on the following frame,
+        # preserving the terminal token that reaches the boundary.
         pad_id = lm_model.text_padding_token_id
         next_text_token, turn_pad_forced = self._consume_forced_pad(
             next_text_token,
             pad_id,
             text_was_forced=text_was_forced,
         )
+        if (
+            self.controls.speech_onset_pending
+            and not text_was_forced
+            and not turn_pad_forced
+        ):
+            # EPAD opens a word without replacing the conversation prefix.
+            # Unlike context injection, its audio is generated and heard.
+            next_text_token = torch.full_like(
+                next_text_token, lm_model.end_of_text_padding_id
+            )
+            self.controls.speech_onset_pending = False
         self._queue_turn_cap_token_copy(
             next_text_token,
             text_was_forced=text_was_forced,
@@ -1538,9 +1539,9 @@ class LMGen(StreamingModule[_LMGenState]):
 
         padding_bonus lifts PAD only mid-turn: ungated it outbids EPAD at
         the moment speech would start, so it waits for the previous frame's
-        accounting to show natural text underway (``_non_pad_streak > 0``,
+        accounting to show natural text underway (``non_pad_streak > 0``,
         the one-frame lag accepted for max_turn_text_tokens). Forced-text
-        windows freeze that streak, so ``_forced_text_recent`` holds the
+        windows freeze that streak, so ``forced_text_recent`` holds the
         bonus off until a natural text token is sampled again: the reply
         after a caption drip is an onset, not a continuation. The
         accounting zeroes the streak whenever ``max_turn_text_tokens <= 0``,
@@ -1552,7 +1553,7 @@ class LMGen(StreamingModule[_LMGenState]):
         """
         padding_bonus_active = self.padding_bonus != 0.0 and (
             self.max_turn_text_tokens <= 0
-            or (self._non_pad_streak > 0 and not self._forced_text_recent)
+            or (self.controls.non_pad_streak > 0 and not self.controls.forced_text_recent)
         )
         if not padding_bonus_active and self.turn_onset_bias == 0.0:
             return text_logits_f
@@ -1577,9 +1578,9 @@ class LMGen(StreamingModule[_LMGenState]):
     ) -> tuple[torch.Tensor, bool]:
         # Interrupts use the same force window as the automatic turn cap and
         # must work even when max_turn_text_tokens is disabled.
-        if text_was_forced or self._pad_force_remaining <= 0:
+        if text_was_forced or self.controls.pad_force_remaining <= 0:
             return next_text_token, False
-        self._pad_force_remaining -= 1
+        self.controls.pad_force_remaining -= 1
         return torch.full_like(next_text_token, pad_id), True
 
     def _queue_turn_cap_token_copy(
@@ -1598,17 +1599,17 @@ class LMGen(StreamingModule[_LMGenState]):
             next_text_token[:1], non_blocking=True
         )
         event.record(torch.cuda.current_stream(next_text_token.device))
-        self._turn_cap_token_pending = True
-        self._turn_cap_token_recorded = True
+        self.controls.turn_cap_token_pending = True
+        self.controls.turn_cap_token_recorded = True
 
     def _read_turn_cap_token(self, next_text_token: torch.Tensor) -> int:
-        if not getattr(self, "_turn_cap_token_pending", False):
+        if not self.controls.turn_cap_token_pending:
             return int(next_text_token[0])
-        if not getattr(self, "_turn_cap_token_recorded", False):
+        if not self.controls.turn_cap_token_recorded:
             # A pending flag without a freshly recorded event means the
             # bookkeeping was reset mid-frame; the host buffer is stale, so
             # fall back to the caller's token instead of consuming it.
-            self._turn_cap_token_pending = False
+            self.controls.turn_cap_token_pending = False
             return int(next_text_token[0])
         event = self._turn_cap_token_event
         assert event is not None
@@ -1616,32 +1617,66 @@ class LMGen(StreamingModule[_LMGenState]):
         # cannot drain the depth graph launched later in the frame.
         if not event.query():
             event.synchronize()
-        self._turn_cap_token_pending = False
-        self._turn_cap_token_recorded = False
+        self.controls.turn_cap_token_pending = False
+        self.controls.turn_cap_token_recorded = False
         return int(self._turn_cap_token_host[0])
 
-    def reset_turn_cap_tracking(self) -> None:
-        """Zero every turn-cap counter and drop in-flight copy bookkeeping.
+    def set_sentence_end_tokens(self, tokens: Iterable[int]) -> None:
+        """Configure tokenizer-derived sentence terminals once at startup.
 
-        The pinned host buffer may still carry a token from an abandoned
-        frame; clearing both flags guarantees the next accounting pass reads
-        a freshly recorded event or falls back to the caller's token.
+        Callers identify pieces ending in sentence punctuation after stripping
+        closers. This is a punctuation heuristic, not sentence parsing. The
+        immutable CPU membership survives turn resets and preview transactions;
+        an empty set keeps the hard cap for callers without tokenizer metadata.
         """
-        self._non_pad_streak = 0
-        self._turn_pad_streak = 0
-        self._dense_text_streak = 0
-        self._pad_force_remaining = 0
-        self._pad_force_reason = ""
-        self._forced_text_recent = False
-        self._turn_cap_token_pending = False
-        self._turn_cap_token_recorded = False
+        self._sentence_end_tokens = frozenset(tokens)
+
+    def reset_turn_cap_accounting(self) -> None:
+        """Start a new accounting window without cancelling PAD or a cue."""
+        self.controls.non_pad_streak = 0
+        self.controls.turn_pad_streak = 0
+        self.controls.dense_text_streak = 0
+        # Discard stale host-copy bookkeeping, not the captured host buffer.
+        self.controls.turn_cap_token_pending = False
+        self.controls.turn_cap_token_recorded = False
+
+    def reset_turn_cap_tracking(self) -> None:
+        """Clear turn bookkeeping and cancel any unconsumed speech cue."""
+        self.reset_turn_cap_accounting()
+        self.controls.pad_force_remaining = 0
+        self.controls.pad_force_reason = ""
+        self.controls.forced_text_recent = False
+        self.cancel_speech()
+
+    def cancel_speech(self) -> None:
+        """Cancel a pending cue without changing the current turn."""
+        self.controls.speech_onset_pending = False
+
+    def request_speech(self) -> None:
+        """Release a stopped turn and cue one natural EPAD with normal audio.
+
+        Forced context and automatic cap frames defer consumption. No KV,
+        voice conditioning, graph buffers, or random state are replaced.
+        """
+        self.reset_turn_cap_tracking()
+        self.reset_repetition_state()
+        self.controls.speech_onset_pending = True
+
+    def interrupt(self, yield_frames: int) -> None:
+        """Abort a turn, keeping an already longer forced-silence window."""
+        if isinstance(yield_frames, bool) or not isinstance(yield_frames, int) or yield_frames < 0:
+            raise ValueError("yield_frames must be a nonnegative integer")
+        remaining = max(self.controls.pad_force_remaining, yield_frames)
+        self.reset_turn_cap_tracking()
+        self.reset_repetition_state()
+        self.controls.pad_force_remaining = remaining
 
     def _arm_pad_force(self, reason: str) -> None:
         """Force the turn-break PAD window and record why."""
-        self._pad_force_remaining = REPETITION_TURN_BREAK_FRAMES
-        self._pad_force_reason = reason
-        self._non_pad_streak = 0
-        self._dense_text_streak = 0
+        self.controls.pad_force_remaining = REPETITION_TURN_BREAK_FRAMES
+        self.controls.pad_force_reason = reason
+        self.controls.non_pad_streak = 0
+        self.controls.dense_text_streak = 0
 
     def _update_turn_cap(
         self,
@@ -1656,36 +1691,43 @@ class LMGen(StreamingModule[_LMGenState]):
         Two detectors share the read: the reply-length cap counts natural
         tokens across short pauses, and the runaway-text detector counts
         consecutive frames without a PAD, which speech never sustains.
+        With sentence metadata, the target waits for a terminal token, bounded
+        by a fixed natural-token grace window; it never changes dense detection.
         """
         if text_was_forced:
             # The freeze keeps the cap count across the window; the flag
             # keeps the frozen streak from reading as text underway to the
             # padding-bonus gate until natural text resumes.
-            self._forced_text_recent = True
+            self.controls.forced_text_recent = True
             return
         if turn_pad_forced:
-            self._non_pad_streak = 0
-            self._turn_pad_streak = 0
-            self._dense_text_streak = 0
+            self.controls.non_pad_streak = 0
+            self.controls.turn_pad_streak = 0
+            self.controls.dense_text_streak = 0
             return
         token = self._read_turn_cap_token(next_text_token)
         if token in (0, pad_id):
-            self._dense_text_streak = 0
-            self._turn_pad_streak += 1
-            if self._turn_pad_streak >= REPETITION_TURN_BREAK_FRAMES:
-                self._non_pad_streak = 0
+            self.controls.dense_text_streak = 0
+            self.controls.turn_pad_streak += 1
+            if self.controls.turn_pad_streak >= REPETITION_TURN_BREAK_FRAMES:
+                self.controls.non_pad_streak = 0
             return
-        self._turn_pad_streak = 0
-        self._forced_text_recent = False
-        self._dense_text_streak += 1
-        if self._dense_text_streak >= DENSE_TEXT_COLLAPSE_FRAMES:
+        self.controls.turn_pad_streak = 0
+        self.controls.forced_text_recent = False
+        self.controls.dense_text_streak += 1
+        if self.controls.dense_text_streak >= DENSE_TEXT_COLLAPSE_FRAMES:
             self._arm_pad_force("dense")
             return
         if self.max_turn_text_tokens <= 0:
-            self._non_pad_streak = 0
+            self.controls.non_pad_streak = 0
             return
-        self._non_pad_streak += 1
-        if self._non_pad_streak >= self.max_turn_text_tokens:
+        self.controls.non_pad_streak += 1
+        if self.controls.non_pad_streak >= self.max_turn_text_tokens and (
+            not self._sentence_end_tokens
+            or token in self._sentence_end_tokens
+            or self.controls.non_pad_streak
+            >= self.max_turn_text_tokens + TURN_CAP_SENTENCE_GRACE_TOKENS
+        ):
             self._arm_pad_force("cap")
 
     def reset_repetition_state(self) -> None:
@@ -1711,24 +1753,96 @@ class LMGen(StreamingModule[_LMGenState]):
         self._audio_temperature.fill_(acoustic)
         self._audio_temperature[0] = semantic
 
-    def set_audio_sampling(self, temperature: float, top_k: int) -> bool:
-        """Apply graph-safe acoustic sampling controls in place.
+    def sampling_settings(self) -> LMSamplingSettings:
+        """Capture scalar sampling settings without reading GPU tensors."""
+        return LMSamplingSettings(**{name: getattr(self, name) for name in SAMPLING_FIELDS})
 
-        Both values are copied into CUDA-graph input tensors. The depformer
-        uses a fixed-cardinality top-k and masks ranks against the tensor k,
-        and the per-level temperature vector keeps its shape, so neither
-        update requires graph recapture.
+    def apply_sampling(self, **updates: float | int | bool) -> bool:
+        """Validate a partial update before changing any live setting.
 
-        Returns whether top-k changed (for applied-config telemetry).
+        Uses the public LM setting names in LMSamplingSettings. Temperatures
+        and top-k are written into existing graph inputs, never recaptured.
+        Returns whether acoustic top-k changed, for applied-config telemetry.
         """
-        temperature = float(temperature)
-        top_k = int(top_k)
-        top_k_changed = top_k != self.top_k
-        self.temp = temperature
-        self._write_audio_temperature(temperature)
-        self.top_k = top_k
-        self._audio_top_k.fill_(top_k)
+        settings = replace(self.sampling_settings(), **updates)
+        settings.validate(MAX_REPETITION_CONTEXT)
+        # The sampling/argmax branch itself is Python code captured by the
+        # depth graph, unlike the live temperature and top-k tensor inputs.
+        if (
+            settings.use_sampling != self.use_sampling
+            and self._audio_temperature.device.type == "cuda"
+            and self.is_streaming
+        ):
+            raise ValueError("use_sampling cannot change during CUDA streaming")
+        top_k_changed = settings.top_k != self.top_k
+        for name in updates:
+            setattr(self, name, getattr(settings, name))
+        if "temp" in updates or "semantic_temperature_cap" in updates:
+            self._write_audio_temperature(settings.temp)
+        if "top_k" in updates:
+            self._audio_top_k.fill_(settings.top_k)
         return top_k_changed
+
+    def capture_preview_state(self) -> LMPreviewState:
+        """Capture non-streaming state while the owner holds its infer lock.
+
+        Prompt loads replace references; priming only reads their contents.
+        Retain those references instead of cloning model/device state. A
+        pending host token is tiny, but its D2H write must finish before read.
+        """
+        token = None
+        if self.controls.turn_cap_token_pending and self.controls.turn_cap_token_recorded:
+            event = self._turn_cap_token_event
+            if event is not None:
+                event.synchronize()
+            token = int(self._turn_cap_token_host[0])
+        return LMPreviewState(
+            sampling=self.sampling_settings(),
+            controls=replace(self.controls),
+            cfg_gamma=self.cfg_gamma,
+            cfg_gamma_floor=self.cfg_gamma_floor,
+            persona_cfg=self.persona_cfg,
+            text_prompt_tokens=self.text_prompt_tokens,
+            voice_prompt_strength=self.voice_prompt_strength,
+            voice_selection_interval=self.voice_selection_interval,
+            voice_prompt=self.voice_prompt,
+            voice_prompt_audio=self.voice_prompt_audio,
+            voice_prompt_cache=self.voice_prompt_cache,
+            voice_prompt_embeddings=self.voice_prompt_embeddings,
+            voice_prompt_full_state=self.voice_prompt_full_state,
+            turn_cap_token=token,
+        )
+
+    def restore_preview_state(self, snapshot: LMPreviewState) -> None:
+        """Restore non-streaming state without replacing any graph input.
+
+        The caller independently restores streaming buffers in place and RNG
+        state, and aggregates restoration failures across both model/codecs.
+        """
+        self.apply_sampling(**{
+            name: getattr(snapshot.sampling, name) for name in SAMPLING_FIELDS
+        })
+        self.cfg_gamma = snapshot.cfg_gamma
+        self.cfg_gamma_floor = snapshot.cfg_gamma_floor
+        self.persona_cfg = snapshot.persona_cfg
+        self.text_prompt_tokens = snapshot.text_prompt_tokens
+        self.voice_prompt_strength = snapshot.voice_prompt_strength
+        self.voice_selection_interval = snapshot.voice_selection_interval
+        self.voice_prompt = snapshot.voice_prompt
+        self.voice_prompt_audio = snapshot.voice_prompt_audio
+        self.voice_prompt_cache = snapshot.voice_prompt_cache
+        self.voice_prompt_embeddings = snapshot.voice_prompt_embeddings
+        self.voice_prompt_full_state = snapshot.voice_prompt_full_state
+        # The preview may have left a D2H copy in flight. Complete it before
+        # restoring the saved token into the same pinned host allocation.
+        if self.controls.turn_cap_token_pending and self.controls.turn_cap_token_recorded:
+            event = self._turn_cap_token_event
+            if event is not None:
+                event.synchronize()
+        if snapshot.turn_cap_token is not None:
+            self._turn_cap_token_host.fill_(snapshot.turn_cap_token)
+        for field in fields(LMControlState):
+            setattr(self.controls, field.name, getattr(snapshot.controls, field.name))
 
     def _strength_voice_prompt_bounds(self) -> tuple[int, int]:
         """Return the frame-aligned conditioning interval for current controls."""

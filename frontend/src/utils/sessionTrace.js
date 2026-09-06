@@ -163,20 +163,30 @@ const CONTROLLED_STRING_FIELDS = new Set([
 // only protocol reasons we deliberately emit and collapse everything else.
 const SAFE_REASON_VALUES = new Set([
   "action_timeout",
+  "assistant_speaking",
   "barge_in",
+  "busy",
   "cadence",
   "camera_refresh",
   "caption_feed",
+  "context_busy",
   "control_closed",
+  "empty",
   "hold_ceiling",
   "manual",
   "no_snapshot",
   "regression",
   "regression_stop",
   "screen_refresh",
+  "session_ended",
   "silence",
+  "speak",
   "stale_snapshot",
+  "too_long",
+  "typed_note",
+  "user_speaking",
   "user_turn",
+  "warming_up",
 ]);
 
 // These fields are never written to a report, including when the user elects

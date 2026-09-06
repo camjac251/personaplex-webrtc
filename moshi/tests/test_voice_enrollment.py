@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +23,7 @@ sys.path.insert(0, "moshi")
 import moshi.models.lm as lm_module
 import moshi.server as server_module
 from moshi.models.lm import LMGen
+from moshi.models.lm_controls import LMControlState
 from moshi.server import (
     PREVIEW_FIXED_CONTROLS,
     PREVIEW_SAMPLE_TEXT,
@@ -285,6 +287,15 @@ class _FakeTokenizer:
 
 
 class _FakeLM:
+    sampling_settings = LMGen.sampling_settings
+    apply_sampling = LMGen.apply_sampling
+    _write_audio_temperature = LMGen._write_audio_temperature
+    reset_turn_cap_accounting = LMGen.reset_turn_cap_accounting
+    reset_turn_cap_tracking = LMGen.reset_turn_cap_tracking
+    cancel_speech = LMGen.cancel_speech
+    capture_preview_state = LMGen.capture_preview_state
+    restore_preview_state = LMGen.restore_preview_state
+
     def __init__(self, *, fail_generation: bool):
         self.use_sampling = False
         self.temp = 0.33
@@ -295,9 +306,12 @@ class _FakeLM:
         self.repetition_penalty = 1.2
         self.repetition_penalty_context = 7
         self.padding_bonus = 0.4
+        self.turn_onset_bias = 0.25
         self.semantic_temperature_cap = 0.5
         self.max_turn_text_tokens = 55
         self.cfg_gamma = 1.7
+        self.cfg_gamma_floor = 1.5
+        self.persona_cfg = True
         self.text_prompt_tokens = [9]
         self.voice_prompt = object()
         self.voice_prompt_audio = np.ones((1, 2_000), dtype=np.float32)
@@ -306,13 +320,21 @@ class _FakeLM:
         self.voice_prompt_full_state = object()
         self.voice_prompt_strength = 0.6
         self.voice_selection_interval = (200, 800)
-        self._non_pad_streak = 4
-        self._turn_pad_streak = 3
-        self._pad_force_remaining = 2
-        self._turn_cap_token_pending = True
-        self._turn_cap_token_recorded = True
-        self._audio_temperature = torch.tensor([0.3, 0.4])
-        self._audio_top_k = torch.tensor(12)
+        self.controls = LMControlState(
+            non_pad_streak=4,
+            turn_pad_streak=3,
+            dense_text_streak=5,
+            pad_force_remaining=2,
+            pad_force_reason="dense",
+            forced_text_recent=True,
+            speech_onset_pending=True,
+            turn_cap_token_pending=True,
+            turn_cap_token_recorded=True,
+        )
+        self._turn_cap_token_host = torch.tensor([17])
+        self._turn_cap_token_event = None
+        self._audio_temperature = torch.tensor([self.semantic_temperature_cap, self.temp])
+        self._audio_top_k = torch.tensor(self.top_k)
         self._sample_rate = 1_000
         self._frame_size = 100
         self.fail_generation = fail_generation
@@ -334,15 +356,6 @@ class _FakeLM:
             return 2_000 - keep, 2_000
         return 0, keep
 
-    def set_audio_sampling(self, temperature, top_k):
-        self.temp = temperature
-        self.top_k = top_k
-        self._audio_temperature.fill_(temperature)
-        self._audio_top_k.fill_(top_k)
-
-    def reset_turn_cap_tracking(self):
-        self._non_pad_streak = 0
-
     def reset_streaming(self):
         self.stream_content.fill_(-1)
 
@@ -353,13 +366,16 @@ class _FakeLM:
         return torch.zeros((1, 1, 1), dtype=torch.long)
 
     def step(self, **_kwargs):
+        self._turn_cap_token_host.fill_(99)
+        self.controls.turn_cap_token_pending = True
+        self.controls.turn_cap_token_recorded = True
         if self.fail_generation:
             raise RuntimeError("private generation detail")
         return torch.zeros((1, 9, 1), dtype=torch.long)
 
     def set_streaming_state_inplace(self, snapshot):
         self.restored_stream = True
-        self.stream_content = snapshot["state"].clone()
+        self.stream_content.copy_(snapshot["state"])
         self.restored_stream_content = self.stream_content.clone()
 
     def validate_streaming_state(self, _snapshot):
@@ -384,7 +400,7 @@ class _FakeMimi:
 
     def set_streaming_state_inplace(self, snapshot):
         self.restore_attempted = True
-        self.stream_content = snapshot["state"].clone()
+        self.stream_content.copy_(snapshot["state"])
         self.restored_stream_content = self.stream_content.clone()
         if self.fail_restore:
             raise RuntimeError("poisoned restore detail")
@@ -416,6 +432,11 @@ def test_preview_restores_every_surface_after_generation_failure() -> None:
     pointers = {
         name: getattr(lm, name)
         for name in (
+            "text_prompt_tokens",
+            "controls",
+            "_audio_temperature",
+            "_audio_top_k",
+            "_turn_cap_token_host",
             "voice_prompt",
             "voice_prompt_audio",
             "voice_prompt_cache",
@@ -441,18 +462,17 @@ def test_preview_restores_every_surface_after_generation_failure() -> None:
             "repetition_penalty",
             "repetition_penalty_context",
             "padding_bonus",
+            "turn_onset_bias",
             "semantic_temperature_cap",
             "max_turn_text_tokens",
             "cfg_gamma",
+            "cfg_gamma_floor",
+            "persona_cfg",
             "voice_prompt_strength",
             "voice_selection_interval",
-            "_non_pad_streak",
-            "_turn_pad_streak",
-            "_pad_force_remaining",
-            "_turn_cap_token_pending",
-            "_turn_cap_token_recorded",
         )
     }
+    saved_controls = replace(lm.controls)
     text_prompt_tokens = list(lm.text_prompt_tokens)
     audio_temperature = lm._audio_temperature.clone()
     audio_top_k = lm._audio_top_k.clone()
@@ -488,6 +508,8 @@ def test_preview_restores_every_surface_after_generation_failure() -> None:
     assert after_numpy_rng[2:] == before_numpy_rng[2:]
     for name, value in scalar_attrs.items():
         assert getattr(lm, name) == value
+    assert lm.controls == saved_controls
+    assert lm._turn_cap_token_host.item() == 17
     assert lm.text_prompt_tokens == text_prompt_tokens
     assert torch.equal(lm._audio_temperature, audio_temperature)
     assert torch.equal(lm._audio_top_k, audio_top_k)

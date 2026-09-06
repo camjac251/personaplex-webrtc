@@ -29,6 +29,7 @@ import {
   VISION_SEND_BUFFERED_LIMIT,
   VOICES,
 } from "./data/dashboardData.jsx";
+import { useContextNoteSubmission } from "./hooks/useContextNoteSubmission.js";
 import { useStoredState } from "./hooks/useStoredState.js";
 import { useToast } from "./hooks/useToast.js";
 import { rmsFromAnalyser } from "./utils/audio.js";
@@ -253,14 +254,23 @@ const TURN_HANDLING_MODES = [
   {
     id: "native",
     label: "Native duplex",
-    desc: "Let the aligned model handle overlap and backchannels.",
+    desc: "Default: the model handles overlap and backchannels without automatic interruption.",
+  },
+  {
+    id: "gentle",
+    label: "Gentle yield",
+    desc: "Server yields after about 1.2 seconds of sustained user audio overlapping assistant audio.",
   },
   {
     id: "assisted",
     label: "Assisted",
-    desc: "Server force-stops the assistant on sustained overlap.",
+    desc: "Faster interruption: the browser or server stops the assistant after a brief overlap.",
   },
 ];
+
+function isTurnHandlingMode(value) {
+  return TURN_HANDLING_MODES.some((mode) => mode.id === value);
+}
 
 function normalizeVisionReactionMode(value, fallback = "passive") {
   if (value === "manual") return "passive";
@@ -471,7 +481,6 @@ function App() {
   // Session-scoped runtime state (not persisted); reset when a session starts.
   const [bookmarks, setBookmarks] = useState([]);
   const [bookmarkPending, setBookmarkPending] = useState(false);
-  const [contextNoteDraft, setContextNoteDraft] = useState("");
   const [latencyMs, setLatencyMs] = useState(0);
   const [tailLatencyMs, setTailLatencyMs] = useState(0);
   const [rttSamples, setRttSamples] = useState([]);
@@ -540,7 +549,7 @@ function App() {
   const [turnHandling, setTurnHandling] = useStoredState(
     "pp_turnHandling",
     DEFAULTS.turnHandling,
-    (value) => (value === "assisted" ? "assisted" : "native"),
+    (value) => (isTurnHandlingMode(value) ? value : DEFAULTS.turnHandling),
   );
   // Persist only the server-issued opaque handle so an explicitly retained
   // clone remains removable after a reload. The source name, decoded facts,
@@ -686,15 +695,12 @@ function App() {
 
   const aiAudioRef = useRef(null);
   const visionVideoRef = useRef(null);
-  const pcRef = useRef(null);
-  const controlRef = useRef(null);
   const sessionIdRef = useRef(null);
   const sessionLifecycleRef = useRef(null);
   if (sessionLifecycleRef.current === null) {
     sessionLifecycleRef.current = createSessionLifecycle();
   }
   const pendingCandidatesRef = useRef([]);
-  const candidateStreamRef = useRef(null);
   const micStreamRef = useRef(null);
   const aiStreamRef = useRef(null);
   const audioContextRef = useRef(null);
@@ -894,6 +900,13 @@ function App() {
     if (level === "err") traceTotalsRef.current.errors += 1;
     recordTrace(kind, { message: text, offset_ms: offsetMs, ...extra }, { level });
   }, [recordTrace]);
+
+  const contextNote = useContextNoteSubmission({
+    enabled: phase === "live" && !reconnecting,
+    sendCommand: sessionLifecycleRef.current.sendCommand,
+    onNotice: addNotice,
+  });
+  const { receive: receiveContextNote, disconnect: disconnectContextNote } = contextNote;
 
   const recordRttSample = useCallback((rtt) => {
     if (!(rtt > 0)) return;
@@ -1284,7 +1297,7 @@ function App() {
       setVoiceBlend(false);
       clearUploadedVoice();
     }
-    if (profile.turnHandling === "assisted" || profile.turnHandling === "native") {
+    if (isTurnHandlingMode(profile.turnHandling)) {
       setTurnHandling(profile.turnHandling);
     } else {
       // Built-ins use `recommended`, and older partial profiles may have no
@@ -1606,7 +1619,7 @@ function App() {
       ),
     );
     setReinforceInSilences(!!config.reinforce_in_silences);
-    if (config.turn_handling === "assisted" || config.turn_handling === "native") {
+    if (isTurnHandlingMode(config.turn_handling)) {
       setTurnHandling(config.turn_handling);
     }
     setAudioTemp(clampInferenceValue("audioTemp", config.audio_temperature, DEFAULTS.audioTemp));
@@ -1687,7 +1700,7 @@ function App() {
     if (typeof mic.auto_gain === "boolean") setAutoGain(mic.auto_gain);
     if (typeof mic.output_device_id === "string") setOutputDeviceId(mic.output_device_id || "default");
     const interaction = profile?.interaction || {};
-    if (interaction.turn_handling === "assisted" || interaction.turn_handling === "native") {
+    if (isTurnHandlingMode(interaction.turn_handling)) {
       setTurnHandling(interaction.turn_handling);
     }
     const interval = readNumber(profile?.vision?.interval_ms, visionIntervalMs);
@@ -1860,7 +1873,7 @@ function App() {
       ["Rep ctx", currentProfileSnapshot.repContext, pinned.repContext],
       ["Pad", currentProfileSnapshot.padBonus, pinned.padBonus],
       ["Onset", currentProfileSnapshot.turnOnsetBias, pinned.turnOnsetBias],
-      ["Max turn", currentProfileSnapshot.maxTurn, pinned.maxTurn],
+      ["Reply target", currentProfileSnapshot.maxTurn, pinned.maxTurn],
       ["Echo", currentProfileSnapshot.echoCancel, pinned.echoCancel],
       ["Noise", currentProfileSnapshot.noiseSupp, pinned.noiseSupp],
       ["AGC", currentProfileSnapshot.autoGain, pinned.autoGain],
@@ -1983,25 +1996,25 @@ function App() {
   }, []);
 
   const sendVisionReactionFlags = useCallback((mode, sourceActive = true) => {
-    if (controlRef.current?.readyState === "open") {
-      controlRef.current.send(JSON.stringify({
+    if (sessionLifecycleRef.current.isControlOpen) {
+      sessionLifecycleRef.current.sendCommand({
         type: "update_config",
         vision_feed_model: sourceActive && mode === "continuous",
         vision_ground_user_turns: sourceActive && mode === "after_speech",
-      }));
+      });
     }
   }, []);
 
   const stopVision = useCallback(() => {
     const activeStream = visionStreamRef.current;
     const activeGeneration = visionSourceGenerationRef.current;
-    if (activeStream && controlRef.current?.readyState === "open") {
+    if (activeStream && sessionLifecycleRef.current.isControlOpen) {
       try {
-        controlRef.current.send(JSON.stringify({
+        sessionLifecycleRef.current.sendCommand({
           type: "vision_source_stopped",
           source: visionSourceKindRef.current,
           source_generation: activeGeneration,
-        }));
+        });
       } catch {
         // The transport may already be closing; local invalidation still
         // prevents a late caption from becoming current.
@@ -2040,35 +2053,9 @@ function App() {
   // destination, the running MediaRecorder, and all UI session state alive
   // so a fresh-pc reconnect can rebind without losing the session.
   const teardownTransport = useCallback(() => {
-    if (candidateStreamRef.current) {
-      try {
-        candidateStreamRef.current.close();
-      } catch {
-        // Ignore stream close failures.
-      }
-      candidateStreamRef.current = null;
-    }
+    disconnectContextNote();
+    sessionLifecycleRef.current.disposeTransport();
     pendingCandidatesRef.current = [];
-    if (controlRef.current) {
-      try {
-        controlRef.current.close();
-      } catch {
-        // Ignore channel close failures.
-      }
-      controlRef.current = null;
-    }
-    if (pcRef.current) {
-      try {
-        pcRef.current.ontrack = null;
-        pcRef.current.onconnectionstatechange = null;
-        pcRef.current.oniceconnectionstatechange = null;
-        pcRef.current.onicecandidate = null;
-        pcRef.current.close();
-      } catch {
-        // Ignore peer close failures.
-      }
-      pcRef.current = null;
-    }
     if (aiAudioRef.current) {
       try {
         aiAudioRef.current.srcObject = null;
@@ -2093,7 +2080,7 @@ function App() {
     // connection buffer until its answer arrives instead of being posted
     // against the dead session.
     sessionIdRef.current = null;
-  }, []);
+  }, [disconnectContextNote]);
 
   const cleanup = useCallback(
     (options = {}) => {
@@ -2233,15 +2220,15 @@ function App() {
         // still live (reconnect after an expired resume window), the badge
         // says "Live" while the server silently drops every frame it
         // sends. Re-announce the source under a new generation.
-        if (!resumed && visionStreamRef.current && controlRef.current?.readyState === "open") {
+        if (!resumed && visionStreamRef.current && sessionLifecycleRef.current.isControlOpen) {
           const sourceGeneration = visionSourceGenerationRef.current + 1;
           visionSourceGenerationRef.current = sourceGeneration;
           clearLivePendingVisionFrames(pendingVisionFramesRef.current);
-          controlRef.current.send(JSON.stringify({
+          sessionLifecycleRef.current.sendCommand({
             type: "vision_source_started",
             source: visionSourceKindRef.current || "camera",
             source_generation: sourceGeneration,
-          }));
+          });
         }
         if (navigator.mediaSession) {
           try {
@@ -2271,8 +2258,8 @@ function App() {
         for (const [key, val] of Object.entries(liveTuningRef.current)) {
           if (sentConfig[key] !== val) drifted[key] = val;
         }
-        if (Object.keys(drifted).length && controlRef.current?.readyState === "open") {
-          controlRef.current.send(JSON.stringify({ type: "update_config", ...drifted }));
+        if (Object.keys(drifted).length && sessionLifecycleRef.current.isControlOpen) {
+          sessionLifecycleRef.current.sendCommand({ type: "update_config", ...drifted });
         }
       } else if (message.type === "text") {
         const chunk = message.v || "";
@@ -2636,7 +2623,29 @@ function App() {
             message.audio_silence_b_complete === true,
         });
       } else if (message.type === "event") {
-        const text = message.text || message.kind || "Server event";
+        let text = message.text || message.kind || "Server event";
+        let level = message.level || "info";
+        if (message.kind === "context_note") {
+          const notice = receiveContextNote(message.data || {});
+          if (notice) ({ text, level } = notice);
+        }
+        if (message.kind === "speak") {
+          const data = message.data || {};
+          if (data.status === "requested") {
+            text = "Speak now requested; waiting for the model to respond";
+            level = "info";
+          } else if (data.status === "rejected") {
+            const reasons = {
+              warming_up: "the session is still warming up",
+              user_speaking: "wait until you have finished speaking",
+              assistant_speaking: "the assistant is already speaking",
+              context_busy: "wait for the context note to finish",
+              session_ended: "the session has ended",
+            };
+            text = `Speak now unavailable: ${reasons[data.reason] || "try again when the conversation is idle"}`;
+            level = "warn";
+          }
+        }
         if (message.kind === "bookmark") {
           const data = message.data || {};
           const status = String(data.status || "");
@@ -2698,8 +2707,8 @@ function App() {
             : kindRaw.includes("vision")
               ? "vision"
               : "event";
-        lastServerEventRef.current = { text, at: performance.now() };
-        addNotice(message.level || "info", text, kind);
+        lastServerEventRef.current = { text: message.text || text, at: performance.now() };
+        addNotice(level, text, kind);
       } else if (message.type === "notice") {
         const text = message.text || "Server notice";
         const recentEvent = lastServerEventRef.current;
@@ -2720,35 +2729,9 @@ function App() {
         setStageMessage("Session complete");
       }
     },
-    [addNotice, attachAudioGraph, cleanup, pulseInterrupt, recordRttSample, recordTrace, startRecording, stopVision, toast],
+    [addNotice, attachAudioGraph, cleanup, pulseInterrupt, receiveContextNote, recordRttSample, recordTrace, startRecording, stopVision, toast],
   );
 
-  const startCandidateStream = useCallback(
-    (sessionId) => {
-      const stream = new EventSource(`/api/rtc/candidates?session_id=${encodeURIComponent(sessionId)}`);
-      candidateStreamRef.current = stream;
-      stream.onmessage = (event) => {
-        try {
-          const candidate = JSON.parse(event.data);
-          pcRef.current?.addIceCandidate(candidate).catch((error) => {
-            console.warn("addIceCandidate failed:", error);
-          });
-        } catch (error) {
-          console.warn("bad candidate JSON:", error);
-        }
-      };
-      stream.addEventListener("done", () => {
-        stream.close();
-        if (candidateStreamRef.current === stream) candidateStreamRef.current = null;
-      });
-      stream.onerror = () => {
-        stream.close();
-        if (candidateStreamRef.current === stream) candidateStreamRef.current = null;
-      };
-      flushPendingCandidates();
-    },
-    [flushPendingCandidates],
-  );
 
   // Builds a fresh RTCPeerConnection against the current mic stream, wires
   // every transport handler (tracks, control channel, state changes, ICE
@@ -2758,16 +2741,19 @@ function App() {
   const openPeerSession = useCallback(
     async ({ resumeSessionId = null } = {}) => {
       setStageMessage("Preparing connection");
-      const iceServers = await fetchIceServers();
-      addNotice("info", "Creating peer connection");
-      // Candidates gathered by this peer connection buffer until the answer
-      // delivers its session id; a leftover id from a previous attempt would
-      // post them against the wrong session.
-      sessionIdRef.current = null;
-      const pc = new RTCPeerConnection({ iceServers, iceCandidatePoolSize: 1 });
-      pcRef.current = pc;
+      const lifecycle = sessionLifecycleRef.current;
+      const attempt = lifecycle.beginTransport();
+      let transport;
       try {
-        pc.ontrack = (event) => {
+        const iceServers = await fetchIceServers();
+        if (!lifecycle.isCurrent(attempt)) return;
+        addNotice("info", "Creating peer connection");
+        // Candidates gathered by this peer connection buffer until the answer
+        // delivers its session id; a leftover id from a previous attempt would
+        // post them against the wrong session.
+        sessionIdRef.current = null;
+        const pc = new RTCPeerConnection({ iceServers, iceCandidatePoolSize: 1 });
+        const onTrack = (event) => {
           aiStreamRef.current = event.streams?.[0] || new MediaStream([event.track]);
           if (aiAudioRef.current) {
             aiAudioRef.current.srcObject = aiStreamRef.current;
@@ -2789,8 +2775,7 @@ function App() {
           attachAudioGraph();
         };
 
-        pc.onconnectionstatechange = () => {
-          if (pcRef.current !== pc) return;
+        const onConnectionStateChange = () => {
           const state = pc.connectionState;
           recordTrace("transport.connection", { status: state });
           const live = stateRef.current.phase === "live";
@@ -2818,7 +2803,7 @@ function App() {
               // rebuild, so a normal blip is not preempted needlessly.
               reconnectGraceTimerRef.current = window.setTimeout(() => {
                 reconnectGraceTimerRef.current = null;
-                if (pcRef.current && pcRef.current.connectionState !== "connected") {
+                if (transport.isCurrent() && pc.connectionState !== "connected") {
                   reconnectRef.current?.();
                 }
               }, RECONNECT_GRACE_MS);
@@ -2826,8 +2811,7 @@ function App() {
           }
         };
 
-        pc.oniceconnectionstatechange = () => {
-          if (pcRef.current !== pc) return;
+        const onIceConnectionStateChange = () => {
           const state = pc.iceConnectionState;
           recordTrace("transport.ice", { status: state });
           const live = stateRef.current.phase === "live";
@@ -2848,62 +2832,51 @@ function App() {
           }
         };
 
-        const control = pc.createDataChannel("control");
-        controlRef.current = control;
-        control.onopen = () => {
-          const payload = buildConfigPayload();
-          sessionTraceRef.current?.setRequestedConfig(payload);
-          recordTrace("config.sent", { config: payload });
-          control.send(JSON.stringify({ type: "config", ...payload }));
-          if (resumingRef.current && offerResumedRef.current) {
-            // The server resumes under the original session's applied
-            // config and ignores the payload above (sent only as the
-            // channel-open signal), so the connect-time record must keep
-            // describing what the server actually runs.
-            setStageMessage("Restoring session");
-            addNotice("info", "Control channel open, resuming session");
-            return;
-          }
-          setServerAppliedConfig(null);
-          sentConfigRef.current = payload;
-          setPhase("warmup");
-          setStageMessage("Loading model and warming audio");
-          addNotice("info", "Config sent, waiting for server warmup");
-        };
-        control.onmessage = (event) => {
-          // A queued message from the transport we just replaced must not
-          // mutate (or end) the fresh resumed session.
-          if (controlRef.current !== control) return;
-          if (typeof event.data !== "string") return;
-          try {
-            handleControlMessage(JSON.parse(event.data));
-          } catch (error) {
-            console.warn("bad control JSON:", error);
-          }
-        };
-        control.onclose = () => {
-          // Teardown paths null the ref before this event can fire, so only
-          // an unexpected close (transport drop, SCTP-level error) gets past
-          // this guard. Route it into the same recovery path a failed peer
-          // connection takes; its catch runs the terminal teardown.
-          if (controlRef.current !== control) return;
-          if (stateRef.current.phase !== "live") return;
-          recordTrace("transport.control_closed", { status: "closed" }, { level: "error" });
-          addNotice("err", "Control channel closed");
-          reconnectRef.current?.();
-        };
-
-        pc.onicecandidate = (event) => {
-          if (sessionIdRef.current) postCandidate(event.candidate);
-          else pendingCandidatesRef.current.push(event.candidate);
-        };
+        transport = lifecycle.bindPeer(pc, {
+          onTrack,
+          onConnectionStateChange,
+          onIceConnectionStateChange,
+          onIceCandidate: (event) => {
+            if (sessionIdRef.current) postCandidate(event.candidate);
+            else pendingCandidatesRef.current.push(event.candidate);
+          },
+        });
+        transport.bindControl(pc.createDataChannel("control"), {
+          onOpen: () => {
+            const payload = buildConfigPayload();
+            sessionTraceRef.current?.setRequestedConfig(payload);
+            recordTrace("config.sent", { config: payload });
+            transport.sendCommand({ type: "config", ...payload });
+            if (resumingRef.current && offerResumedRef.current) {
+              // The resume config is only a channel-open signal; keep the
+              // original record of the config the server actually runs.
+              setStageMessage("Restoring session");
+              addNotice("info", "Control channel open, resuming session");
+              return;
+            }
+            setServerAppliedConfig(null);
+            sentConfigRef.current = payload;
+            setPhase("warmup");
+            setStageMessage("Loading model and warming audio");
+            addNotice("info", "Config sent, waiting for server warmup");
+          },
+          onMessage: handleControlMessage,
+          onClose: () => {
+            if (stateRef.current.phase !== "live") return;
+            recordTrace("transport.control_closed", { status: "closed" }, { level: "error" });
+            addNotice("err", "Control channel closed");
+            reconnectRef.current?.();
+          },
+        });
 
         micStreamRef.current.getAudioTracks().forEach((track) => {
           pc.addTrack(track, micStreamRef.current);
         });
 
         const offer = await pc.createOffer();
+        if (!transport.isCurrent()) return;
         await pc.setLocalDescription(offer);
+        if (!transport.isCurrent()) return;
         setStageMessage("Negotiating session");
         const res = await fetch("/api/rtc/offer", {
           method: "POST",
@@ -2915,6 +2888,7 @@ function App() {
           }),
         });
 
+        if (!transport.isCurrent()) return;
         if (res.status === 409) {
           const error = new Error("Session busy. Another client is already connected.");
           error.code = "session_busy";
@@ -2931,29 +2905,26 @@ function App() {
         }
 
         const answer = await res.json();
+        if (!transport.isCurrent()) return;
         offerResumedRef.current = answer.resumed === true;
         sessionIdRef.current = answer.session_id || null;
         await pc.setRemoteDescription({ sdp: answer.sdp, type: answer.type });
-        if (sessionIdRef.current) startCandidateStream(sessionIdRef.current);
+        if (!transport.isCurrent()) return;
+        if (sessionIdRef.current) {
+          transport.bindCandidates(new EventSource(`/api/rtc/candidates?session_id=${encodeURIComponent(sessionIdRef.current)}`));
+          flushPendingCandidates();
+        }
         return offerResumedRef.current;
       } catch (error) {
-        // Unwind only the transport objects this attempt created; shared
-        // state (mic, audio graph, recorder) stays up so the caller can
-        // retry or run its own teardown.
-        if (pcRef.current === pc) {
-          try {
-            pc.close();
-          } catch {
-            // Ignore peer close failures.
-          }
-          pcRef.current = null;
-          controlRef.current = null;
-          pendingCandidatesRef.current = [];
-        }
+        if (!lifecycle.isCurrent(attempt)) return;
+        // Failed attempts release their channels without stopping the mic,
+        // audio graph, or recorder needed by a retry.
+        transport?.dispose();
+        pendingCandidatesRef.current = [];
         throw error;
       }
     },
-    [addNotice, attachAudioGraph, buildConfigPayload, cleanup, handleControlMessage, postCandidate, recordTrace, startCandidateStream],
+    [addNotice, attachAudioGraph, buildConfigPayload, cleanup, flushPendingCandidates, handleControlMessage, postCandidate, recordTrace],
   );
 
   // Fresh-pc reconnect. aiortc cannot ICE-restart a live transport (the
@@ -3041,7 +3012,6 @@ function App() {
     tuningWarnedRef.current = false;
     visionInjectDroughtRef.current = { captions: 0, warned: false };
     cleanup({ keepPhase: true });
-    sessionLifecycleRef.current.beginTransport();
     sessionTraceRef.current = createSessionTrace();
     traceMaximaRef.current = { rtf: 0, gpuUtil: 0, vramUsed: 0 };
     traceTotalsRef.current = {
@@ -3184,15 +3154,6 @@ function App() {
   }, [clearConnectHold, startConversation]);
 
   const stopConversation = useCallback(() => {
-    const control = controlRef.current;
-    if (control?.readyState === "open") {
-      try {
-        control.send(JSON.stringify({ type: "goodbye" }));
-      } catch {
-        // Best-effort: without it the server reads the close as a
-        // transport drop and holds a short resume window.
-      }
-    }
     addNotice("info", "Ending session, recording will remain available");
     recordTrace("session.goodbye", { end_reason: "user_goodbye" });
     sessionTraceRef.current?.finish("user_goodbye");
@@ -3240,15 +3201,14 @@ function App() {
   };
 
   const sendVisionFrame = useCallback((dataUrl, meta, detail = false, historicalDetail = false) => {
-    const control = controlRef.current;
-    if (!dataUrl || !control || control.readyState !== "open") return null;
+    if (!dataUrl || !sessionLifecycleRef.current.isControlOpen) return null;
     const base64 = dataUrl.split(",")[1] || "";
     if (!base64) return null;
     if (base64.length >= Math.min(VISION_FRAME_TARGET_CHARS, VISION_FRAME_MAX_CHARS)) {
       addNotice("warn", "Vision frame too large to send, try a smaller source", "vision");
       return null;
     }
-    if (control.bufferedAmount > VISION_SEND_BUFFERED_LIMIT) {
+    if (sessionLifecycleRef.current.bufferedAmount > VISION_SEND_BUFFERED_LIMIT) {
       addNotice("warn", "Vision frame skipped, control channel congested", "vision");
       return null;
     }
@@ -3271,16 +3231,14 @@ function App() {
     }
     try {
       if (base64.length <= VISION_FRAME_CHUNK_CHARS) {
-        control.send(
-          JSON.stringify({
-            type: "vision_frame",
-            frame_id: frameId,
-            data: base64,
-            detail: !!detail,
-            historical_detail: !!historicalDetail,
-            source_generation: sourceGeneration,
-          }),
-        );
+        sessionLifecycleRef.current.sendCommand({
+          type: "vision_frame",
+          frame_id: frameId,
+          data: base64,
+          detail: !!detail,
+          historical_detail: !!historicalDetail,
+          source_generation: sourceGeneration,
+        });
       } else {
         // One SCTP message must stay under the server's 64 KB
         // max-message-size, so large frames (full-res detail captures,
@@ -3288,18 +3246,16 @@ function App() {
         // reassembles by frame_id.
         const total = Math.ceil(base64.length / VISION_FRAME_CHUNK_CHARS);
         for (let seq = 0; seq < total; seq += 1) {
-          control.send(
-            JSON.stringify({
-              type: "vision_frame_chunk",
-              frame_id: frameId,
-              seq,
-              total,
-              data: base64.slice(seq * VISION_FRAME_CHUNK_CHARS, (seq + 1) * VISION_FRAME_CHUNK_CHARS),
-              detail: !!detail,
-              historical_detail: !!historicalDetail,
-              source_generation: sourceGeneration,
-            }),
-          );
+          sessionLifecycleRef.current.sendCommand({
+            type: "vision_frame_chunk",
+            frame_id: frameId,
+            seq,
+            total,
+            data: base64.slice(seq * VISION_FRAME_CHUNK_CHARS, (seq + 1) * VISION_FRAME_CHUNK_CHARS),
+            detail: !!detail,
+            historical_detail: !!historicalDetail,
+            source_generation: sourceGeneration,
+          });
         }
       }
     } catch (error) {
@@ -3328,7 +3284,7 @@ function App() {
   const captureFrame = useCallback(
     async (detail = false, force = false, reason = "") => {
       if (!visionStreamRef.current || !visionVideoRef.current) return false;
-      if (controlRef.current?.readyState !== "open") return false;
+      if (!sessionLifecycleRef.current.isControlOpen) return false;
       const video = visionVideoRef.current;
       if (!video.videoWidth || !video.videoHeight) return false;
       const initialQuality = detail ? 0.85 : 0.72;
@@ -3408,12 +3364,12 @@ function App() {
       clearLivePendingVisionFrames(pendingVisionFramesRef.current);
       setCurrentCaption("");
       setCurrentVisionFeed({ mode: "unknown", queued: 0 });
-      if (controlRef.current?.readyState === "open") {
-        controlRef.current.send(JSON.stringify({
+      if (sessionLifecycleRef.current.isControlOpen) {
+        sessionLifecycleRef.current.sendCommand({
           type: "vision_source_started",
           source,
           source_generation: sourceGeneration,
-        }));
+        });
       }
       // The browser can end the tracks outside the app UI (the floating
       // "Stop sharing" bar, a camera unplug); tear vision down and say so
@@ -3481,7 +3437,7 @@ function App() {
     if (visionCostUsd < Number(visionCostLimitUsd)) return;
     setVisionBudgetTripped(true);
     stopVision();
-    addNotice("warn", `Vision cost ceiling reached at $${visionCostUsd.toFixed(4)}`, "budget");
+    addNotice("warn", `Vision estimated cost ceiling reached at $${visionCostUsd.toFixed(4)}`, "budget");
   }, [addNotice, stopVision, visionBudgetTripped, visionCostLimitActive, visionCostLimitUsd, visionCostUsd, visionOn]);
 
   useEffect(() => {
@@ -3589,9 +3545,22 @@ function App() {
     const now = performance.now();
     if (now - lastRewindClickRef.current < 1000) return;
     lastRewindClickRef.current = now;
-    if (controlRef.current?.readyState === "open") {
-      controlRef.current.send(JSON.stringify({ type: "rewind" }));
+    if (sessionLifecycleRef.current.isControlOpen) {
+      sessionLifecycleRef.current.sendCommand({ type: "rewind" });
       addNotice("info", "Rewind requested", "rewind");
+    }
+  };
+
+  const speakNow = () => {
+    if (phase !== "live" || reconnecting) return;
+    if (!sessionLifecycleRef.current.isControlOpen) {
+      addNotice("warn", "Speak now unavailable: control channel is closed");
+      return;
+    }
+    try {
+      sessionLifecycleRef.current.sendCommand({ type: "speak" });
+    } catch {
+      addNotice("err", "Speak now could not be sent; try again");
     }
   };
 
@@ -3599,8 +3568,8 @@ function App() {
     const now = performance.now();
     if (now - lastRewindClickRef.current < 1000) return;
     lastRewindClickRef.current = now;
-    if (controlRef.current?.readyState === "open") {
-      controlRef.current.send(JSON.stringify({ type: "voice_reset" }));
+    if (sessionLifecycleRef.current.isControlOpen) {
+      sessionLifecycleRef.current.sendCommand({ type: "voice_reset" });
       addNotice("info", "Voice reset requested", "rewind");
     }
   };
@@ -3610,12 +3579,12 @@ function App() {
     const now = performance.now();
     if (now - lastBookmarkClickRef.current < 1000) return;
     lastBookmarkClickRef.current = now;
-    if (controlRef.current?.readyState !== "open") return;
+    if (!sessionLifecycleRef.current.isControlOpen) return;
     const id = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const label = `Mark ${bookmarks.length + 1}`;
     const atSec = elapsedSec;
     setBookmarkPending(true);
-    controlRef.current.send(JSON.stringify({ type: "bookmark", id, label, at_sec: atSec }));
+    sessionLifecycleRef.current.sendCommand({ type: "bookmark", id, label, at_sec: atSec });
     addNotice("info", `Bookmark requested at ${formatOffset(atSec * 1000)}`, "rewind");
   };
 
@@ -3624,18 +3593,9 @@ function App() {
     const now = performance.now();
     if (now - lastRewindClickRef.current < 1000) return;
     lastRewindClickRef.current = now;
-    if (controlRef.current?.readyState !== "open") return;
-    controlRef.current.send(JSON.stringify({ type: "rewind", id: bm.id }));
+    if (!sessionLifecycleRef.current.isControlOpen) return;
+    sessionLifecycleRef.current.sendCommand({ type: "rewind", id: bm.id });
     addNotice("info", `Restore requested · ${bm.label}`, "rewind");
-  };
-
-  const submitContextNote = () => {
-    const note = contextNoteDraft.trim();
-    if (!note || phase !== "live") return;
-    if (controlRef.current?.readyState !== "open") return;
-    controlRef.current.send(JSON.stringify({ type: "context_note", text: note }));
-    setContextNoteDraft("");
-    addNotice("info", "Context note sent", "vision");
   };
 
   const sendLiveConfig = useCallback((partial) => {
@@ -3649,9 +3609,9 @@ function App() {
       liveConfigTimerRef.current = null;
       const fields = liveConfigPendingRef.current;
       liveConfigPendingRef.current = {};
-      if (controlRef.current?.readyState === "open" && Object.keys(fields).length) {
+      if (sessionLifecycleRef.current.isControlOpen && Object.keys(fields).length) {
         recordTrace("config.update_sent", { config: fields });
-        controlRef.current.send(JSON.stringify({ type: "update_config", ...fields }));
+        sessionLifecycleRef.current.sendCommand({ type: "update_config", ...fields });
       }
     }, 150);
   }, [isLive, recordTrace]);
@@ -3826,8 +3786,8 @@ function App() {
       // Stop pressed right after it.
       if (now - (lastInterruptClickRef.current[reason] || 0) < 900) return false;
       lastInterruptClickRef.current[reason] = now;
-      if (controlRef.current?.readyState === "open") {
-        controlRef.current.send(JSON.stringify({ type: "interrupt", reason }));
+      if (sessionLifecycleRef.current.isControlOpen) {
+        sessionLifecycleRef.current.sendCommand({ type: "interrupt", reason });
         pulseInterrupt();
         addNotice(
           reason === "barge_in" ? "warn" : "info",
@@ -4232,6 +4192,7 @@ function App() {
         overlapTicks += 1;
         setSpeaking("both");
         if (
+          // Gentle yielding belongs to the server, not this faster meter.
           turnHandling === "assisted"
           && overlapTicks >= 3
           && !bargeActiveRef.current
@@ -4312,7 +4273,7 @@ function App() {
     let prevReceived = 0;
     let prevLost = 0;
     const id = setInterval(async () => {
-      const pc = pcRef.current;
+      const pc = sessionLifecycleRef.current.peer;
       if (!pc) return;
       try {
         const stats = await pc.getStats();
@@ -4389,7 +4350,7 @@ function App() {
   }, [phase, recordRttSample, recordTrace]);
 
   useEffect(() => {
-    const pc = pcRef.current;
+    const pc = sessionLifecycleRef.current.peer;
     if (phase !== "live" || !pc?.getReceivers) return;
     const hint = jitterBuffer === "smooth" ? JITTER_BUFFER_SMOOTH_SEC : 0;
     pc.getReceivers().forEach((receiver) => {
@@ -4415,8 +4376,7 @@ function App() {
       return undefined;
     }
     const id = setInterval(() => {
-      const control = controlRef.current;
-      if (control?.readyState !== "open") return;
+      if (!sessionLifecycleRef.current.isControlOpen) return;
       const pending = pendingPingsRef.current;
       // A ping still in the map at the next tick never got a pong.
       const now = performance.now();
@@ -4437,7 +4397,7 @@ function App() {
         pending.delete(oldest);
       }
       try {
-        control.send(JSON.stringify({ type: "ping", t, seq }));
+        sessionLifecycleRef.current.sendCommand({ type: "ping", t, seq });
       } catch {
         // Send is best-effort; a closed channel is handled by teardown paths.
       }
@@ -5211,7 +5171,7 @@ function App() {
                     <Info k="visionPrompt" />
                   </div>
                 </div>
-                <span className="sect-sub">{serverInfo.visionModel || "Gemini"}</span>
+                <span className="sect-sub">{serverInfo.visionModel || "Gemini 3.8 Flash"}</span>
               </div>
               <textarea
                 aria-label="Vision prompt"
@@ -5549,9 +5509,9 @@ function App() {
                 )}
                 {speaking === "both" && !visionInjecting && !interrupting && (
                   <div className="viz-inject barge">
-                    <span className="d" /> {turnHandling === "native" ? "Native overlap" : "Barge-in"}{" "}
+                    <span className="d" /> {turnHandling === "native" ? "Native overlap" : turnHandling === "gentle" ? "Gentle overlap" : "Barge-in"}{" "}
                     <span className="gate">
-                      {turnHandling === "native" ? "model handling duplex" : "user took the turn"}
+                      {turnHandling === "native" ? "model handling duplex" : turnHandling === "gentle" ? "server checks sustained speech" : "user took the turn"}
                     </span>
                   </div>
                 )}
@@ -5635,27 +5595,40 @@ function App() {
                 {isLive && (
                   <form
                     className="context-note-row"
+                    aria-busy={contextNote.pending}
                     onSubmit={(event) => {
                       event.preventDefault();
-                      submitContextNote();
+                      contextNote.submit();
                     }}
                   >
                     <input
                       type="text"
                       className="context-note-input"
-                      value={contextNoteDraft}
-                      maxLength={180}
-                      placeholder="Type context for the AI, e.g. You are talking with someone planning a trip"
-                      aria-label="Context note for the AI"
-                      onChange={(event) => setContextNoteDraft(event.target.value)}
+                      value={contextNote.draft}
+                      placeholder="Add a short note for the AI"
+                      aria-label="Experimental context note for the AI"
+                      aria-describedby={cls("context-note-help context-note-limit", (contextNote.overLimit || contextNote.error) && "context-note-error")}
+                      aria-invalid={contextNote.overLimit || !!contextNote.error}
+                      onChange={(event) => contextNote.edit(event.target.value)}
                     />
                     <button
                       type="submit"
                       className="context-note-send"
-                      disabled={!contextNoteDraft.trim()}
+                      disabled={!contextNote.canSubmit}
                     >
-                      Inject
+                      {contextNote.pending ? "Sending…" : "Inject"}
                     </button>
+                    <p className="context-note-help" id="context-note-help">
+                      Experimental note: it may be repeated aloud. This is not private memory.
+                    </p>
+                    <p className="context-note-help" id="context-note-limit">
+                      {contextNote.chars}/180 characters · Up to 32 model tokens, checked by the server.
+                    </p>
+                    {(contextNote.overLimit || contextNote.error) && (
+                      <p className="context-note-error" id="context-note-error" role="alert">
+                        {contextNote.overLimit ? "Over the 180-character limit. Shorten your note before sending." : contextNote.error}
+                      </p>
+                    )}
                   </form>
                 )}
                 {/* biome-ignore lint/a11y/useAriaPropsSupportedByRole: aria-label names this readout region for assistive tech; visible per-row labels are also present */}
@@ -5725,8 +5698,8 @@ function App() {
                     <span><b>{visionFramesGated}</b> gated</span>
                     <span className={cls(visionFeedModel && "hot", visionInjecting && "warn")}>{visionFeedStatus}</span>
                     <span className={cls(visionGroundTurns && "hot")}>{visionTurnStatus}</span>
-                    <span>~$<b>{visionCostUsd.toFixed(4)}</b></span>
-                    {visionCostLimitActive && <span><b>${visionCostRemaining.toFixed(4)}</b> left</span>}
+                    <span title="Planning estimate, not billed usage; see Cost ceiling for token assumptions and dated Gemini 3.8 Flash rates.">Est. $<b>{visionCostUsd.toFixed(4)}</b></span>
+                    {visionCostLimitActive && <span><b>${visionCostRemaining.toFixed(4)}</b> estimated left</span>}
                     {visionBudgetTripped && <span className="warn">budget hit</span>}
                   </div>
                   <div className="vision-history">
@@ -5951,7 +5924,7 @@ function App() {
                   <RailColumn title="TURN" aggregate={`${maxTurn} tok · pad ${fmt(padBonus, 1)}`}>
                     <MiniSlider label="Padding bonus" info="padBonus" value={padBonus} onChange={(value) => { setPadBonus(value); setSessionProfileId("custom"); }} onCommit={guardedTuningCommit("padBonus", setPadBonus, (v) => ({ padding_bonus: Number(v) }))} min={tuningRanges.padBonus.min} max={tuningRanges.padBonus.max} step={tuningRanges.padBonus.step} format={(v) => fmt(v, 1)} />
                     <MiniSlider label="Onset bias" info="turnOnsetBias" value={turnOnsetBias} onChange={(value) => { setTurnOnsetBias(value); setSessionProfileId("custom"); }} onCommit={guardedTuningCommit("turnOnsetBias", setTurnOnsetBias, (v) => ({ turn_onset_bias: Number(v) }))} min={tuningRanges.turnOnsetBias.min} max={tuningRanges.turnOnsetBias.max} step={tuningRanges.turnOnsetBias.step} format={(v) => fmt(v, 1)} />
-                    <MiniSlider label="Max length" info="maxTurn" value={maxTurn} onChange={(value) => { setMaxTurn(value); setSessionProfileId("custom"); }} onCommit={guardedTuningCommit("maxTurn", setMaxTurn, (v) => ({ max_turn_text_tokens: Number.parseInt(v, 10) }))} min={tuningRanges.maxTurn.min} max={tuningRanges.maxTurn.max} step={tuningRanges.maxTurn.step} format={(v) => `${v}`} />
+                    <MiniSlider label="Reply target" info="maxTurn" value={maxTurn} onChange={(value) => { setMaxTurn(value); setSessionProfileId("custom"); }} onCommit={guardedTuningCommit("maxTurn", setMaxTurn, (v) => ({ max_turn_text_tokens: Number.parseInt(v, 10) }))} min={tuningRanges.maxTurn.min} max={tuningRanges.maxTurn.max} step={tuningRanges.maxTurn.step} format={(v) => `${v}`} />
                   </RailColumn>
                   <RailColumn title="CONTEXT" aggregate={visionOn || reinforceInSilences ? (injectStat.idleRms != null ? `live ${fmt(injectStat.idleRms, 3)} · ${injectStat.streak ?? 0}f` : `${fmt(injectSilenceRms, 3)} · ${injectSilenceStreak}f`) : "inactive"}>
                     <MiniSlider label="Silence floor" info="injRms" value={injectSilenceRms} onChange={(value) => { setInjectSilenceRms(value); setSessionProfileId("custom"); }} onCommit={(value) => sendLiveConfig({ inject_silence_rms: Number(value) })} min={INFERENCE_RANGES.expert.injectSilenceRms.min} max={INFERENCE_RANGES.expert.injectSilenceRms.max} step={INFERENCE_RANGES.expert.injectSilenceRms.step} format={(v) => fmt(v, 3)} />
@@ -5981,7 +5954,8 @@ function App() {
                     </>
                   )}
                   <button className="btn ghost" type="button" onClick={rewind}>{Icon.rewind} Rewind</button>
-                  <button className="btn ghost" type="button" onClick={voiceReset} title="Restore the session-start voice anchor to cure voice drift">{Icon.skipStart} Voice reset</button>
+                  <button className="btn ghost" type="button" onClick={voiceReset} title="Restore the session-start conversation state, including its voice anchor; this discards later conversation context, not just voice drift.">{Icon.skipStart} Voice reset</button>
+                  <button className="btn ghost" type="button" onClick={speakNow} disabled={reconnecting} title="Ask the model to speak from the current conversation without resetting it, the voice, or the seed.">Speak now</button>
                   <button className="btn ghost" type="button" disabled={!isLive || bookmarkPending} onClick={addBookmark} title="Bookmark the current snapshot to jump back to it">{Icon.bookmark} {bookmarkPending ? "Saving…" : "Bookmark"}</button>
                   <button className="btn danger" type="button" onClick={() => interruptResponse("manual")}>{Icon.stop} Stop response</button>
                 </>

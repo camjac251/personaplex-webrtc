@@ -18,6 +18,7 @@ import torch
 sys.path.insert(0, "moshi")
 
 from moshi.models.lm import LMGen  # noqa: E402
+from moshi.models.lm_controls import LMControlState
 
 PAD_ID = 3
 VOCAB = 4
@@ -51,6 +52,7 @@ def _fake_depth(rows: torch.Tensor):
 
 def _cfg_lm_gen(depth_rows: torch.Tensor) -> LMGen:
     lm_gen = LMGen.__new__(LMGen)
+    lm_gen.controls = LMControlState()
     lm_gen.lm_model = _FakeLmModel()
     lm_gen.caption_cfg = True
     lm_gen.cfg_gamma = 1.0
@@ -63,11 +65,6 @@ def _cfg_lm_gen(depth_rows: torch.Tensor) -> LMGen:
     lm_gen.padding_bonus = 0.0
     lm_gen.turn_onset_bias = 0.0
     lm_gen.max_turn_text_tokens = 0
-    lm_gen._non_pad_streak = 0
-    lm_gen._turn_pad_streak = 0
-    lm_gen._dense_text_streak = 0
-    lm_gen._pad_force_remaining = 0
-    lm_gen._pad_force_reason = ""
     lm_gen.report_loss = False
     lm_gen.return_logits = False
     lm_gen._audio_temperature = torch.full((DEP_Q,), 0.8)
@@ -211,6 +208,7 @@ class _FakeLmModelWithDevice(_FakeLmModel):
 
 def _priming_lm_gen(*, caption_cfg: bool, persona_cfg: bool) -> tuple[LMGen, list]:
     lm_gen = LMGen.__new__(LMGen)
+    lm_gen.controls = LMControlState()
     lm_gen.lm_model = _FakeLmModelWithDevice()
     lm_gen.caption_cfg = caption_cfg
     lm_gen.persona_cfg = persona_cfg

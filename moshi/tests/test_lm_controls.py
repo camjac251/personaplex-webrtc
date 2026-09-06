@@ -14,10 +14,12 @@ import torch
 
 sys.path.insert(0, "moshi")
 
+from moshi.models.lm_controls import LMControlState
 from moshi.models.lm import (  # noqa: E402
     DEFAULT_SEMANTIC_TEMPERATURE_CAP,
     DENSE_TEXT_COLLAPSE_FRAMES,
     REPETITION_TURN_BREAK_FRAMES,
+    TURN_CAP_SENTENCE_GRACE_TOKENS,
     LMGen,
     trim_boundary_silence,
 )
@@ -38,9 +40,19 @@ class _Graph:
 def _bare_lm_gen() -> tuple[LMGen, _Graph]:
     graph = _Graph()
     lm_gen = LMGen.__new__(LMGen)
+    lm_gen.controls = LMControlState()
+    lm_gen.use_sampling = True
     lm_gen.temp = 0.8
+    lm_gen.temp_text = 0.7
     lm_gen.top_k = 250
+    lm_gen.top_k_text = 25
+    lm_gen.min_p_text = 0.0
+    lm_gen.repetition_penalty = 1.0
+    lm_gen.repetition_penalty_context = 64
+    lm_gen.padding_bonus = 0.0
+    lm_gen.turn_onset_bias = 0.0
     lm_gen.semantic_temperature_cap = DEFAULT_SEMANTIC_TEMPERATURE_CAP
+    lm_gen.max_turn_text_tokens = 0
     lm_gen._audio_temperature = torch.full((8,), 0.8)
     lm_gen._audio_top_k = torch.tensor(250, dtype=torch.long)
     lm_gen._streaming_state = SimpleNamespace(graphed_depth=graph)
@@ -49,7 +61,7 @@ def _bare_lm_gen() -> tuple[LMGen, _Graph]:
 
 def test_temperature_updates_graph_input_without_reset() -> None:
     lm_gen, graph = _bare_lm_gen()
-    changed = lm_gen.set_audio_sampling(1.1, 250)
+    changed = lm_gen.apply_sampling(temp=1.1, top_k=250)
     assert changed is False
     assert lm_gen.temp == 1.1
     # Same tensor object, same shape: the graph replays the new values.
@@ -64,7 +76,7 @@ def test_semantic_codebook_temperature_is_independent() -> None:
     lm_gen, _ = _bare_lm_gen()
 
     # Hot acoustic settings leave the semantic level at its own value.
-    lm_gen.set_audio_sampling(1.2, 250)
+    lm_gen.apply_sampling(temp=1.2, top_k=250)
     assert torch.isclose(
         lm_gen._audio_temperature[0],
         torch.tensor(DEFAULT_SEMANTIC_TEMPERATURE_CAP),
@@ -74,7 +86,7 @@ def test_semantic_codebook_temperature_is_independent() -> None:
     )
 
     # Cool acoustic settings do not drag the semantic level down with them.
-    lm_gen.set_audio_sampling(0.6, 250)
+    lm_gen.apply_sampling(temp=0.6, top_k=250)
     assert torch.isclose(
         lm_gen._audio_temperature[0],
         torch.tensor(DEFAULT_SEMANTIC_TEMPERATURE_CAP),
@@ -87,7 +99,7 @@ def test_semantic_codebook_temperature_is_independent() -> None:
     # is applied on the next sampling write, which is how the live path
     # sequences the two assignments.
     lm_gen.semantic_temperature_cap = 0.9
-    lm_gen.set_audio_sampling(0.8, 250)
+    lm_gen.apply_sampling(temp=0.8, top_k=250)
     assert torch.isclose(lm_gen._audio_temperature[0], torch.tensor(0.9))
     assert torch.allclose(
         lm_gen._audio_temperature[1:], torch.full((7,), 0.8)
@@ -95,7 +107,7 @@ def test_semantic_codebook_temperature_is_independent() -> None:
 
     # The floor still protects the CUDA-graph division.
     lm_gen.semantic_temperature_cap = 0.0
-    lm_gen.set_audio_sampling(0.8, 250)
+    lm_gen.apply_sampling(temp=0.8, top_k=250)
     assert lm_gen._audio_temperature[0].item() > 0.0
 
 
@@ -121,7 +133,7 @@ def test_min_p_masks_low_probability_text_tokens() -> None:
 
 def test_top_k_updates_graph_input_without_reset() -> None:
     lm_gen, graph = _bare_lm_gen()
-    changed = lm_gen.set_audio_sampling(0.7, 512)
+    changed = lm_gen.apply_sampling(temp=0.7, top_k=512)
     assert changed is True
     assert lm_gen.temp == 0.7
     assert lm_gen.top_k == 512
@@ -154,6 +166,7 @@ def test_dynamic_top_k_masks_candidates_without_graph_shape_changes() -> None:
 
 def _ring_lm_gen(ctx: int = 4) -> tuple[LMGen, SimpleNamespace]:
     lm_gen = LMGen.__new__(LMGen)
+    lm_gen.controls = LMControlState()
     lm_gen.repetition_penalty_context = ctx
     state = SimpleNamespace(
         recent_text_tokens=torch.full((1, 8), -1, dtype=torch.long),
@@ -241,8 +254,9 @@ def test_new_turn_clears_history_before_penalty() -> None:
 
 def test_interrupt_force_window_works_with_turn_cap_disabled() -> None:
     lm_gen = LMGen.__new__(LMGen)
+    lm_gen.controls = LMControlState()
     lm_gen.max_turn_text_tokens = 0
-    lm_gen._pad_force_remaining = 2
+    lm_gen.controls.pad_force_remaining = 2
     natural = torch.tensor([17], dtype=torch.long)
 
     first, forced = lm_gen._consume_forced_pad(
@@ -274,35 +288,32 @@ def test_turn_cap_counts_across_short_natural_pauses() -> None:
     account(3)
     account(12)
     account(3)
-    assert lm_gen._pad_force_remaining == 0
+    assert lm_gen.controls.pad_force_remaining == 0
     account(13)
-    assert lm_gen._pad_force_remaining == REPETITION_TURN_BREAK_FRAMES
-    assert lm_gen._non_pad_streak == 0
+    assert lm_gen.controls.pad_force_remaining == REPETITION_TURN_BREAK_FRAMES
+    assert lm_gen.controls.non_pad_streak == 0
 
     # A sustained natural PAD run is a true boundary, so prior words no
     # longer count toward the next turn's cap.
-    lm_gen._pad_force_remaining = 0
+    lm_gen.controls.pad_force_remaining = 0
     account(21)
     account(22)
     for _ in range(REPETITION_TURN_BREAK_FRAMES):
         account(3)
     account(23)
-    assert lm_gen._pad_force_remaining == 0
-    assert lm_gen._non_pad_streak == 1
+    assert lm_gen.controls.pad_force_remaining == 0
+    assert lm_gen.controls.non_pad_streak == 1
 
     # External text injection/Stop padding never advances either counter.
     account(24, forced_text=True)
-    assert lm_gen._non_pad_streak == 1
+    assert lm_gen.controls.non_pad_streak == 1
 
 
 def _cap_lm_gen(max_turn: int) -> LMGen:
     lm_gen = LMGen.__new__(LMGen)
+    lm_gen.controls = LMControlState()
     lm_gen.max_turn_text_tokens = max_turn
-    lm_gen._non_pad_streak = 0
-    lm_gen._turn_pad_streak = 0
-    lm_gen._dense_text_streak = 0
-    lm_gen._pad_force_remaining = 0
-    lm_gen._pad_force_reason = ""
+    lm_gen.set_sentence_end_tokens(())
     return lm_gen
 
 
@@ -316,22 +327,24 @@ def _account(lm_gen: LMGen, token: int, *, forced_text: bool = False) -> None:
 
 
 def test_runaway_text_trips_regardless_of_the_length_cap() -> None:
-    # Cap effectively off: a token on every frame still arms the PAD
-    # window once the dense streak is reached, and names the reason.
-    lm_gen = _cap_lm_gen(2000)
+    # A dense stream still collapses inside sentence grace, even when the
+    # token at the dense boundary also completes the sentence.
+    lm_gen = _cap_lm_gen(DENSE_TEXT_COLLAPSE_FRAMES - 1)
+    lm_gen.set_sentence_end_tokens([18])
     for _ in range(DENSE_TEXT_COLLAPSE_FRAMES - 1):
         _account(lm_gen, 17)
-    assert lm_gen._pad_force_remaining == 0
-    _account(lm_gen, 17)
-    assert lm_gen._pad_force_remaining == REPETITION_TURN_BREAK_FRAMES
-    assert lm_gen._pad_force_reason == "dense"
-    assert lm_gen._dense_text_streak == 0
+    assert lm_gen.controls.pad_force_remaining == 0
+    _account(lm_gen, 18)
+    assert lm_gen.controls.pad_force_remaining == REPETITION_TURN_BREAK_FRAMES
+    assert lm_gen.controls.pad_force_reason == "dense"
+    assert lm_gen.controls.dense_text_streak == 0
 
     # Cap disabled entirely (server-built configs): the detector still runs.
     lm_gen = _cap_lm_gen(0)
+    lm_gen.set_sentence_end_tokens([17])
     for _ in range(DENSE_TEXT_COLLAPSE_FRAMES):
         _account(lm_gen, 17)
-    assert lm_gen._pad_force_reason == "dense"
+    assert lm_gen.controls.pad_force_reason == "dense"
 
 
 def test_speech_with_pads_between_words_never_reads_as_runaway() -> None:
@@ -342,13 +355,13 @@ def test_speech_with_pads_between_words_never_reads_as_runaway() -> None:
         _account(lm_gen, 11)
         _account(lm_gen, 12)
         _account(lm_gen, 3)
-    assert lm_gen._pad_force_remaining == 0
-    assert lm_gen._pad_force_reason == ""
+    assert lm_gen.controls.pad_force_remaining == 0
+    assert lm_gen.controls.pad_force_reason == ""
     # Forced context frames are excluded: a 32-token drip is not speech.
     for _ in range(DENSE_TEXT_COLLAPSE_FRAMES):
         _account(lm_gen, 41, forced_text=True)
-    assert lm_gen._dense_text_streak == 0
-    assert lm_gen._pad_force_remaining == 0
+    assert lm_gen.controls.dense_text_streak == 0
+    assert lm_gen.controls.pad_force_remaining == 0
 
 
 def test_length_cap_trip_is_labelled_cap() -> None:
@@ -358,8 +371,73 @@ def test_length_cap_trip_is_labelled_cap() -> None:
     _account(lm_gen, 12)
     _account(lm_gen, 3)
     _account(lm_gen, 13)
-    assert lm_gen._pad_force_remaining == REPETITION_TURN_BREAK_FRAMES
-    assert lm_gen._pad_force_reason == "cap"
+    assert lm_gen.controls.pad_force_remaining == REPETITION_TURN_BREAK_FRAMES
+    assert lm_gen.controls.pad_force_reason == "cap"
+
+
+def test_sentence_target_waits_for_terminal_at_or_after_target() -> None:
+    lm_gen = _cap_lm_gen(3)
+    terminals = [17]
+    lm_gen.set_sentence_end_tokens(terminals)
+    terminals.append(19)  # Caller mutation cannot alter startup metadata.
+    _account(lm_gen, 17)
+    _account(lm_gen, 11)
+    assert lm_gen.controls.pad_force_remaining == 0
+    _account(lm_gen, 17)
+    assert lm_gen.controls.pad_force_remaining == REPETITION_TURN_BREAK_FRAMES
+    assert lm_gen.controls.pad_force_reason == "cap"
+
+    lm_gen.reset_turn_cap_tracking()
+    for token in (17, 11, 19, 3, 0):
+        _account(lm_gen, token)
+    _account(lm_gen, 17, forced_text=True)
+    assert lm_gen.controls.pad_force_remaining == 0
+    assert lm_gen.controls.non_pad_streak == 3
+    _account(lm_gen, 11)
+    assert lm_gen.controls.pad_force_remaining == 0
+    _account(lm_gen, 17)
+    assert lm_gen.controls.pad_force_remaining == REPETITION_TURN_BREAK_FRAMES
+    assert lm_gen.controls.pad_force_reason == "cap"
+
+
+def test_sentence_target_grace_has_absolute_natural_token_ceiling() -> None:
+    target = 3
+    lm_gen = _cap_lm_gen(target)
+    lm_gen.set_sentence_end_tokens([17])
+    for _ in range(target + TURN_CAP_SENTENCE_GRACE_TOKENS - 1):
+        _account(lm_gen, 11)
+        _account(lm_gen, 3)
+        _account(lm_gen, 17, forced_text=True)
+        assert lm_gen.controls.pad_force_remaining == 0
+    _account(lm_gen, 11)
+    assert lm_gen.controls.pad_force_remaining == REPETITION_TURN_BREAK_FRAMES
+    assert lm_gen.controls.pad_force_reason == "cap"
+
+
+def test_sentence_metadata_does_not_enable_disabled_reply_target() -> None:
+    lm_gen = _cap_lm_gen(0)
+    lm_gen.set_sentence_end_tokens([17])
+    for _ in range(TURN_CAP_SENTENCE_GRACE_TOKENS + 1):
+        _account(lm_gen, 17)
+        _account(lm_gen, 3)
+    assert lm_gen.controls.pad_force_remaining == 0
+    assert lm_gen.controls.pad_force_reason == ""
+
+
+def test_sentence_grace_ends_at_natural_turn_break() -> None:
+    lm_gen = _cap_lm_gen(3)
+    lm_gen.set_sentence_end_tokens([17])
+    for _ in range(4):
+        _account(lm_gen, 11)
+    assert lm_gen.controls.pad_force_remaining == 0
+    for _ in range(REPETITION_TURN_BREAK_FRAMES):
+        _account(lm_gen, 3)
+    _account(lm_gen, 17)
+    _account(lm_gen, 11)
+    assert lm_gen.controls.pad_force_remaining == 0
+    _account(lm_gen, 17)
+    assert lm_gen.controls.pad_force_remaining == REPETITION_TURN_BREAK_FRAMES
+    assert lm_gen.controls.pad_force_reason == "cap"
 
 
 def test_boundary_silence_trim_keeps_guarded_speech() -> None:
@@ -419,6 +497,7 @@ def test_boundary_silence_trim_keeps_quiet_valid_clip() -> None:
 
 def _bias_lm_gen() -> LMGen:
     lm_gen = LMGen.__new__(LMGen)
+    lm_gen.controls = LMControlState()
     # EPAD=0 / PAD=3 mirror the deployed tokenizer's `token in (0, pad_id)`
     # idiom used by the turn accounting.
     lm_gen.lm_model = SimpleNamespace(
@@ -427,10 +506,6 @@ def _bias_lm_gen() -> LMGen:
     lm_gen.padding_bonus = 0.0
     lm_gen.turn_onset_bias = 0.0
     lm_gen.max_turn_text_tokens = 120
-    lm_gen._non_pad_streak = 0
-    lm_gen._dense_text_streak = 0
-    lm_gen._pad_force_reason = ""
-    lm_gen._forced_text_recent = False
     return lm_gen
 
 
@@ -456,13 +531,13 @@ def test_padding_bonus_is_continuation_only() -> None:
     # Onset (no text underway per the previous frame's accounting): PAD
     # keeps its natural logit so the bonus cannot outbid EPAD at the moment
     # speech would start.
-    lm_gen._non_pad_streak = 0
+    lm_gen.controls.non_pad_streak = 0
     out = lm_gen._apply_text_logit_biases(logits, logits)
     assert out is logits
     assert torch.all(logits == 0.0)
 
     # Mid-turn the bonus applies to PAD and leaves EPAD untouched.
-    lm_gen._non_pad_streak = 4
+    lm_gen.controls.non_pad_streak = 4
     out = lm_gen._apply_text_logit_biases(logits, logits)
     assert out[0, 0, 0, 3].item() == 1.5
     assert out[0, 0, 0, 0].item() == 0.0
@@ -474,7 +549,7 @@ def test_padding_bonus_ungated_when_turn_cap_disabled() -> None:
     lm_gen = _bias_lm_gen()
     lm_gen.padding_bonus = 1.0
     lm_gen.max_turn_text_tokens = 0
-    lm_gen._non_pad_streak = 0
+    lm_gen.controls.non_pad_streak = 0
     logits = torch.zeros((1, 1, 1, 5), dtype=torch.float32)
     out = lm_gen._apply_text_logit_biases(logits, logits)
     assert out[0, 0, 0, 3].item() == 1.0
@@ -486,9 +561,9 @@ def test_padding_bonus_waits_for_natural_text_after_forced_window() -> None:
     # onset that follows the window.
     lm_gen = _bias_lm_gen()
     lm_gen.padding_bonus = 1.0
-    lm_gen._non_pad_streak = 4
-    lm_gen._turn_pad_streak = 0
-    lm_gen._pad_force_remaining = 0
+    lm_gen.controls.non_pad_streak = 4
+    lm_gen.controls.turn_pad_streak = 0
+    lm_gen.controls.pad_force_remaining = 0
     logits = torch.zeros((1, 1, 1, 5), dtype=torch.float32)
 
     def account(token: int, *, forced_text: bool = False) -> None:
@@ -500,7 +575,7 @@ def test_padding_bonus_waits_for_natural_text_after_forced_window() -> None:
         )
 
     account(21, forced_text=True)
-    assert lm_gen._non_pad_streak == 4
+    assert lm_gen.controls.non_pad_streak == 4
     out = lm_gen._apply_text_logit_biases(logits, logits)
     assert out is logits
 
@@ -519,7 +594,7 @@ def test_bias_writes_never_mutate_aliased_logits() -> None:
     lm_gen = _bias_lm_gen()
     lm_gen.turn_onset_bias = 1.0
     lm_gen.padding_bonus = 2.0
-    lm_gen._non_pad_streak = 3
+    lm_gen.controls.non_pad_streak = 3
     logits = torch.zeros((1, 1, 1, 5), dtype=torch.float32)
 
     # float() of a float32 tensor aliases the source storage, mirroring the
@@ -541,22 +616,23 @@ def test_bias_writes_never_mutate_aliased_logits() -> None:
 
 def test_turn_cap_reset_clears_pending_copy_bookkeeping() -> None:
     lm_gen = LMGen.__new__(LMGen)
-    lm_gen._non_pad_streak = 7
-    lm_gen._turn_pad_streak = 5
-    lm_gen._pad_force_remaining = 3
-    lm_gen._forced_text_recent = True
-    lm_gen._turn_cap_token_pending = True
-    lm_gen._turn_cap_token_recorded = True
+    lm_gen.controls = LMControlState()
+    lm_gen.controls.non_pad_streak = 7
+    lm_gen.controls.turn_pad_streak = 5
+    lm_gen.controls.pad_force_remaining = 3
+    lm_gen.controls.forced_text_recent = True
+    lm_gen.controls.turn_cap_token_pending = True
+    lm_gen.controls.turn_cap_token_recorded = True
     lm_gen._turn_cap_token_host = torch.tensor([99], dtype=torch.long)
 
     lm_gen.reset_turn_cap_tracking()
 
-    assert lm_gen._non_pad_streak == 0
-    assert lm_gen._turn_pad_streak == 0
-    assert lm_gen._pad_force_remaining == 0
-    assert lm_gen._forced_text_recent is False
-    assert lm_gen._turn_cap_token_pending is False
-    assert lm_gen._turn_cap_token_recorded is False
+    assert lm_gen.controls.non_pad_streak == 0
+    assert lm_gen.controls.turn_pad_streak == 0
+    assert lm_gen.controls.pad_force_remaining == 0
+    assert lm_gen.controls.forced_text_recent is False
+    assert lm_gen.controls.turn_cap_token_pending is False
+    assert lm_gen.controls.turn_cap_token_recorded is False
 
 
 def test_turn_cap_pending_without_fresh_event_uses_current_token() -> None:
@@ -565,15 +641,16 @@ def test_turn_cap_pending_without_fresh_event_uses_current_token() -> None:
             raise AssertionError("stale event must not be queried")
 
     lm_gen = LMGen.__new__(LMGen)
-    lm_gen._turn_cap_token_pending = True
-    lm_gen._turn_cap_token_recorded = False
+    lm_gen.controls = LMControlState()
+    lm_gen.controls.turn_cap_token_pending = True
+    lm_gen.controls.turn_cap_token_recorded = False
     lm_gen._turn_cap_token_event = _StaleEvent()
     lm_gen._turn_cap_token_host = torch.tensor([99], dtype=torch.long)
 
     token = lm_gen._read_turn_cap_token(torch.tensor([17], dtype=torch.long))
 
     assert token == 17
-    assert lm_gen._turn_cap_token_pending is False
+    assert lm_gen.controls.turn_cap_token_pending is False
 
 
 def test_depformer_early_exit_reuses_provided_tail_codebooks() -> None:
@@ -601,6 +678,7 @@ def test_depformer_early_exit_reuses_provided_tail_codebooks() -> None:
             return logits
 
     lm_gen = LMGen.__new__(LMGen)
+    lm_gen.controls = LMControlState()
     lm_gen.lm_model = _Lm()
     lm_gen.depformer_early_exit = 8
     lm_gen.return_logits = False
@@ -643,6 +721,7 @@ def test_depformer_early_exit_preserves_sampling_rng_progression() -> None:
 
     def run(early_exit: int) -> tuple[torch.Tensor, torch.Tensor]:
         lm_gen = LMGen.__new__(LMGen)
+        lm_gen.controls = LMControlState()
         lm_gen.lm_model = _Lm()
         lm_gen.depformer_early_exit = early_exit
         lm_gen.return_logits = False
@@ -665,8 +744,81 @@ def test_depformer_early_exit_preserves_sampling_rng_progression() -> None:
     assert torch.equal(early_rng, full_rng)
 
 
+def test_sampling_rejects_invalid_partial_update_atomically() -> None:
+    gen, graph = _bare_lm_gen()
+    before = gen.sampling_settings()
+    temperature = gen._audio_temperature
+    top_k = gen._audio_top_k
+    temperature_values = temperature.clone()
+    for updates in (
+        {"temp": 1.1, "min_p_text": float("nan")},
+        {"top_k": 12, "semantic_temperature_cap": -0.1},
+        {"temp": 1.1, "top_k_text": 2.5},
+        {"temp": 1.1, "repetition_penalty_context": 257},
+        {"temp": 1.1, "use_sampling": 1},
+        {"temp": 1.1, "min_p_text": 1.1},
+        {"temp": 1e100, "top_k": 12},
+        {"temp": 1.1, "top_k": 2**64},
+    ):
+        try:
+            gen.apply_sampling(**updates)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"accepted invalid update: {updates}")
+        assert gen.sampling_settings() == before
+        assert gen._audio_temperature is temperature
+        assert gen._audio_top_k is top_k
+        assert torch.equal(temperature, temperature_values)
+        assert top_k.item() == before.top_k
+    assert graph.resets == []
+
+
+def test_sampling_partial_update_preserves_pacing_and_tensor_storage() -> None:
+    gen, graph = _bare_lm_gen()
+    temperature = gen._audio_temperature
+    top_k = gen._audio_top_k
+    gen.apply_sampling(padding_bonus=-1.25, turn_onset_bias=2.5)
+    gen.apply_sampling(temp=0.0, semantic_temperature_cap=0.9, top_k=0)
+    assert gen.padding_bonus == -1.25
+    assert gen.turn_onset_bias == 2.5
+    assert gen._audio_temperature is temperature
+    assert gen._audio_top_k is top_k
+    assert torch.isclose(temperature[0], torch.tensor(0.9))
+    assert torch.all(temperature[1:] > 0)
+    assert torch.all(temperature[1:] <= 1e-6)
+    assert top_k.item() == 0
+    assert graph.resets == []
+
+
+def test_accounting_reset_preserves_pending_cue_and_interruption_window() -> None:
+    gen = _cap_lm_gen(2)
+    gen.controls = LMControlState(
+        non_pad_streak=1, turn_pad_streak=3, dense_text_streak=4,
+        pad_force_remaining=2, pad_force_reason="cap", forced_text_recent=True,
+        speech_onset_pending=True, turn_cap_token_pending=True,
+        turn_cap_token_recorded=True,
+    )
+    gen.reset_turn_cap_accounting()
+    assert gen.controls.speech_onset_pending
+    assert gen.controls.forced_text_recent
+    assert gen.controls.pad_force_reason == "cap"
+    token, forced = gen._consume_forced_pad(torch.tensor([17]), 3, text_was_forced=False)
+    assert forced and token.item() == 3
+    assert gen.controls.pad_force_remaining == 1
+    gen.controls.pad_force_remaining = 0
+    _account(gen, 17)
+    assert gen.controls.pad_force_remaining == 0
+    _account(gen, 18)
+    assert gen.controls.pad_force_reason == "cap"
+    assert gen.controls.pad_force_remaining == REPETITION_TURN_BREAK_FRAMES
+
+
 if __name__ == "__main__":
     tests = [
+        test_sampling_rejects_invalid_partial_update_atomically,
+        test_sampling_partial_update_preserves_pacing_and_tensor_storage,
+        test_accounting_reset_preserves_pending_cue_and_interruption_window,
         test_temperature_updates_graph_input_without_reset,
         test_semantic_codebook_temperature_is_independent,
         test_min_p_masks_low_probability_text_tokens,
@@ -680,6 +832,10 @@ if __name__ == "__main__":
         test_runaway_text_trips_regardless_of_the_length_cap,
         test_speech_with_pads_between_words_never_reads_as_runaway,
         test_length_cap_trip_is_labelled_cap,
+        test_sentence_target_waits_for_terminal_at_or_after_target,
+        test_sentence_target_grace_has_absolute_natural_token_ceiling,
+        test_sentence_metadata_does_not_enable_disabled_reply_target,
+        test_sentence_grace_ends_at_natural_turn_break,
         test_turn_onset_bias_lands_on_epad_logit,
         test_padding_bonus_is_continuation_only,
         test_padding_bonus_ungated_when_turn_cap_disabled,

@@ -61,7 +61,13 @@ export const VOICES = [
   "VARM4",
 ];
 
-export const VISION_PER_CALL_USD = 0.00012;
+// Planning estimate, not billed usage: 1,500 input tokens and 500 output
+// tokens (including thinking) per frame. Actual prompt/image/detail usage varies.
+// Gemini 3.8 Flash standard paid tier, checked 2026-09-04:
+// https://ai.google.dev/gemini-api/docs/pricing#gemini-3.8-flash
+const VISION_INTRO_PRICING = Date.now() < Date.UTC(2027, 0, 1);
+export const VISION_PER_CALL_USD = (1500 * (VISION_INTRO_PRICING ? 0.75 : 1.50)
+  + 500 * (VISION_INTRO_PRICING ? 3.75 : 7.50)) / 1_000_000;
 export const VISION_MOTION_THRESHOLD = 0.04;
 // One control-channel SCTP message must stay under the server's negotiated
 // 64 KB max-message-size; a larger send throws (and can error-close the
@@ -208,8 +214,8 @@ export const SESSION_PROFILES = [
     repPenalty: 1.0,
     repContext: 64,
     padBonus: 0,
-    // Upstream has no guidance and no length cap at all; the top of the
-    // range is the closest the wire contract allows for the cap.
+    // Upstream has no guidance or length limit; the highest reply target
+    // is the closest the wire contract allows.
     personaCfgGamma: 1.0,
     maxTurn: 2000,
     echoCancel: false,
@@ -228,10 +234,9 @@ export const SESSION_PROFILES = [
     presetId: "assistant",
     voice: "NATF1",
     turnHandling: "assisted",
-    // Cooler text sampling yields sooner, and the cap is the one profile
-    // value deliberately below the default: it is the short-answer limit
-    // (about a hundred words), not a loop guard. No repetition penalty: it
-    // taxes the names and terms a task reply must repeat.
+    // Cooler text sampling yields sooner; the shorter reply target starts
+    // looking for a sentence ending at 120 natural text tokens. No
+    // repetition penalty: it taxes the names and terms a task reply repeats.
     textTemp: 0.55,
     textTopk: 18,
     audioTemp: 0.65,
@@ -316,13 +321,14 @@ export const PARAM_INFO = {
     title: "Turn handling",
     body: (
       <>
-        <b>Native duplex</b> lets the interactivity-aligned model decide when
-        to yield, overlap, and backchannel; the server applies no
-        interruption of its own, so a remote echo of the model's voice or a
-        hot sampling configuration shows up as floor-holding rather than as
-        a turn-detection fault. <b>Assisted</b> force-stops output after
-        sustained overlap and is intended as a fallback for base models or
-        difficult acoustic setups. Manual Stop always remains available.
+        <b>Native duplex</b> is the default: the model handles yielding,
+        overlap, and backchannels without automatic interruption.
+        <b> Gentle yield</b> adds a server-only stop after about <b>1.2 s</b>
+        of sustained user audio overlapping assistant audio. Brief pauses
+        do not count toward that duration, and the browser sends no
+        automatic stop in this mode. <b>Assisted</b> reacts faster to brief
+        overlap, using browser and server interruption. Choose before
+        connecting or switch live. Manual Stop remains available in all modes.
       </>
     ),
   },
@@ -509,18 +515,16 @@ export const PARAM_INFO = {
     ),
   },
   maxTurn: {
-    title: "Max turn length",
+    title: "Sentence-aware reply target",
     body: (
       <>
-        Reply-length cap on consecutive non-silence text tokens; it does
-        nothing until a reply reaches it, then forces about a second of
-        silence. Default <b>240</b> is roughly two hundred words (about 80 s
-        of continuous speech), room for a full explanation while still
-        bounding a monologue. Loop detection does not depend on this value:
-        the server watches for a token on every frame, which speech never
-        produces, and that is what feeds auto-rewind. The floor is <b>40</b>{" "}
-        even in Expert mode, and the Expert maximum of <b>2000</b> is
-        effectively no cap.
+        Target reply length in natural text tokens, not words or audio
+        frames. At the target, the model stops at the next sentence ending
+        detected by punctuation, allowing at most <b>24</b> additional text
+        tokens before a hard cap. This is a punctuation heuristic, not
+        grammatical sentence detection; abbreviations and unusual punctuation
+        can affect where it stops. Default <b>240</b>; minimum <b>40</b>,
+        or up to <b>2000</b> in Expert mode. This controls reply length only.
       </>
     ),
   },
@@ -719,9 +723,14 @@ export const PARAM_INFO = {
     title: "Cost ceiling",
     body: (
       <>
-        A hard spend cap for Gemini vision this session, in dollars. At the
-        limit the server stops sending frames. Set <b>0</b> to disable the cap.
-        Each call is about <b>$0.00012</b>.
+        Stops vision when its estimated cost reaches this limit. Set <b>0</b> to
+        disable it. This is not a billing cap. The planning estimate is
+        <b> ${VISION_PER_CALL_USD.toFixed(4)} per frame</b>, assuming 1,500 input
+        and 500 output tokens, including thinking. Actual usage varies.
+        Gemini 3.8 Flash introductory pricing is <b>$0.75/M input</b> and
+        <b> $3.75/M output</b> through <b>2026-12-31</b>. Published rates from
+        2027-01-01 are $1.50/M input and $7.50/M output; confirm current rates
+        in <a href="https://ai.google.dev/gemini-api/docs/pricing#gemini-3.8-flash" target="_blank" rel="noreferrer">Google’s pricing</a>.
       </>
     ),
   },

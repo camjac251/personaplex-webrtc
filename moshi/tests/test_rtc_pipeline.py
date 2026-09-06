@@ -29,6 +29,7 @@ from moshi.rtc_session import (
     MimiOutputTrack,
     RTCSession,
 )
+from moshi.recovery import RestoreIntent
 from moshi.runtime_metrics import RuntimeMetrics
 from moshi.server import (
     TEXT_STARVED_MIN_FRAMES,
@@ -961,12 +962,12 @@ async def test_voice_reset_targets_baseline_not_latest_snapshot() -> None:
     # after the periodic task has replaced the ring wholesale.
     state._session_snapshots = {"session": [(200.0, periodic)]}
     state._session_bookmarks = {"session": [{"id": "bm", "state": periodic}]}
-    restore_calls: list[tuple[str, dict, bool]] = []
+    restore_calls: list[tuple[str, dict, RestoreIntent]] = []
 
     async def fake_restore(
-        session, session_id, snapshot, *, auto_recovery=False
+        session, session_id, snapshot, *, intent
     ):
-        restore_calls.append((session_id, snapshot, auto_recovery))
+        restore_calls.append((session_id, snapshot, intent))
         return True
 
     state._restore_session_snapshot = fake_restore
@@ -975,12 +976,12 @@ async def test_voice_reset_targets_baseline_not_latest_snapshot() -> None:
     await state._handle_voice_reset(session, "session", _RecordingClog())
 
     assert len(restore_calls) == 1
-    restored_session_id, restored_snapshot, auto_recovery = restore_calls[0]
+    restored_session_id, restored_snapshot, intent = restore_calls[0]
     assert restored_session_id == "session"
     assert restored_snapshot is baseline
     # Manual rewind semantics: live tuning must be preserved, so the
     # auto-recovery tuning reset must not be requested.
-    assert auto_recovery is False
+    assert intent is RestoreIntent.VOICE_RESET
     assert [(kind, level) for kind, level, _ in session.events] == [
         ("voice_reset", "ok")
     ]

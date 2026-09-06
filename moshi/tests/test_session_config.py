@@ -326,10 +326,8 @@ def test_parse_session_config_preserves_valid_wire_values() -> None:
 
 def test_turn_handling_contract() -> None:
     assert parse_session_config({}).turn_handling == "native"
-    assert (
-        parse_session_config({"turn_handling": "assisted"}).turn_handling
-        == "assisted"
-    )
+    for mode in ("native", "gentle", "assisted"):
+        assert parse_session_config({"turn_handling": mode}).turn_handling == mode
     for bad in ("auto", "", "NATIVE", None, 1):
         try:
             clamp_turn_handling(bad)

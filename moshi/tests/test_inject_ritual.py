@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 from collections import deque
 
 import numpy as np
@@ -20,7 +21,12 @@ import torch
 
 sys.path.insert(0, "moshi")
 
+from moshi.context import ContextLifecycle, ContextOrigin
+from moshi.models.lm import LMGen
+from moshi.models.lm_controls import LMControlState
 from moshi.server import (  # noqa: E402
+    VISION_QUEUE_MAX,
+    VISION_AMBIENT_MIN_INTERVAL_SEC,
     CONTEXT_SEAL_HOLD_FRAMES,
     INJECT_SILENCE_RMS_DEFAULT,
     INJECT_SILENCE_STREAK_DEFAULT,
@@ -53,10 +59,17 @@ class _FakeLmGen:
     """
 
     max_delay = 1
+    cancel_speech = LMGen.cancel_speech
+    reset_turn_cap_accounting = LMGen.reset_turn_cap_accounting
+    reset_turn_cap_tracking = LMGen.reset_turn_cap_tracking
+    reset_repetition_state = LMGen.reset_repetition_state
+    request_speech = LMGen.request_speech
+    interrupt = LMGen.interrupt
 
     def __init__(self) -> None:
         self.lm_model = _FakeLmModel()
-        self._pad_force_remaining = 0
+        self.controls = LMControlState()
+        self._streaming_state = None
         self._sine = torch.full((1, 8, 1), SINE_MARK, dtype=torch.long)
         self._zero = torch.full((1, 8, 1), ZERO_MARK, dtype=torch.long)
         self.steps: list[dict] = []
@@ -94,6 +107,7 @@ class _FakeMimi:
 
 def _pipeline_state() -> tuple[ServerState, _FakeLmGen]:
     state = ServerState.__new__(ServerState)
+    state._context = ContextLifecycle(VISION_QUEUE_MAX, VISION_AMBIENT_MIN_INTERVAL_SEC)
     lm_gen = _FakeLmGen()
     state.lm_gen = lm_gen
     state.mimi = _FakeMimi()
@@ -112,14 +126,14 @@ def _pipeline_state() -> tuple[ServerState, _FakeLmGen]:
     state._reset_pending_text_flags()
 
     # Inject machinery.
-    state._vision_pending = deque()
-    state._vision_pending_source = ""
-    state._vision_pending_meta = {}
-    state._vision_active = deque()
-    state._vision_active_source = ""
-    state._vision_active_meta = {}
-    state._vision_inject_steps = 0
-    state._inject_seal_remaining = 0
+    state._context.notes.waiting.tokens = deque()
+    state._context.notes.waiting.source = ""
+    state._context.notes.waiting.meta = {}
+    state._context.notes.active.tokens = deque()
+    state._context.notes.active.source = ""
+    state._context.notes.active.meta = {}
+    state._context.notes.active.emitted = 0
+    state._context.hold_remaining = 0
     state._vision_pad_streak = 8
     state._audio_silence_streak = 8
     state._inject_silence_rms = INJECT_SILENCE_RMS_DEFAULT
@@ -128,11 +142,11 @@ def _pipeline_state() -> tuple[ServerState, _FakeLmGen]:
     state._interrupt_gate_remaining = 0
     state._stop_response_latched = False
     state._context_seal_token = 7
-    state._last_injected_vision_key = ""
-    state._last_ambient_context_queued_at = 0.0
-    state._active_context_meta = {}
-    state._inject_active = False
-    state._inject_end_status = "complete"
+    state._context.last_injected_key = ""
+    state._context.last_ambient_queued_at = 0.0
+    state._context.status_meta = {}
+    state._context.injecting = False
+    state._context.end_status = "complete"
     state._observed_idle_rms_ema = 0.0
     state._outbound_muted_prev = False
 
@@ -140,13 +154,13 @@ def _pipeline_state() -> tuple[ServerState, _FakeLmGen]:
     state._reinforce_enabled = False
     state._reinforce_prompt_tokens = []
     state._reinforce_prompt_text = ""
-    state._reinforce_pending = deque()
-    state._reinforce_pending_meta = {}
-    state._reinforce_active = deque()
-    state._reinforce_active_meta = {}
-    state._reinforce_seal_pending = False
-    state._reinforce_seal_meta = {}
-    state._reinforce_inject_steps = 0
+    state._context.persona.waiting.tokens = deque()
+    state._context.persona.waiting.meta = {}
+    state._context.persona.active.tokens = deque()
+    state._context.persona.active.meta = {}
+    state._context.seal_packet = None
+    
+    state._context.persona.active.emitted = 0
     state._last_reinforce_at = 0.0
 
     # User-turn activity tracking.
@@ -200,9 +214,9 @@ def _loud_chunk() -> np.ndarray:
 
 def test_drip_frames_ride_the_t0_ritual() -> None:
     state, lm_gen = _pipeline_state()
-    state._vision_active.extend([41, 42])
-    state._vision_active_source = "ambient"
-    state._vision_active_meta = {"source": "ambient", "text": "scene"}
+    state._context.notes.active.tokens.extend([41, 42])
+    state._context.notes.active.source = "ambient"
+    state._context.notes.active.meta = {"source": "ambient", "text": "scene"}
 
     state._process_audio_frame(_silent_chunk())
     state._process_audio_frame(_silent_chunk())
@@ -219,13 +233,13 @@ def test_drip_frames_ride_the_t0_ritual() -> None:
         "forced_text": 42,
     }
     # Delivering the last token arms the completion hold.
-    assert state._inject_seal_remaining == CONTEXT_SEAL_HOLD_FRAMES
+    assert state._context.hold_remaining == CONTEXT_SEAL_HOLD_FRAMES
 
 
 def test_completion_hold_pads_then_releases() -> None:
     state, lm_gen = _pipeline_state()
-    state._vision_active.extend([41])
-    state._vision_active_meta = {"source": "ambient", "text": "scene"}
+    state._context.notes.active.tokens.extend([41])
+    state._context.notes.active.meta = {"source": "ambient", "text": "scene"}
 
     state._process_audio_frame(_silent_chunk())
     for _ in range(CONTEXT_SEAL_HOLD_FRAMES):
@@ -242,7 +256,7 @@ def test_completion_hold_pads_then_releases() -> None:
         }
         for frame in hold_frames
     ), hold_frames
-    assert state._inject_seal_remaining == 0
+    assert state._context.hold_remaining == 0
     # After the hold the model runs free again on real mic audio.
     released = lm_gen.steps[1 + CONTEXT_SEAL_HOLD_FRAMES]
     assert released["input_mark"] == MIC_MARK
@@ -252,14 +266,14 @@ def test_completion_hold_pads_then_releases() -> None:
 
 def test_user_speech_cancels_hold_and_keeps_mic_audio() -> None:
     state, lm_gen = _pipeline_state()
-    state._vision_active.extend([41])
-    state._vision_active_meta = {"source": "ambient", "text": "scene"}
+    state._context.notes.active.tokens.extend([41])
+    state._context.notes.active.meta = {"source": "ambient", "text": "scene"}
 
     state._process_audio_frame(_silent_chunk())
-    assert state._inject_seal_remaining == CONTEXT_SEAL_HOLD_FRAMES
+    assert state._context.hold_remaining == CONTEXT_SEAL_HOLD_FRAMES
     state._process_audio_frame(_loud_chunk())
 
-    assert state._inject_seal_remaining == 0
+    assert state._context.hold_remaining == 0
     spoken = lm_gen.steps[1]
     assert spoken["input_mark"] == MIC_MARK
     assert spoken["forced_text"] is None
@@ -273,16 +287,16 @@ def test_vision_waits_for_reinforce_seal_before_promotion() -> None:
     state._last_reinforce_at = -1e18
 
     state._process_audio_frame(_silent_chunk())
-    state._vision_pending.extend([41, 42])
-    state._vision_pending_source = "ambient"
-    state._vision_pending_meta = {"source": "ambient", "text": "scene"}
+    state._context.notes.waiting.tokens.extend([41, 42])
+    state._context.notes.waiting.source = "ambient"
+    state._context.notes.waiting.meta = {"source": "ambient", "text": "scene"}
     state._process_audio_frame(_silent_chunk())
     state._process_audio_frame(_silent_chunk())
 
     forced = [frame["forced_text"] for frame in lm_gen.steps[:3]]
     assert forced == [61, state._context_seal_token, 41]
-    assert list(state._reinforce_active) == []
-    assert not state._reinforce_seal_pending
+    assert list(state._context.persona.active.tokens) == []
+    assert not (state._context.seal_packet is not None)
 
 
 def test_user_speech_defers_reinforce_seal_without_dangling_clause() -> None:
@@ -298,22 +312,22 @@ def test_user_speech_defers_reinforce_seal_without_dangling_clause() -> None:
     spoken = lm_gen.steps[1]
     assert spoken["input_mark"] == MIC_MARK
     assert spoken["forced_text"] is None
-    assert state._reinforce_seal_pending
-    assert list(state._reinforce_active) == []
+    assert (state._context.seal_packet is not None)
+    assert list(state._context.persona.active.tokens) == []
 
     state._process_audio_frame(_silent_chunk())
 
     assert lm_gen.steps[2]["forced_text"] == state._context_seal_token
-    assert not state._reinforce_seal_pending
-    assert list(state._reinforce_active) == []
+    assert not (state._context.seal_packet is not None)
+    assert list(state._context.persona.active.tokens) == []
 
 
 def test_stop_latch_frames_keep_real_mic_audio() -> None:
     state, lm_gen = _pipeline_state()
     state._stop_response_latched = True
     state._stop_latched_at = 1e18  # far future; the latch must not expire
-    state._vision_active.extend([41])
-    state._vision_active_meta = {"source": "ambient", "text": "scene"}
+    state._context.notes.active.tokens.extend([41])
+    state._context.notes.active.meta = {"source": "ambient", "text": "scene"}
 
     state._process_audio_frame(_silent_chunk())
 
@@ -327,22 +341,18 @@ def test_stop_latch_frames_keep_real_mic_audio() -> None:
 def test_typed_note_queues_at_manual_priority_and_drips() -> None:
     state, lm_gen = _pipeline_state()
     # An ambient caption is already waiting; a typed note must displace it.
-    state._vision_pending.extend([41, 42])
-    state._vision_pending_source = "ambient"
-    state._vision_pending_meta = {"source": "ambient", "text": "scene"}
+    state._context.notes.waiting.tokens.extend([41, 42])
+    state._context.notes.waiting.source = "ambient"
+    state._context.notes.waiting.meta = {"source": "ambient", "text": "scene"}
 
     note_meta = {"source": "manual", "reason": "typed_note", "text": "note"}
-    ok, blocked_by, duplicate = state._queue_waiting_vision_context(
-        [71, 72], "manual", note_meta
-    )
+    ok, blocked_by, duplicate = state._context.queue_note([71, 72], "manual", note_meta, origin=ContextOrigin.VISION, now=time.monotonic(), camera_generation=state._context.camera_generation)
     assert (ok, blocked_by, duplicate) == (True, "", False)
-    assert list(state._vision_pending) == [71, 72]
-    assert state._vision_pending_source == "manual"
+    assert list(state._context.notes.waiting.tokens) == [71, 72]
+    assert state._context.notes.waiting.source == "manual"
 
     # The reverse displacement is refused: ambient may not evict a note.
-    ok, blocked_by, duplicate = state._queue_waiting_vision_context(
-        [41, 42], "ambient", {"source": "ambient", "text": "scene"}
-    )
+    ok, blocked_by, duplicate = state._context.queue_note([41, 42], "ambient", {"source": "ambient", "text": "scene"}, origin=ContextOrigin.VISION, now=time.monotonic(), camera_generation=state._context.camera_generation)
     assert (ok, blocked_by, duplicate) == (False, "manual", False)
 
     # The note drips under the standard ritual.
@@ -358,7 +368,7 @@ def test_typed_note_queues_at_manual_priority_and_drips() -> None:
         "agent_silenced": True,
         "forced_text": 72,
     }
-    assert state._inject_seal_remaining == CONTEXT_SEAL_HOLD_FRAMES
+    assert state._context.hold_remaining == CONTEXT_SEAL_HOLD_FRAMES
 
 
 def test_inbound_activity_counters_follow_processed_frames() -> None:
@@ -391,13 +401,13 @@ def test_forced_tokens_never_surface_after_a_dropped_hold() -> None:
     forced frame that produced it, not to the natural step that returned it.
     """
     state, _lm_gen = _pipeline_state()
-    state._vision_active.extend([41])
-    state._vision_active_meta = {"source": "ambient", "text": "scene"}
+    state._context.notes.active.tokens.extend([41])
+    state._context.notes.active.meta = {"source": "ambient", "text": "scene"}
 
     first = state._process_audio_frame(_silent_chunk())
     second = state._process_audio_frame(_loud_chunk())
 
-    assert state._inject_seal_remaining == 0
+    assert state._context.hold_remaining == 0
     assert _surfaced(first) == []
     assert _surfaced(second) == []
 
@@ -426,8 +436,8 @@ def test_natural_word_before_a_drip_still_reaches_the_transcript() -> None:
 
     natural = state._process_audio_frame(_silent_chunk())
     # The natural word is now the pending slot; the next step is forced.
-    state._vision_active.extend([41, 42])
-    state._vision_active_meta = {"source": "ambient", "text": "scene"}
+    state._context.notes.active.tokens.extend([41, 42])
+    state._context.notes.active.meta = {"source": "ambient", "text": "scene"}
     forced = state._process_audio_frame(_silent_chunk())
 
     assert lm_gen.steps[1]["forced_text"] == 41
@@ -508,8 +518,8 @@ def test_caption_boost_decays_to_the_persona_floor() -> None:
     lm_gen.cfg_gamma_floor = 1.5
     lm_gen.cfg_gamma = 1.5
     state._caption_cfg_gamma = 2.0
-    state._vision_active.extend([41])
-    state._vision_active_meta = {"source": "ambient", "text": "scene"}
+    state._context.notes.active.tokens.extend([41])
+    state._context.notes.active.meta = {"source": "ambient", "text": "scene"}
 
     # Delivering the packet boosts to the caption target (above the floor).
     state._process_audio_frame(_silent_chunk())
@@ -529,14 +539,44 @@ def test_caption_boost_decays_to_the_persona_floor() -> None:
     state._caption_cfg_gamma = 1.2
     state._vision_pad_streak = 8
     state._audio_silence_streak = 8
-    state._vision_active.extend([41])
-    state._vision_active_meta = {"source": "ambient", "text": "scene two"}
+    state._context.notes.active.tokens.extend([41])
+    state._context.notes.active.meta = {"source": "ambient", "text": "scene two"}
     state._process_audio_frame(_silent_chunk())
     assert lm_gen.cfg_gamma == 1.5
 
 
+def test_camera_switch_does_not_preempt_an_unrelated_persona_drip() -> None:
+    import asyncio
+    from test_vision_context import _Session
+
+    async def run_case():
+        state, gen = _pipeline_state()
+        state._infer_executor = None
+        state._active_session_id = "session"
+        session = _Session()
+        state._active_session = session
+        state._vision_live_tasks = {}
+        state._context.camera_generation = 1
+        state._context.camera_active = True
+        state._reinforce_enabled = True
+        state._reinforce_prompt_tokens = [61, 62, 63]
+        state._reinforce_prompt_text = "Persona."
+        state._last_reinforce_at = -1e18
+        state._process_audio_frame(_silent_chunk())
+        state._context.queue_note([41], "ambient", {"source": "ambient", "text": "Old scene."},
+                                  origin=ContextOrigin.VISION, now=1.0, camera_generation=1)
+        await state._handle_vision_source(session, "session", 2, True)
+        state._process_audio_frame(_silent_chunk())
+        state._process_audio_frame(_silent_chunk())
+        assert [frame["forced_text"] for frame in gen.steps] == [61, 62, 63]
+        assert state._context.hold_remaining == CONTEXT_SEAL_HOLD_FRAMES
+
+    asyncio.run(run_case())
+
+
 if __name__ == "__main__":
     tests = [
+        test_camera_switch_does_not_preempt_an_unrelated_persona_drip,
         test_drip_frames_ride_the_t0_ritual,
         test_completion_hold_pads_then_releases,
         test_user_speech_cancels_hold_and_keeps_mic_audio,
