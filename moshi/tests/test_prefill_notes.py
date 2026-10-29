@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 import sys
 from dataclasses import asdict
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import numpy as np
@@ -345,7 +347,38 @@ def _raw_voice(gen: LMGen) -> _Mimi:
     return _Mimi()
 
 
-def _assert_prefill_pair(reference: LMGen, batch: LMGen, mimi_ref=None, mimi_batch=None, *, voice_frames=0) -> None:
+def _stored_voice(source: LMGen) -> torch.Tensor:
+    """Capture the legacy .pt layout: [frames, batch, time=1, dimension]."""
+    embeddings = []
+    hook = source.lm_model.transformer.register_forward_pre_hook(
+        lambda _module, args: embeddings.append(args[0].clone())
+    )
+    try:
+        assert source._step_voice_prompt(_raw_voice(source)) == 5
+    finally:
+        hook.remove()
+    return torch.stack(embeddings)
+
+
+def _assert_next_step_equal(reference: LMGen, batch: LMGen) -> None:
+    torch.manual_seed(513)
+    expected, expected_logits = reference.step(USER_CODES)
+    torch.manual_seed(513)
+    actual, actual_logits = batch.step(USER_CODES)
+    assert torch.equal(actual, expected)
+    # Check both temporal text logits and every depformer audio-codebook logit.
+    torch.testing.assert_close(actual_logits, expected_logits, rtol=2e-5, atol=2e-6)
+
+
+def _assert_prefill_pair(
+    reference: LMGen,
+    batch: LMGen,
+    mimi_ref=None,
+    mimi_batch=None,
+    *,
+    voice_frames: int = 0,
+    expected_columns: int | None = None,
+) -> None:
     reference.step_system_prompts(mimi_ref)
     shapes = []
     hook = batch.lm_model.transformer.register_forward_pre_hook(
@@ -353,16 +386,20 @@ def _assert_prefill_pair(reference: LMGen, batch: LMGen, mimi_ref=None, mimi_bat
     )
     pointers = _pointers(batch)
     rng = torch.get_rng_state().clone()
-    with patch.object(batch._streaming_state, "graphed_depth", side_effect=AssertionError("prefill sampled audio")):
-        assert batch.prefill_system_prompts(mimi_batch) == voice_frames
-    hook.remove()
-    assert len(shapes) == 1 and shapes[0] > 1, shapes
+    try:
+        with patch.object(batch._streaming_state, "graphed_depth", side_effect=AssertionError("prefill sampled audio")):
+            assert batch.prefill_system_prompts(mimi_batch) == voice_frames
+    finally:
+        hook.remove()
+    assert len(shapes) == 1 and shapes[0] > 0, shapes
+    if expected_columns is not None:
+        assert shapes == [expected_columns], shapes
     assert torch.equal(torch.get_rng_state(), rng)
     assert pointers == _pointers(batch)
     _assert_states_equal(batch, reference)
     assert batch.notes_start == reference.notes_start
     assert asdict(batch.controls) == asdict(reference.controls)
-    torch.testing.assert_close(_next_logits(batch), _next_logits(reference), rtol=2e-5, atol=2e-6)
+    _assert_next_step_equal(reference, batch)
 
 
 def test_batched_plain_text_matches_frame_steps() -> None:
@@ -391,38 +428,175 @@ def test_batched_raw_voice_matches_frame_steps() -> None:
     assert mimi_ref.frames == mimi_batch.frames == 5
 
 
-def test_saved_voice_restore_and_embedding_replay_precede_batch() -> None:
+def test_batched_stored_voice_matches_frame_steps() -> None:
     source = _generator()
-    mimi = _raw_voice(source)
-    embeddings = []
-    hook = source.lm_model.transformer.register_forward_pre_hook(
-        lambda _module, args: embeddings.append(args[0].clone())
-    )
-    assert source._step_voice_prompt(mimi) == 5
-    hook.remove()
+    embeddings = _stored_voice(source)
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / "voice.pt"
+        torch.save({"embeddings": embeddings, "cache": source._streaming_state.cache}, path)
+        for caption_cfg in (False, True):
+            for notes_frames in (0, 5):
+                kwargs = {
+                    "caption_cfg": caption_cfg,
+                    "persona_cfg": caption_cfg,
+                    "notes_frames": notes_frames,
+                }
+                reference = _generator(**kwargs)
+                batch = _generator(**kwargs, batched_prefill=True)
+                for gen in (reference, batch):
+                    gen.load_voice_prompt_embeddings(str(path))
+                    gen.notes_tokens = list(NOTES_A) if notes_frames else []
+                remaining = 2 * batch.audio_silence_frame_cnt + len(PROMPT)
+                if notes_frames:
+                    remaining += notes_frames + 1
+                _assert_prefill_pair(
+                    reference, batch, voice_frames=len(embeddings),
+                    expected_columns=len(embeddings) + remaining,
+                )
+                if notes_frames:
+                    assert batch.notes_start == source._streaming_state.offset + 2 * batch.audio_silence_frame_cnt + len(PROMPT)
+                for gen in (reference, batch):
+                    assert torch.equal(gen.voice_prompt_embeddings, embeddings)
+                    assert torch.equal(gen.voice_prompt_cache, source._streaming_state.cache)
+
+
+def test_batched_blended_voice_matches_frame_steps() -> None:
+    source = _generator()
+    embeddings = _stored_voice(source)
+    # Blends have no final token cache. Also cover replay after an existing
+    # prefix and embeddings that already contain both caption-CFG rows.
+    for caption_cfg, prefix_frames, rows in ((False, 0, 1), (True, 0, 1), (True, 3, 2)):
+        kwargs = {"caption_cfg": caption_cfg, "persona_cfg": caption_cfg, "silence": 0}
+        reference = _generator(**kwargs)
+        batch = _generator(**kwargs, batched_prefill=True)
+        for gen in (reference, batch):
+            gen.text_prompt_tokens = []
+            gen.notes_tokens = list(NOTES_A)
+            for _ in range(prefix_frames):
+                gen.step(
+                    input_tokens=gen._sine_codes,
+                    moshi_tokens=gen._zero_codes,
+                    text_token=PAD_ID,
+                )
+            gen.voice_prompt_embeddings = embeddings.expand(-1, rows, -1, -1)
+            assert gen.voice_prompt_cache is None
+        _assert_prefill_pair(
+            reference, batch, voice_frames=len(embeddings),
+            expected_columns=len(embeddings) + batch.notes_frames + 1,
+        )
+        assert batch.notes_start == prefix_frames + len(embeddings) + int(prefix_frames == 0)
+
+
+def test_batched_stored_voice_without_forced_tail() -> None:
+    source = _generator()
+    embeddings = _stored_voice(source)[:1]
+    for caption_cfg in (False, True):
+        kwargs = {"caption_cfg": caption_cfg, "notes_frames": 0, "silence": 0}
+        reference = _generator(**kwargs)
+        batch = _generator(**kwargs, batched_prefill=True)
+        for gen in (reference, batch):
+            gen.text_prompt_tokens = []
+            gen.voice_prompt_embeddings = embeddings
+        _assert_prefill_pair(reference, batch, voice_frames=1, expected_columns=1)
+
+
+def test_saved_voice_restore_precedes_batch() -> None:
+    source = _generator()
+    _stored_voice(source)
     full_state = _flat_state(source)
-    for full_restore in (False, True):
-        reference = _generator(caption_cfg=True, persona_cfg=True)
-        batch = _generator(caption_cfg=True, persona_cfg=True, batched_prefill=True)
+    for caption_cfg in (False, True):
+        reference = _generator(caption_cfg=caption_cfg, persona_cfg=caption_cfg)
+        batch = _generator(caption_cfg=caption_cfg, persona_cfg=caption_cfg, batched_prefill=True)
+        for gen in (reference, batch):
+            # The sidecar loader uses an empty, non-None embedding marker.
+            gen.voice_prompt_embeddings = []
+            gen.voice_prompt_full_state = full_state
+            gen.notes_tokens = list(NOTES_A)
+        remaining = 2 * batch.audio_silence_frame_cnt + len(PROMPT) + batch.notes_frames + 1
+        _assert_prefill_pair(reference, batch, expected_columns=remaining)
+        _assert_snapshot_unchanged(source, full_state)
+    assert full_state  # restore must not consume the reusable sidecar mapping.
+
+
+def test_saving_voice_embeddings_keeps_frame_steps() -> None:
+    with TemporaryDirectory() as directory:
+        reference = _generator()
+        batch = _generator(batched_prefill=True)
+        for gen, name in ((reference, "reference"), (batch, "batch")):
+            gen.voice_prompt = str(Path(directory) / f"{name}.wav")
+            gen.save_voice_prompt_embeddings = True
+            gen.return_logits = False
+            gen.notes_tokens = list(NOTES_A)
+        mimi_ref, mimi_batch = _raw_voice(reference), _raw_voice(batch)
+        reference.step_system_prompts(mimi_ref)
+        shapes = []
+        hook = batch.lm_model.transformer.register_forward_pre_hook(
+            lambda _module, args: shapes.append(args[0].shape[1])
+        )
+        try:
+            assert batch.prefill_system_prompts(mimi_batch) == 5
+        finally:
+            hook.remove()
+        remaining = 2 * batch.audio_silence_frame_cnt + len(PROMPT) + batch.notes_frames + 1
+        assert shapes == [1] * 4 + [remaining], shapes
+        assert mimi_ref.frames == mimi_batch.frames == 5
+        _assert_states_equal(batch, reference)
+        assert batch.notes_start == reference.notes_start
+        saved_reference = torch.load(Path(directory) / "reference.pt", weights_only=True)
+        saved_batch = torch.load(Path(directory) / "batch.pt", weights_only=True)
+        torch.testing.assert_close(saved_batch, saved_reference, rtol=0, atol=0)
+        assert saved_batch["embeddings"].shape[0] == 4
+        assert saved_batch["full_state_available"]
+        restored = _generator(notes_frames=0, silence=0)
+        restored.text_prompt_tokens = []
+        restored.load_voice_prompt_embeddings(str(Path(directory) / "batch.pt"))
+        assert restored.voice_prompt_full_state is not None
+        with patch.object(
+            restored.lm_model.transformer, "forward",
+            side_effect=AssertionError("full voice state was replayed"),
+        ):
+            assert restored.prefill_system_prompts(None) == 0
+        assert restored._streaming_state.offset == 5
+        assert int(restored.lm_model.transformer._streaming_state.offset) == 4
+        assert torch.equal(restored._streaming_state.cache, saved_batch["cache"])
+        reference.return_logits = batch.return_logits = True
+        _assert_next_step_equal(reference, batch)
+
+
+def test_stored_voice_prefill_capacity_accounts_for_replay() -> None:
+    source = _generator()
+    embeddings = _stored_voice(source)
+    remaining = 2 * source.audio_silence_frame_cnt + len(PROMPT) + source.notes_frames + 1
+    columns = len(embeddings) + remaining
+    for context in (columns, columns - 1):
+        kwargs = {"context": context, "sink": 4, "caption_cfg": True, "persona_cfg": True}
+        reference = _generator(**kwargs)
+        batch = _generator(**kwargs, batched_prefill=True)
         for gen in (reference, batch):
             gen.voice_prompt_embeddings = embeddings
-            if full_restore:
-                gen.voice_prompt_full_state = full_state
-            else:
-                gen.voice_prompt_cache = source._streaming_state.cache.clone()
+            gen.voice_prompt_cache = source._streaming_state.cache
+            gen.notes_tokens = list(NOTES_A)
+        if context == columns:
+            _assert_prefill_pair(
+                reference, batch, voice_frames=len(embeddings),
+                expected_columns=columns,
+            )
+            continue
         reference.step_system_prompts(None)
         shapes = []
         hook = batch.lm_model.transformer.register_forward_pre_hook(
-            lambda _module, args, shapes=shapes: shapes.append(args[0].shape[1])
+            lambda _module, args: shapes.append(args[0].shape[1])
         )
-        count = batch.prefill_system_prompts(None)
-        hook.remove()
-        assert count == (0 if full_restore else len(embeddings))
-        remaining = 2 * batch.audio_silence_frame_cnt + len(PROMPT) + batch.notes_frames + 1
-        assert shapes == ([1] * count + [remaining]), shapes
+        try:
+            with patch("moshi.models.lm.logger.info") as log:
+                assert batch.prefill_system_prompts(None) == len(embeddings)
+        finally:
+            hook.remove()
+        assert shapes == [1] * columns, shapes
+        log.assert_called_once_with("Prompt span exceeds KV capacity; using frame-by-frame prefill")
         _assert_states_equal(batch, reference)
-        torch.testing.assert_close(_next_logits(batch), _next_logits(reference), rtol=2e-5, atol=2e-6)
-    assert full_state  # restore must not consume the reusable sidecar mapping.
+        assert batch.notes_start == reference.notes_start
+        _assert_next_step_equal(reference, batch)
 
 
 def test_prefill_overflow_falls_back_to_frame_steps() -> None:
@@ -491,7 +665,12 @@ if __name__ == "__main__":
         test_batched_persona_cfg_matches_frame_steps,
         test_batched_notes_match_frame_steps,
         test_batched_raw_voice_matches_frame_steps,
-        test_saved_voice_restore_and_embedding_replay_precede_batch,
+        test_batched_stored_voice_matches_frame_steps,
+        test_batched_blended_voice_matches_frame_steps,
+        test_batched_stored_voice_without_forced_tail,
+        test_saved_voice_restore_precedes_batch,
+        test_saving_voice_embeddings_keeps_frame_steps,
+        test_stored_voice_prefill_capacity_accounts_for_replay,
         test_prefill_overflow_falls_back_to_frame_steps,
         test_async_and_sync_priming_match_and_cancel_unprimed_notes,
         test_notes_without_prefix_finish_initial_audio_fills,

@@ -2,10 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { fetchIceServers, fetchVoiceList } from "./api/rtc.js";
 import { CharacterCard } from "./components/CharacterCard.jsx";
-import { DirectorNotes } from "./components/DirectorNotes.jsx";
+import { DirectorNotes, OpeningDirection } from "./components/DirectorNotes.jsx";
 import { Info, Listbox, ToggleRow, MiniSlider } from "./components/Controls.jsx";
 import { PreflightModal, VisionSourceModal, FrameModal } from "./components/Modals.jsx";
-import { Badge, Flow, Level, RailColumn, Row, RTTGraph, Scope, TelemetryCell, VuMeter } from "./components/Telemetry.jsx";
+import { Badge, Flow, Level, RailColumn, Row, RTTGraph, Scope, TelemetryCell } from "./components/Telemetry.jsx";
+import { Transcript } from "./components/Transcript.jsx";
 import { Icon } from "./components/icons.jsx";
 import {
   DEFAULTS,
@@ -39,6 +40,8 @@ import { rmsFromAnalyser } from "./utils/audio.js";
 import { cls, fmt, fmtGb } from "./utils/format.js";
 import { canStartConversation, createSessionLifecycle } from "./utils/sessionLifecycle.js";
 import { createSessionTrace, downloadSessionTrace } from "./utils/sessionTrace.js";
+import { splitTranscriptChunk } from "./utils/transcript.js";
+import { resolvedVisionReactionMode, visionReactionFlags } from "./utils/vision.js";
 
 function parseStoredArray(value) {
   try {
@@ -215,7 +218,8 @@ const ASSISTED_MODEL_DEFAULTS = {
 };
 const CHARACTERPLEX_MODEL_DEFAULTS = {
   ...DEFAULTS,
-  turnHandling: "floor",
+  turnOnsetBias: 1.0,
+  turnHandling: "native",
 };
 
 function defaultsForModel(variant, nativeDuplexRecommended = null) {
@@ -227,7 +231,7 @@ function defaultsForModel(variant, nativeDuplexRecommended = null) {
 }
 
 function recommendedTurnHandlingForModel(variant, nativeDuplexRecommended = null) {
-  if (variant === "characterplex") return "floor";
+  if (variant === "characterplex") return "native";
   return variant === "rl-seamless" || nativeDuplexRecommended === true
     ? "native"
     : "assisted";
@@ -255,8 +259,9 @@ function matchesReplacedDefault(value, defaults) {
 }
 
 const VISION_REACTION_MODES = [
-  { id: "passive", label: "Captions only" },
-  { id: "continuous", label: "Ambient react · unsafe" },
+  { id: "passive", label: "Captions only", info: "visionPassive" },
+  { id: "notes", label: "Scene notes", info: "visionNotes" },
+  { id: "continuous", label: "Ambient react · unsafe", info: "visionAmbient" },
 ];
 
 const TURN_HANDLING_MODES = [
@@ -291,7 +296,8 @@ function normalizeVisionReactionMode(value, fallback = "passive") {
   return VISION_REACTION_MODES.some((mode) => mode.id === value) ? value : fallback;
 }
 
-function visionReactionModeFromFlags(feedModel, groundTurns, fallback = "passive") {
+function visionReactionModeFromFlags(feedModel, groundTurns, fallback = "passive", notes = false) {
+  if (notes) return "notes";
   if (feedModel) return "continuous";
   // Retire legacy after-speech grounding: real GPU traces showed it queued
   // only after the assistant's answer and could provoke an unsolicited
@@ -304,20 +310,14 @@ function storedVisionReactionMode() {
   try {
     const groundTurns = localStorage.getItem("pp_visionGroundTurns") === "1";
     const feedModel = localStorage.getItem("pp_visionFeedModel") === "1";
-    // The two-toggle UI labelled its both-off state "manual" and kept the
-    // on-demand injection button enabled, so a stored both-off state maps to
-    // captions-only. Fresh installs also default there: enabling vision must
-    // not silently alter the speech model's learned turn timing.
+    // Preserve legacy explicit choices. An empty preference follows the
+    // active model: CharacterPlex uses Scene notes, other models captions only.
     const legacyPresent =
       localStorage.getItem("pp_visionGroundTurns") !== null ||
       localStorage.getItem("pp_visionFeedModel") !== null;
-    return visionReactionModeFromFlags(
-      feedModel,
-      groundTurns,
-      legacyPresent ? "manual" : "passive",
-    );
+    return legacyPresent ? visionReactionModeFromFlags(feedModel, groundTurns, "manual") : "";
   } catch {
-    return "passive";
+    return "";
   }
 }
 
@@ -482,12 +482,11 @@ function App() {
   const [phase, setPhase] = useState("idle");
   // User toggle to peek at the frozen config column while a session runs.
   const [sideExpanded, setSideExpanded] = useState(false);
-  // Collapsible tuning rack. Starts open on tall viewports and collapsed on
-  // short ones so the transcript keeps its room; the stored preference wins
-  // on later loads.
+  // Advanced tuning stays available without crowding live direction and
+  // conversation. An explicit stored preference wins on later loads.
   const [railOpen, setRailOpen] = useStoredState(
     "pp_railOpen",
-    typeof window !== "undefined" ? window.innerHeight > 700 : true,
+    false,
     (v) => v === "1",
     (v) => (v ? "1" : "0"),
   );
@@ -519,6 +518,7 @@ function App() {
   // between text chunks). The flat accumulator is only read inside its own
   // setter, where per-turn word and rate accounting slices it.
   const [aiTurns, setAiTurns] = useState([]);
+  const [transcriptMarkers, setTranscriptMarkers] = useState([]);
   // User-side transcript turns. Each entry is { id, audioOnly, text }. A
   // turn is created from the local speaking-state transition (mic spoke,
   // assistant resumed) with audioOnly true and no text; the optional
@@ -625,13 +625,11 @@ function App() {
   const [autoGain, setAutoGain] = useStoredState("pp_autoGain", DEFAULTS.autoGain, (v) => v === "1", (v) => (v ? "1" : "0"));
   const [visionInTranscript, setVisionInTranscript] = useStoredState("pp_visionInTranscript", false, (v) => v === "1", (v) => (v ? "1" : "0"));
   const [visionPromptReplace, setVisionPromptReplace] = useStoredState("pp_visionPromptReplace", false, (v) => v === "1", (v) => (v ? "1" : "0"));
-  const [visionReactionMode, setVisionReactionMode] = useStoredState(
+  const [visionReactionPreference, setVisionReactionMode] = useStoredState(
     "pp_visionReactionMode",
     storedVisionReactionMode(),
-    (value) => normalizeVisionReactionMode(value),
+    (value) => normalizeVisionReactionMode(value, ""),
   );
-  const visionFeedModel = visionReactionMode === "continuous";
-  const visionGroundTurns = visionReactionMode === "after_speech";
   const [reinforceInSilences, setReinforceInSilences] = useStoredState("pp_reinforceInSilences", false, (v) => v === "1", (v) => (v ? "1" : "0"));
   const [seedRandom, setSeedRandom] = useStoredState("pp_seedRandom", true, (v) => v === "1", (v) => (v ? "1" : "0"));
   const [seed, setSeed] = useStoredState("pp_seedValue", DEFAULTS.seed, Number);
@@ -672,6 +670,10 @@ function App() {
     nativeDuplexRecommended: null,
     notesFrames: 0,
   });
+  const visionReactionMode = resolvedVisionReactionMode(visionReactionPreference, serverInfo.modelVariant, serverInfo.notesFrames);
+  const visionFeedModel = visionReactionMode === "continuous";
+  const visionGroundTurns = visionReactionMode === "after_speech";
+  const visionNotes = visionReactionMode === "notes" && serverInfo.notesFrames > 0;
   const modelDefaults = defaultsForModel(
     serverInfo.modelVariant,
     serverInfo.nativeDuplexRecommended,
@@ -859,8 +861,7 @@ function App() {
     padding_bonus: Number(padBonus),
     turn_onset_bias: Number(turnOnsetBias),
     max_turn_text_tokens: Number.parseInt(maxTurn, 10),
-    vision_feed_model: !!visionFeedModel,
-    vision_ground_user_turns: !!visionOn && !!visionGroundTurns,
+    ...visionReactionFlags(visionReactionMode, visionOn, serverInfo.notesFrames),
     inject_silence_rms: Number(injectSilenceRms),
     inject_silence_streak: Number.parseInt(injectSilenceStreak, 10),
   };
@@ -920,6 +921,13 @@ function App() {
     recordTrace(kind, { message: text, offset_ms: offsetMs, ...extra }, { level });
   }, [recordTrace]);
 
+  // Local-only content. Never send these markers to notices or sessionTrace.
+  const addTranscriptMarker = useCallback((text, role = "system") => {
+    const at = performance.now();
+    const marker = { id: `marker-${globalThis.crypto.randomUUID()}`, at, role, text };
+    setTranscriptMarkers((items) => [...items, marker].slice(-80));
+  }, []);
+
   const contextNote = useContextNoteSubmission({
     enabled: phase === "live" && !reconnecting,
     sendCommand: sessionLifecycleRef.current.sendCommand,
@@ -930,7 +938,7 @@ function App() {
     enabled: serverInfo.notesFrames > 0 && phase === "live" && !reconnecting,
     sendCommand: sessionLifecycleRef.current.sendCommand,
   });
-  const { receive: receiveDirectorNotes, disconnect: disconnectDirectorNotes } = directorNotes;
+  const { receive: receiveDirectorNotes, disconnect: disconnectDirectorNotes, startSession: startDirectorNotesSession } = directorNotes;
 
   const recordRttSample = useCallback((rtt) => {
     if (!(rtt > 0)) return;
@@ -1158,8 +1166,8 @@ function App() {
   const visionCostUsd = visionFramesSent * VISION_PER_CALL_USD;
   const visionCostLimitActive = Number(visionCostLimitUsd) > 0;
   const visionCostRemaining = Math.max(0, Number(visionCostLimitUsd || 0) - visionCostUsd);
-  const visionFeedStatus = formatVisionFeed(currentVisionFeed, visionFeedModel, visionInjecting);
-  const visionTurnStatus = visionGroundTurns
+  const visionFeedStatus = visionNotes ? "scene notes" : formatVisionFeed(currentVisionFeed, visionFeedModel, visionInjecting);
+  const visionTurnStatus = visionNotes ? "silent updates" : visionGroundTurns
     ? "auto after speech"
     : visionFeedModel
       ? "continuous react"
@@ -1495,8 +1503,7 @@ function App() {
         visionPrompt === DEFAULT_VISION_PROMPT ? "" : visionPrompt || "",
       vision_prompt_replace: !!visionPromptReplace,
       vision_in_transcript: !!visionInTranscript,
-      vision_feed_model: !!visionFeedModel,
-      vision_ground_user_turns: !!visionOn && !!visionGroundTurns,
+      ...visionReactionFlags(visionReactionMode, visionOn, serverInfo.notesFrames),
       reinforce_in_silences: !!reinforceInSilences,
       // Overlap ownership travels with the session so the server can
       // enforce the mode and run its own sustained-overlap stop.
@@ -1536,8 +1543,7 @@ function App() {
     visionPrompt,
     visionPromptReplace,
     visionInTranscript,
-    visionFeedModel,
-    visionGroundTurns,
+    visionReactionMode,
     visionOn,
     reinforceInSilences,
     turnHandling,
@@ -1592,6 +1598,7 @@ function App() {
         cost_limit_usd: Number(visionCostLimitUsd),
         reaction_mode: visionReactionMode,
         feed_model: !!visionFeedModel,
+        notes: !!visionNotes,
         ground_user_turns: !!visionGroundTurns,
       },
     };
@@ -1610,6 +1617,7 @@ function App() {
     visionCostLimitUsd,
     visionReactionMode,
     visionFeedModel,
+    visionNotes,
     visionGroundTurns,
   ]);
 
@@ -1648,6 +1656,7 @@ function App() {
         configFeedModel,
         configGroundTurns,
         profile?.vision?.reaction_mode ?? (legacyProfile ? "manual" : "passive"),
+        config.vision_notes === true || profile?.vision?.notes === true,
       ),
     );
     setReinforceInSilences(!!config.reinforce_in_silences);
@@ -2031,11 +2040,10 @@ function App() {
     if (sessionLifecycleRef.current.isControlOpen) {
       sessionLifecycleRef.current.sendCommand({
         type: "update_config",
-        vision_feed_model: sourceActive && mode === "continuous",
-        vision_ground_user_turns: sourceActive && mode === "after_speech",
+        ...visionReactionFlags(mode, sourceActive, serverInfo.notesFrames),
       });
     }
-  }, []);
+  }, [serverInfo.notesFrames]);
 
   const stopVision = useCallback(() => {
     const activeStream = visionStreamRef.current;
@@ -2211,6 +2219,7 @@ function App() {
         const wasResuming = resumingRef.current;
         resumingRef.current = false;
         const resumed = wasResuming && message.resumed === true;
+        if (!resumed) startDirectorNotesSession(sentConfigRef.current?.notes || "");
         setPhase("live");
         // A transport loss can drop the terminal bookmark event after the
         // server accepted the request. Never carry a permanently disabled
@@ -2295,7 +2304,11 @@ function App() {
           sessionLifecycleRef.current.sendCommand({ type: "update_config", ...drifted });
         }
       } else if (message.type === "text") {
-        const chunk = message.v || "";
+        const segments = splitTranscriptChunk(message.v);
+        for (const segment of segments) {
+          if (segment.kind === "vision") addTranscriptMarker(segment.text, "vision");
+        }
+        const chunk = segments.filter((segment) => segment.kind === "text").map((segment) => segment.text).join("");
         if (!chunk) return;
         const now = performance.now();
         if (!assistantTurnRef.current.startedAt || now - (assistantTurnRef.current.lastChunkAt || 0) > 1600) {
@@ -2316,7 +2329,7 @@ function App() {
           traceTotalsRef.current.assistantTurns += 1;
           const aiTurnId = `${Date.now()}-ai-${Math.random().toString(36).slice(2, 7)}`;
           aiTurnOpenRef.current = aiTurnId;
-          setAiTurns((turns) => [...turns, { id: aiTurnId, at: now, text: "" }].slice(-60));
+          setAiTurns((turns) => [...turns.map((turn) => turn.active ? { ...turn, active: false } : turn), { id: aiTurnId, at: now, text: "", active: true }].slice(-60));
         } else {
           assistantTurnRef.current.lastChunkAt = now;
         }
@@ -2368,6 +2381,8 @@ function App() {
             lastLength: transcriptLengthRef.current,
             words: 0,
           };
+          const closedId = aiTurnOpenRef.current;
+          setAiTurns((turns) => turns.map((item) => item.id === closedId ? { ...item, active: false } : item));
           aiTurnOpenRef.current = null;
           assistantIdleTimerRef.current = null;
         }, 1600);
@@ -2661,11 +2676,18 @@ function App() {
         if (message.kind === "context_note") {
           const notice = receiveContextNote(message.data || {});
           if (notice) ({ text, level } = notice);
+          if (message.data?.status === "queued") addTranscriptMarker("Context note queued");
         }
         if (message.kind === "notes") {
           const notice = receiveDirectorNotes(message.data || {});
           if (notice) ({ text, level } = notice);
           else text = "Director notes status updated";
+          if (notice?.localText !== undefined) addTranscriptMarker(notice.localText ? `Direction applied: ${notice.localText}` : "Direction cleared");
+        }
+        if (message.kind === "vision_notes") {
+          const status = message.data?.status;
+          text = status === "applied" ? "Scene updated" : status === "cleared" ? "Scene notes cleared" : "Scene notes update rejected";
+          if (status === "applied") addTranscriptMarker("Scene updated", "vision");
         }
         if (message.kind === "floor") {
           text = message.data?.action === "hold"
@@ -2774,7 +2796,7 @@ function App() {
         setStageMessage("Session complete");
       }
     },
-    [addNotice, attachAudioGraph, cleanup, pulseInterrupt, receiveContextNote, receiveDirectorNotes, recordRttSample, recordTrace, startRecording, stopVision, toast],
+    [addNotice, addTranscriptMarker, attachAudioGraph, cleanup, pulseInterrupt, receiveContextNote, receiveDirectorNotes, startDirectorNotesSession, recordRttSample, recordTrace, startRecording, stopVision, toast],
   );
 
 
@@ -3087,6 +3109,7 @@ function App() {
     setTranscriptText("");
     transcriptLengthRef.current = 0;
     setAiTurns([]);
+    setTranscriptMarkers([]);
     aiTurnOpenRef.current = null;
     setUserTurns([]);
     userTurnOpenRef.current = null;
@@ -3217,6 +3240,7 @@ function App() {
     setTranscriptText("");
     transcriptLengthRef.current = 0;
     setAiTurns([]);
+    setTranscriptMarkers([]);
     aiTurnOpenRef.current = null;
     setUserTurns([]);
     userTurnOpenRef.current = null;
@@ -3436,7 +3460,7 @@ function App() {
       setCaptionEntries([]);
       const startMessage = {
         continuous: "unsafe ambient scene reactions are enabled",
-        manual: "scene grounding is manual",
+        notes: "captions update the character's notes silently",
         passive: "scene captions are passive",
       }[visionReactionMode];
       addNotice(
@@ -4471,18 +4495,13 @@ function App() {
   const phaseProgress = { idle: 0, connecting: 25, warmup: 55, live: 82, stopping: 92, ended: 100 }[phase] ?? 0;
   // Interleave assistant segments and user turns into one chronological list
   // so the transcript reads as a back-and-forth instead of one AI blob.
-  const transcriptTurns = [
+  const transcriptTurns = useMemo(() => [
     ...aiTurns
       .filter((turn) => turn.text.trim())
-      .map((turn) => ({ id: turn.id, role: "ai", at: turn.at || 0, text: turn.text })),
-    ...userTurns.map((turn) => ({
-      id: turn.id,
-      role: "you",
-      at: turn.at || 0,
-      audioOnly: turn.audioOnly,
-      text: turn.text,
-    })),
-  ].sort((a, b) => a.at - b.at);
+      .map((turn) => ({ ...turn, role: "ai", at: turn.at || 0 })),
+    ...userTurns.map((turn) => ({ ...turn, role: "you", at: turn.at || 0 })),
+    ...transcriptMarkers,
+  ].sort((a, b) => a.at - b.at), [aiTurns, userTurns, transcriptMarkers]);
   const blendActive = voiceBlend && !uploadedVoiceFilename && voiceB && voiceB !== voice && blendMix > 0;
   const voiceDisplay = uploadedVoiceFilename
     ? uploadedVoiceLabel || "retained clone"
@@ -4790,6 +4809,9 @@ function App() {
                     setSessionProfileId("custom");
                   }}
                 />
+              )}
+              {serverInfo.notesFrames > 0 && (
+                <OpeningDirection value={initialNotes} notesFrames={serverInfo.notesFrames} onChange={(value) => { setInitialNotes(value); setSessionProfileId("custom"); }} />
               )}
               <div style={{ height: 8 }} />
               <textarea
@@ -5501,61 +5523,25 @@ function App() {
           </div>
 
           <div className="telem">
-            <TelemetryCell label="Latency" value={latencyMs || "·"} unit="ms" fill={Math.min(100, (latencyMs / 300) * 100)} warn={latencyMs > 220} err={latencyMs > 280} />
-            <TelemetryCell label="Tail · p95" value={tailLatencyMs || "·"} unit="ms" fill={Math.min(100, (tailLatencyMs / 380) * 100)} warn={tailLatencyMs > 260} err={tailLatencyMs > 340} />
-            <TelemetryCell label="Turn buffer" value={assistantRate.words} unit={`/${maxTurn} ≈tok`} fill={Math.min(100, (assistantRate.words / Math.max(1, maxTurn)) * 100)} warn={assistantRate.words > maxTurn * 0.75} err={assistantRate.words > maxTurn * 0.9} />
-            <TelemetryCell label="Response rate" value={assistantRate.wpm || "·"} unit="wpm" fill={Math.min(100, (assistantRate.wpm / 220) * 100)} warn={assistantRate.wpm > 170} err={assistantRate.wpm > 220} />
-            <TelemetryCell label="Vision sent / gated" value={visionFramesSent} unit={`/${visionFramesSent + visionFramesGated || "·"}`} fill={(visionFramesSent / Math.max(1, visionFramesSent + visionFramesGated)) * 100} violet />
+            <TelemetryCell label="Latency" info="latencyMetric" value={latencyMs || "·"} unit="ms" fill={Math.min(100, (latencyMs / 300) * 100)} warn={latencyMs > 220} err={latencyMs > 280} />
+            <TelemetryCell label="Tail · p95" info="tailMetric" value={tailLatencyMs || "·"} unit="ms" fill={Math.min(100, (tailLatencyMs / 380) * 100)} warn={tailLatencyMs > 260} err={tailLatencyMs > 340} />
+            <TelemetryCell label="Turn buffer" info="turnMetric" value={assistantRate.words} unit={`/${maxTurn} ≈tok`} fill={Math.min(100, (assistantRate.words / Math.max(1, maxTurn)) * 100)} warn={assistantRate.words > maxTurn * 0.75} err={assistantRate.words > maxTurn * 0.9} />
+            <TelemetryCell label="Response rate" info="rateMetric" value={assistantRate.wpm || "·"} unit="wpm" fill={Math.min(100, (assistantRate.wpm / 220) * 100)} warn={assistantRate.wpm > 170} err={assistantRate.wpm > 220} />
+            <TelemetryCell label="Vision sent / gated" info="visionMetric" value={visionFramesSent} unit={`/${visionFramesSent + visionFramesGated || "·"}`} fill={(visionFramesSent / Math.max(1, visionFramesSent + visionFramesGated)) * 100} violet />
           </div>
 
           <div className="stage-main">
-            <div
-              className="deck"
-              role="img"
+            <section
+              className="signal-strip"
               aria-label={
                 isLive
                   ? `Signal meters. Outbound voice ${voiceDisplay}: ${visionInjecting ? "gated" : speaking === "ai" || speaking === "both" ? "active" : "idle"}. Inbound microphone: ${speaking === "you" || speaking === "both" ? "active" : "idle"}.`
                   : "Signal meters on standby."
               }
             >
-              <div className={cls("chan", (speaking === "you" || speaking === "both") && "hot")}>
-                <div className="chan-h">
-                  <span className="chan-n">IN · YOU</span>
-                  <span className="chan-led amber" />
-                </div>
-                <div className="chan-body">
-                  <div className="chan-scale mono">
-                    <span>0</span>
-                    <span>-6</span>
-                    <span>-18</span>
-                    <span>-∞</span>
-                  </div>
-                  <VuMeter value={levels.mic} color="amber" peak={speaking === "you" || speaking === "both"} />
-                </div>
-                <div className="chan-s mono">
-                  {speaking === "you" || speaking === "both" ? "SIG" : isLive ? "idle" : "—"}
-                </div>
-              </div>
-
               <div className="scope">
                 <div className="scope-screen">
                   <Scope active={isLive && !visionInjecting} speaking={visionInjecting ? null : speaking} />
-                </div>
-                <div className="scope-corner tl">
-                  <span className="dot green" />CH1 · AI OUT
-                </div>
-                <div className="scope-corner tr">
-                  CH2 · YOU IN<span className="dot amber" />
-                </div>
-                <div className="scope-corner bl mono">24 kHz · MIMI</div>
-                <div className="scope-corner br mono">
-                  {isLive
-                    ? `${(rtf || 0.6).toFixed(2)}× RTF`
-                    : phase === "warmup"
-                      ? "WARMUP"
-                      : phase === "connecting"
-                        ? "SYNC"
-                        : "STANDBY"}
                 </div>
 
                 {visionInjecting && (
@@ -5599,129 +5585,32 @@ function App() {
                 )}
               </div>
 
-              <div className={cls("chan", (speaking === "ai" || speaking === "both") && !visionInjecting && "hot")}>
-                <div className="chan-h">
-                  <span className="chan-led green" />
-                  <span className="chan-n">OUT · AI</span>
-                </div>
-                <div className="chan-body">
-                  <VuMeter value={visionInjecting ? 0 : levels.ai} color="green" peak={!visionInjecting && (speaking === "ai" || speaking === "both")} />
-                  <div className="chan-scale mono">
-                    <span>0</span>
-                    <span>-6</span>
-                    <span>-18</span>
-                    <span>-∞</span>
-                  </div>
-                </div>
-                <div className="chan-s mono">
-                  {visionInjecting ? "GATE" : speaking === "ai" || speaking === "both" ? "SIG" : isLive ? "idle" : "—"}
-                </div>
+              <div className="signal-levels">
+                <span className="signal-label">Signal <Info k="signalStrip" /></span>
+                <Level label="IN · YOU" value={levels.mic} you />
+                <Level label="OUT · AI" value={visionInjecting || interrupting ? 0 : levels.ai} />
+                <span className="signal-detail mono">{isLive ? `${(rtf || 0.6).toFixed(2)}× RTF` : "24 kHz · MIMI"}</span>
               </div>
-            </div>
+            </section>
 
             <div className={cls("lower", visionOn && "with-vision")}>
               <div className="transcript">
                 <div className="transcript-h">
                   <span className="l">Transcript</span>
-                  <span className="r">{assistantRate.words ? `${assistantRate.wpm} wpm` : isLive ? "streaming" : phase}</span>
+                  <span className="r">{isLive ? "live transcript" : phase}</span>
                 </div>
-                <div className="transcript-stream">
-                  {transcriptTurns.length === 0 ? (
-                    <div className="transcript-empty">
-                      <div>
-                        <div className="label">{isLive ? "Listening" : "No active transcript"}</div>
-                        <div className="sub">{isLive ? "Speak into your microphone." : "Configure persona on the left, then connect."}</div>
-                      </div>
-                    </div>
-                  ) : (
-                    transcriptTurns.map((turn) =>
-                      turn.role === "ai" ? (
-                        <div key={turn.id} className="line ai">
-                          <span className="who">AI</span>
-                          <span className="text">{turn.text}</span>
-                        </div>
-                      ) : (
-                        <div key={turn.id} className={cls("line you", turn.audioOnly && "audio-only")}>
-                          <span className="who">You</span>
-                          {turn.audioOnly ? (
-                            <span className="text muted">spoke · audio only</span>
-                          ) : (
-                            <span className="text">{turn.text}</span>
-                          )}
-                        </div>
-                      ),
-                    )
-                  )}
-                </div>
-                {serverInfo.notesFrames > 0 && (
-                  <DirectorNotes
-                    notes={directorNotes}
-                    initialNotes={initialNotes}
-                    onInitialNotesChange={(value) => {
-                      setInitialNotes(value);
-                      setSessionProfileId("custom");
-                    }}
-                    notesFrames={serverInfo.notesFrames}
-                  />
+                {serverInfo.notesFrames > 0 && directorNotes.appliedText && (
+                  <div className="directing-chip">
+                    <span className="directing-label">Directing</span>
+                    <span className="directing-text" title={directorNotes.appliedText}>{directorNotes.appliedText}</span>
+                    <button type="button" disabled={!directorNotes.canSend} onClick={directorNotes.clear} aria-label="Clear applied director notes">×</button>
+                  </div>
                 )}
-                {isLive && (
-                  <form
-                    className="context-note-row"
-                    aria-busy={contextNote.pending}
-                    onSubmit={(event) => {
-                      event.preventDefault();
-                      contextNote.submit();
-                    }}
-                  >
-                    <input
-                      type="text"
-                      className="context-note-input"
-                      value={contextNote.draft}
-                      placeholder="Add a short note for the AI"
-                      aria-label="Experimental context note for the AI"
-                      aria-describedby={cls("context-note-help context-note-limit", (contextNote.overLimit || contextNote.error) && "context-note-error")}
-                      aria-invalid={contextNote.overLimit || !!contextNote.error}
-                      onChange={(event) => contextNote.edit(event.target.value)}
-                    />
-                    <button
-                      type="submit"
-                      className="context-note-send"
-                      disabled={!contextNote.canSubmit}
-                    >
-                      {contextNote.pending ? "Sending…" : "Inject"}
-                    </button>
-                    <p className="context-note-help" id="context-note-help">
-                      Experimental note: it may be repeated aloud. This is not private memory.
-                    </p>
-                    <p className="context-note-help" id="context-note-limit">
-                      {contextNote.chars}/180 characters · Up to 32 model tokens, checked by the server.
-                    </p>
-                    {(contextNote.overLimit || contextNote.error) && (
-                      <p className="context-note-error" id="context-note-error" role="alert">
-                        {contextNote.overLimit ? "Over the 180-character limit. Shorten your note before sending." : contextNote.error}
-                      </p>
-                    )}
-                  </form>
-                )}
-                {/* biome-ignore lint/a11y/useAriaPropsSupportedByRole: aria-label names this readout region for assistive tech; visible per-row labels are also present */}
-                <div className="turn-insights" aria-label="Conversation telemetry">
-                  <div className="turn-insight">
-                    <span className="k">Last turn</span>
-                    <span className="v">{assistantRate.words ? `${assistantRate.words} words` : "waiting"}</span>
-                  </div>
-                  <div className="turn-insight">
-                    <span className="k">Rate</span>
-                    <span className="v">{assistantRate.words ? `${assistantRate.wpm} wpm` : "no sample"}</span>
-                  </div>
-                  <div className="turn-insight">
-                    <span className="k">Timeline</span>
-                    <span className="v">{sessionTimeline.length ? `${sessionTimeline.length} points` : "empty"}</span>
-                  </div>
-                </div>
+                <Transcript turns={transcriptTurns} sessionStart={sessionStartedAtRef.current} live={isLive} />
                 {timelinePreview.length > 0 && (
                   <div className="turn-ribbon-wrap">
                     <div className="turn-ribbon-head">
-                      <span>Session timeline</span>
+                      <span>Session timeline · {sessionTimeline.length} {sessionTimeline.length === 1 ? "point" : "points"}</span>
                       <span>{recordingUrl ? "scrub enabled" : phase === "ended" ? "recording unavailable" : "live capture"}</span>
                     </div>
                     <ul className="turn-ribbon" aria-label="Session timeline">
@@ -5756,6 +5645,7 @@ function App() {
                     )}
                   </div>
                 )}
+                <DirectorNotes notes={directorNotes} notesFrames={serverInfo.notesFrames} contextNote={contextNote} live={isLive && !reconnecting} />
               </div>
 
               {visionOn && (
@@ -5855,9 +5745,9 @@ function App() {
                       </span>
                       {/* biome-ignore lint/a11y/useSemanticElements: segmented mode control; the visible label is shared by all buttons and fieldset styling conflicts with the compact panel */}
                       <div className="seg-mini vision-reaction" role="group" aria-labelledby="vision-reaction-label">
-                        {VISION_REACTION_MODES.map((mode) => (
+                        {VISION_REACTION_MODES.filter((mode) => mode.id !== "notes" || serverInfo.notesFrames > 0).map((mode) => (
+                          <span className="vision-mode-choice" key={mode.id}>
                           <button
-                            key={mode.id}
                             type="button"
                             className={cls(visionReactionMode === mode.id && "on")}
                             aria-pressed={visionReactionMode === mode.id}
@@ -5869,12 +5759,16 @@ function App() {
                           >
                             {mode.label}
                           </button>
+                          <Info k={mode.info} />
+                          </span>
                         ))}
                       </div>
-                      <span className={cls("vision-reaction-note", visionReactionMode !== "passive" && "warn")}>
-                        {visionReactionMode === "passive"
-                          ? "Captions stay outside the voice model and cannot disturb speech timing."
-                          : "Unsafe experiment: may speak about changing scenes without being asked."}
+                      <span className={cls("vision-reaction-note", visionReactionMode === "continuous" && "warn")}>
+                        {visionReactionMode === "notes"
+                          ? "Captions update the character's notes silently; nothing is spoken into the conversation."
+                          : visionReactionMode === "passive"
+                            ? "Captions stay outside the voice model and cannot disturb speech timing."
+                            : "Unsafe experiment: may speak about changing scenes without being asked."}
                       </span>
                     </div>
                     <div className="mini-row" style={{ paddingTop: 4 }}>
@@ -6009,10 +5903,6 @@ function App() {
           </div>
 
           <div className="transport">
-            <div className="levels">
-              <Level label="MIC IN" value={levels.mic} you />
-              <Level label="AI OUT" value={levels.ai} />
-            </div>
             <div className="controls">
               {isLive && (
                 <>

@@ -6,7 +6,6 @@ Run directly: ``uv run python moshi/tests/test_runtime_diagnostics.py``.
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import os
 import re
@@ -1558,6 +1557,16 @@ def test_characterplex_identity_and_process_flags() -> None:
         assert payload["process_flags"]["notes_frames"] == 64
         assert payload["process_flags"]["batched_prefill"] is True
         assert payload["process_flags"]["kv_sink_frames"] == 1024
+        state.lm_gen = _ControlLM()
+        state.lm_gen.text_prompt_tokens = []
+        state.lm_gen.cfg_gamma_floor = 1.0
+        state._active_notes = "synthetic private director"
+        state._active_vision_scene = "synthetic private scene"
+        assert state._applied_config_snapshot()["vision_notes"] is False
+        state._vision_notes = True
+        snapshot = state._applied_config_snapshot()
+        assert snapshot["vision_notes"] is True
+        assert "synthetic private" not in json.dumps(snapshot)
     finally:
         state._infer_executor.shutdown()
         state._snapshot_executor.shutdown()

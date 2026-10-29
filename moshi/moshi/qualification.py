@@ -125,6 +125,7 @@ SESSION_BOOL_FIELDS = {
     "vision_prompt_replace",
     "vision_in_transcript",
     "vision_feed_model",
+    "vision_notes",
     "vision_ground_user_turns",
     "reinforce_in_silences",
 }

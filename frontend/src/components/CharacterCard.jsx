@@ -1,6 +1,7 @@
 import { useId, useMemo } from "react";
 import { useStoredState } from "../hooks/useStoredState.js";
 import { compileCharacterCard, parseCharacterCard } from "../utils/characterCard.js";
+import { Info } from "./Controls.jsx";
 
 const CHARACTER_FIELDS = [
   ["name", "Name"], ["age", "Age"], ["pronouns", "Pronouns"],
@@ -40,7 +41,7 @@ export function CharacterCard({ onApply, currentPrompt, sessionActive }) {
     <details className="prompt-preview character-card">
       <summary>
         <span className="prompt-preview-copy">
-          <span className="prompt-preview-title">Character card</span>
+          <span className="prompt-preview-title">Character card <Info k="characterCard" /></span>
           <span className="prompt-preview-sub">Card · scene · roster</span>
         </span>
         <span className="prompt-preview-state mono">~{tokens} tok</span>
@@ -48,7 +49,7 @@ export function CharacterCard({ onApply, currentPrompt, sessionActive }) {
       <div className="character-card-body">
         <p className="context-note-help">Saved in this browser. Use the card as your startup prompt; edits take effect on the next fresh session.</p>
         <fieldset className="character-fields">
-          <legend>Character</legend>
+          <legend>Character <Info k="characterIdentity" /></legend>
           {CHARACTER_FIELDS.map((field) => <CardField key={field[0]} field={field} value={draft[field[0]]} onChange={(value) => edit(field[0], value)} />)}
         </fieldset>
         {REPEATED_FIELDS.map((section) => {
@@ -58,21 +59,21 @@ export function CharacterCard({ onApply, currentPrompt, sessionActive }) {
               {items.map((item, index) => (
                 // biome-ignore lint/suspicious/noArrayIndexKey: entries have no external identity; inputs are controlled and removal preserves remaining values
                 <fieldset className="character-fields" key={index}>
-                  <legend>{section.label} {index + 1}</legend>
+                  <legend>{section.label} {index + 1} <Info k={`character${section.key}`} /></legend>
                   {section.fields.map((field) => <CardField key={field[0]} field={field} value={item[field[0]]} onChange={(value) => edit(section.key, items.map((entry, at) => at === index ? { ...entry, [field[0]]: value } : entry))} />)}
                   <button type="button" className="btn ghost" onClick={() => edit(section.key, items.filter((_, at) => at !== index))}>Remove {section.label.toLowerCase()} {index + 1}</button>
                 </fieldset>
               ))}
-              <button type="button" className="btn ghost" onClick={() => edit(section.key, [...items, {}])}>Add {section.label.toLowerCase()}</button>
+              <div className="character-add"><button type="button" className="btn ghost" onClick={() => edit(section.key, [...items, {}])}>Add {section.label.toLowerCase()}</button><Info k={`character${section.key}`} /></div>
             </div>
           );
         })}
         <fieldset className="character-fields">
-          <legend>Scene</legend>
+          <legend>Scene <Info k="characterScene" /></legend>
           {SCENE_FIELDS.map((field) => <CardField key={field[0]} field={field} value={draft[field[0]]} onChange={(value) => edit(field[0], value)} />)}
         </fieldset>
         <fieldset className="character-fields">
-          <legend>Roster</legend>
+          <legend>Roster <Info k="characterRoster" /></legend>
           {(Array.isArray(draft.roster) ? draft.roster : []).map((item, index) => (
             // biome-ignore lint/suspicious/noArrayIndexKey: controlled roster entries are ordered slots
             <div className="character-repeat" key={index}>

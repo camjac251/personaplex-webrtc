@@ -1125,6 +1125,10 @@ def _notes_state():
     state._active_session_id = "session"
     state._active_notes = ""
     state._active_notes_tokens = []
+    state._active_vision_scene = ""
+    state._vision_notes = False
+    state._vision_notes_disabled = False
+    state._vision_notes_last_rewrite_at = None
     state._context = ContextLifecycle(32, 8.0)
     state._pending_text_flags = deque()
     state._collapse_triggers = deque()
@@ -1157,11 +1161,17 @@ def _notes_session():
 
 def test_initial_notes_normalize_reject_and_reset() -> None:
     state, encoded = _notes_state()
+    state._active_vision_scene = "old scene"
+    state._vision_notes_disabled = True
+    state._vision_notes_last_rewrite_at = 9.0
     with state._infer_lock:
         assert state._configure_initial_notes_locked(" <system> one \n two </system> ") is None
         assert encoded[-1] == " one two"
         assert state._active_notes == "one two"
         assert state.lm_gen.notes_tokens == [10, 11]
+        assert state._active_vision_scene == ""
+        assert not state._vision_notes_disabled
+        assert state._vision_notes_last_rewrite_at is None
         assert state._configure_initial_notes_locked("one two three four") == {
             "status": "rejected", "reason": "too_long", "max_tokens": 3,
         }
@@ -1244,11 +1254,291 @@ async def test_notes_reapply_after_manual_auto_and_voice_restores() -> None:
         assert state._active_notes == "latest notes"
 
 
+def test_scene_notes_composition_preserves_director_and_whole_words() -> None:
+    state, _ = _notes_state()
+    state.lm_gen.notes_frames = 8
+
+    def encode(text):
+        # A long word spans multiple tokens; trimming may not split it.
+        return list(range(sum(4 if word == "multitoken" else 1 for word in text.split())))
+
+    state.text_tokenizer.encode = encode
+    director = "stay steady"
+    combined, tokens = state._compose_notes(
+        director, encode(director), "blue panel multitoken tail.",
+    )
+    assert combined == "stay steady blue panel"
+    assert tokens == encode(f" {combined}")
+    state.lm_gen.notes_frames = 3
+    assert state._compose_notes(director, encode(director), "blue panel") == (
+        director, encode(director),
+    )
+    assert state._compose_notes("", [], "blue panel multitoken") == ("blue panel", [0, 1])
+
+
+def _vision_notes_state():
+    state, encoded = _notes_state()
+    session, events = _notes_session()
+    state.lm_gen.notes_frames = 64
+    state._vision_notes = True
+    state._active_session = session
+    state._main_loop = asyncio.get_running_loop()
+    state._context.transition_camera(1, True)
+    state._vision_live_tasks = {}
+    return state, session, events, encoded
+
+
+async def test_scene_notes_deduplicate_rate_limit_and_reject_full_slot() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from unittest.mock import patch
+
+    state, session, events, encoded = _vision_notes_state()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        state._infer_executor = executor
+        await state._handle_set_notes(session, "session", "Keep calm.", _RecordingClog())
+        with patch("moshi.server.time.monotonic", return_value=0.0):
+            await state._handle_vision_notes("session", "A blue panel is visible.", 1)
+        assert encoded[-1] == " Keep calm. A blue panel is visible."
+        assert state._active_notes == "Keep calm."
+        assert events[-1]["data"] == {"status": "applied", "tokens": 7}
+        before = len(state.lm_gen.rewrites), len(events)
+        with patch("moshi.server.time.monotonic", return_value=10.0):
+            await state._handle_vision_notes("session", "A blue panel is visible.", 1)
+        with patch("moshi.server.time.monotonic", return_value=3.999):
+            await state._handle_vision_notes("session", "A red panel is visible.", 1)
+        assert (len(state.lm_gen.rewrites), len(events)) == before
+        with patch("moshi.server.time.monotonic", return_value=4.0):
+            await state._handle_vision_notes("session", "A red panel is visible.", 1)
+        assert len(state.lm_gen.rewrites) == before[0] + 1
+        assert state._active_vision_scene == "A red panel is visible."
+        state.lm_gen.notes_frames = 3
+        with patch("moshi.server.time.monotonic", return_value=8.0):
+            await state._handle_vision_notes("session", "A green panel is visible.", 1)
+        assert events[-1]["data"] == {"status": "rejected", "reason": "no_space"}
+        assert len(state.lm_gen.rewrites) == before[0] + 1
+        scene_events = [event for event in events if event["kind"] == "vision_notes"]
+        assert all(set(event["data"]) <= {"status", "tokens", "reason"} for event in scene_events)
+        assert all("panel" not in str(event) and "Keep calm" not in str(event) for event in scene_events)
+
+
+async def test_scene_notes_survive_director_edits_and_restores() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    import torch
+
+    state, session, events, encoded = _vision_notes_state()
+    state.device = torch.device("cpu")
+    snapshot = {
+        "version": 2, "lm": {"notes": [99]}, "mimi": {"notes": []},
+        "rng_cpu": torch.get_rng_state().clone(), "rng_cuda": None,
+    }
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        state._infer_executor = executor
+        await state._handle_vision_notes("session", "A blue panel is visible.", 1)
+        await state._handle_set_notes(session, "session", "Speak gently.", _RecordingClog())
+        assert encoded[-1] == " Speak gently. A blue panel is visible."
+        assert state._active_notes == "Speak gently."
+        assert state._active_vision_scene == "A blue panel is visible."
+        for intent in RestoreIntent:
+            assert await state._restore_session_snapshot(session, "session", snapshot, intent=intent)
+            assert encoded[-1] == " Speak gently. A blue panel is visible."
+            assert state.lm_gen.cache == list(range(10, 17))
+            assert snapshot["lm"]["notes"] == [99]
+        await state._handle_set_notes(session, "session", "", _RecordingClog())
+        assert encoded[-1] == " A blue panel is visible."
+        assert state.lm_gen.cache == list(range(10, 15))
+        assert events[-1]["data"] == {"status": "applied", "tokens": 0}
+
+
+async def test_scene_notes_clear_on_camera_stop_and_generation_change() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from unittest.mock import patch
+
+    state, session, events, _ = _vision_notes_state()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        state._infer_executor = executor
+        await state._handle_set_notes(session, "session", "Keep calm.", _RecordingClog())
+        with patch("moshi.server.time.monotonic", return_value=1.0):
+            await state._handle_vision_notes("session", "Blue panel.", 1)
+        assert await state._handle_vision_source(session, "session", 1, False)
+        assert state._active_vision_scene == ""
+        assert state.lm_gen.cache == [10, 11]
+        assert events[-1]["data"] == {"status": "cleared", "tokens": 2}
+        await state._handle_vision_notes("session", "Stale stopped scene.", 1)
+        assert state._active_vision_scene == ""
+        assert await state._handle_vision_source(session, "session", 2, True)
+        with patch("moshi.server.time.monotonic", return_value=5.0):
+            await state._handle_vision_notes("session", "Green panel.", 2)
+        assert await state._handle_vision_source(session, "session", 3, True)
+        assert state._active_vision_scene == "" and state.lm_gen.cache == [10, 11]
+        assert events[-1]["data"] == {"status": "cleared", "tokens": 2}
+        assert state._vision_notes_last_rewrite_at == 5.0
+
+
+async def test_scene_notes_guard_stale_executor_work() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    for changed in ("session", "generation", "flag", "unsupported"):
+        state, _, events, _ = _vision_notes_state()
+        release = threading.Event()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            state._infer_executor = executor
+            executor.submit(release.wait)
+            pending = asyncio.create_task(state._handle_vision_notes("session", "Blue panel.", 1))
+            await asyncio.sleep(0)
+            if changed == "session":
+                state._active_session_id = "replacement"
+            elif changed == "generation":
+                state._context.camera_generation = 2
+            elif changed == "flag":
+                state._vision_notes = False
+            else:
+                state.lm_gen.notes_frames = 0
+            release.set()
+            await pending
+        assert not state.lm_gen.rewrites and not events
+        assert state._active_vision_scene == ""
+
+
+async def test_scene_notes_eviction_disables_once_until_new_session() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    state, session, events, _ = _vision_notes_state()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        state._infer_executor = executor
+        await state._handle_vision_notes("session", "Blue panel.", 1)
+        state.lm_gen.failure = "evicted"
+        # Director edits share the slot, so their failures also latch vision off.
+        await state._handle_set_notes(session, "session", "Keep calm.", _RecordingClog())
+        assert state._vision_notes_disabled
+        state.lm_gen.failure = None
+        before = len(state.lm_gen.rewrites)
+        await state._handle_vision_notes("session", "Green panel.", 1)
+        assert await state._handle_vision_source(session, "session", 2, True)
+        await state._handle_vision_notes("session", "Red panel.", 2)
+        assert len(state.lm_gen.rewrites) == before
+        assert state._active_vision_scene == ""
+        warnings = [event for event in events if event["kind"] == "vision_notes" and event["level"] == "warn"]
+        assert [event["data"] for event in warnings] == [{"status": "rejected", "reason": "evicted"}]
+        with state._infer_lock:
+            state._configure_initial_notes_locked("")
+        await state._handle_vision_notes("session", "New panel.", 2)
+        assert len(state.lm_gen.rewrites) == before + 1
+
+
+def _live_message_handler(state, session):
+    """Execute the real nested control handler without booting a GPU session."""
+    import ast
+    import inspect
+    import textwrap
+    import moshi.server as server
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(ServerState._run_rtc_session)))
+    handler = next(node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef) and node.name == "on_message")
+    namespace = dict(vars(server))
+    warmup_done = asyncio.Event()
+    warmup_done.set()
+    namespace.update(
+        self=state, session=session, session_id="session", warmup_done=warmup_done,
+        loop=asyncio.get_running_loop(), clog=_RecordingClog(),
+    )
+    exec(compile(ast.Module(body=[handler], type_ignores=[]), "<live-control>", "exec"), namespace)
+    return namespace["on_message"]
+
+
+async def test_scene_notes_live_update_config_clears_scene() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from unittest.mock import Mock
+
+    state, session, events, _ = _vision_notes_state()
+    session.client_ended = False
+    state.lm_gen.apply_sampling = Mock()
+    state._applied_config_snapshot = lambda: {"vision_notes": state._vision_notes}
+    on_message = _live_message_handler(state, session)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        state._infer_executor = executor
+        await state._handle_set_notes(session, "session", "Keep calm.", _RecordingClog())
+        await state._handle_vision_notes("session", "Blue panel.", 1)
+        await on_message({"type": "update_config", "vision_notes": False})
+        assert not state._vision_notes and state._active_vision_scene == ""
+        assert state.lm_gen.cache == [10, 11]
+        session.send_config_applied.assert_called_with(
+            {"vision_notes": False}, source="update", applied=["vision_notes"],
+        )
+        assert any(event["kind"] == "vision_notes" and event["data"]["status"] == "cleared" for event in events)
+        await on_message({"type": "update_config", "vision_notes": True})
+        assert state._vision_notes
+        session.send_config_applied.assert_called_with(
+            {"vision_notes": True}, source="update", applied=["vision_notes"],
+        )
+        state._vision_notes_disabled = True
+        await on_message({"type": "update_config", "vision_notes": False})
+        await on_message({"type": "update_config", "vision_notes": True})
+        assert state._vision_notes_disabled
+        state._active_session_id = "replacement"
+        await on_message({"type": "update_config", "vision_notes": False})
+        assert state._vision_notes
+
+
+async def test_live_caption_updates_notes_but_historical_detail_does_not() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from moshi.server import _vision_context_note
+
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def json(self):
+            return {"status": "completed", "steps": [{
+                "type": "model_output",
+                "content": [{"type": "text", "text": '{"caption":"A blue panel is visible."}'}],
+            }]}
+
+    state, session, events, _ = _vision_notes_state()
+    session.send_vision_caption = Mock()
+    state._gemini_api_key = "synthetic-test-key"
+    state._vision_force_disabled = state._vision_spend_tripped = False
+    state._vision_cooldown_until = state._vision_cost_limit_usd = 0.0
+    state._vision_in_flight = set()
+    state._vision_system_prompt = ""
+    state._vision_feed_model = state._vision_in_transcript = False
+    state._vision_context_after_next_caption = None
+    state._http_session = SimpleNamespace(closed=False, post=lambda *args, **kwargs: Response())
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        state._infer_executor = executor
+        await state.handle_vision_frame(
+            "session", "aW1hZ2U=", _RecordingClog(), frame_id="held",
+            source_generation=1, detail=True, historical_detail=True,
+        )
+        assert not state.lm_gen.rewrites and not events
+        await state.handle_vision_frame(
+            "session", "aW1hZ2U=", _RecordingClog(), frame_id="live", source_generation=1,
+        )
+        assert state._active_vision_scene == _vision_context_note("A blue panel is visible.")
+        assert len(state.lm_gen.rewrites) == 1
+        assert events[-1]["kind"] == "vision_notes"
+        assert not state._context.notes.waiting.tokens
+
+
 if __name__ == "__main__":
     tests = [
         test_initial_notes_normalize_reject_and_reset,
         test_set_notes_protocol_and_executor_ownership,
         test_notes_reapply_after_manual_auto_and_voice_restores,
+        test_scene_notes_composition_preserves_director_and_whole_words,
+        test_scene_notes_deduplicate_rate_limit_and_reject_full_slot,
+        test_scene_notes_survive_director_edits_and_restores,
+        test_scene_notes_clear_on_camera_stop_and_generation_change,
+        test_scene_notes_guard_stale_executor_work,
+        test_scene_notes_eviction_disables_once_until_new_session,
+        test_scene_notes_live_update_config_clears_scene,
+        test_live_caption_updates_notes_but_historical_detail_does_not,
         test_stale_queued_generation_is_discarded,
         test_in_flight_result_is_discarded_across_pause,
         test_stop_processing_freezes_and_drains_in_flight_model_work,

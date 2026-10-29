@@ -282,14 +282,16 @@
   .vision-reaction-row > .l { color: var(--ink-3); }
   .vision-reaction {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: minmax(0, 1fr);
   }
-  .vision-reaction button {
+  .vision-mode-choice { display: flex; align-items: center; gap: 4px; }
+  .vision-mode-choice > button:not(.tipbtn) { flex: 1; min-height: 36px; text-align: left; }
+  .vision-reaction button:not(.tipbtn) {
     min-width: 0;
     padding-inline: 6px;
   }
   .vision-reaction-note {
-    color: var(--ink-4);
+    color: var(--ink-3);
     font-size: 9px;
     line-height: 1.35;
   }

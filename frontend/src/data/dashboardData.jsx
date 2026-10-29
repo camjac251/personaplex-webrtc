@@ -317,19 +317,39 @@ export const SESSION_PROFILES = [
 ];
 
 export const PARAM_INFO = {
+  latencyMetric: { title: "Latency", body: "Latest control-channel round-trip time. This measures transport responsiveness, not the time until a spoken reply." },
+  tailMetric: { title: "Tail latency · p95", body: "95th percentile of recent round-trip samples. Higher values reveal occasional delays that an average can hide." },
+  turnMetric: { title: "Turn buffer", body: "Words in the current or latest AI turn, compared with the reply token target. Words are only an approximation of model tokens." },
+  rateMetric: { title: "Response rate", body: "Words per minute in the current or latest AI text turn. This describes text delivery, not audio playback speed." },
+  visionMetric: { title: "Vision sent / gated", body: "Frames sent to the caption service versus total capture attempts. Gated attempts were skipped before sending." },
+  signalStrip: { title: "Live signal", body: "Amber is microphone input; green is AI output. Bars show audio levels. The scope illustrates speaking activity, not the recorded waveform." },
+  jumpToLive: { title: "Jump to live", body: "Return to the newest transcript line and resume auto-follow. The count includes new lines and existing turns that grew while you were reading earlier text." },
+  characterCard: { title: "Character card", body: "Build a structured startup prompt for CharacterPlex. Use card as prompt selects it for the next fresh session; editing the card does not change a live session." },
+  characterIdentity: { title: "Character", body: "Describe who the character is, what they want, and how they speak. Empty fields are left out of the compiled card." },
+  charactertriggers: { title: "Triggers", body: "Describe situations that matter to the character and their intended emotional response." },
+  characterpeople: { title: "People", body: "Add relationships and relevant context for people the character knows." },
+  charactermemories: { title: "Memories", body: "Add fictional background the character should know at startup. These fields are prompt text, not automatic conversation memory." },
+  characterScene: { title: "Scene", body: "Set the starting situation, mood, and dramatic beat. Use live Direct notes to change direction after connecting." },
+  characterRoster: { title: "Roster", body: "List the other participants in the scene so the startup card identifies who is present." },
+  openingDirection: { title: "Opening direction", body: "Initial pinned notes for the next fresh session, saved in this browser. Changes do not update the live slot. The server checks the actual token count." },
+  directNotes: { title: "Direct", body: "Replace the character's pinned direction without restarting. Enter applies; Shift+Enter adds a line. The note is written into the pinned slot, not the spoken stream, so it is rarely read aloud; it usually takes effect within a few seconds, even mid-reply. The server preserves the current scene notes when present." },
+  injectNotes: { title: "Inject · experimental", body: "Queue a short context note for a quiet boundary. Unlike Direct, this feeds the conversation stream and may be repeated aloud. Limit: 180 characters and 32 model tokens." },
+  visionPassive: { title: "Captions only", body: "Display scene captions without feeding them to the voice model." },
+  visionNotes: { title: "Scene notes", body: "Update the pinned scene context silently, at most once every four seconds. Director notes take priority in the shared slot. Available only on servers with a NOTES slot." },
+  visionAmbient: { title: "Ambient react · unsafe", body: "Inject captions into quiet gaps in the conversation, at most once every eight seconds. This can trigger speech without a user prompt." },
   turnHandling: {
     title: "Turn handling",
     body: (
       <>
-        <b>Native duplex</b> is the RL default: the model handles yielding,
+        <b>Native duplex</b> is the RL and CharacterPlex default: the model handles yielding,
         overlap, and backchannels without automatic interruption.
         <b> Gentle yield</b> adds a server-only stop after about <b>1.2 s</b>
         of sustained user audio overlapping assistant audio. Brief pauses
         do not count toward that duration, and the browser sends no
         automatic stop in this mode. <b>Assisted</b> reacts faster to brief
-        overlap, using browser and server interruption. <b>Floor</b> is the
-        CharacterPlex default: holds the assistant silent while you speak,
-        allowing short backchannels. Choose before connecting or switch
+        overlap, using browser and server interruption. <b>Floor</b> optionally
+        holds the assistant silent while you speak, allowing short backchannels.
+        Choose before connecting or switch
         live. Manual Stop remains available in all modes.
       </>
     ),
@@ -510,7 +530,8 @@ export const PARAM_INFO = {
       <>
         Biases the end-of-padding token that marks the model starting to
         speak. Negative values delay onset (more patient turn-taking);
-        positive values hasten it (more eager). Default is <b>0</b> (off).
+        positive values hasten it (more eager). CharacterPlex starts at <b>+1.0</b>.
+        Other models default to <b>0</b> (off).
         Independent from Padding bonus, which only shortens a reply already
         underway.
       </>
@@ -563,9 +584,8 @@ export const PARAM_INFO = {
     title: "Echo in transcript",
     body: (
       <>
-        Shows Gemini scene descriptions inline in the transcript as{" "}
-        <code>[vision]</code> lines for debugging. This does not control whether
-        the speaker can use vision.
+        Shows Gemini scene descriptions as separate violet Vision lines.
+        This does not control whether the speaker can use vision.
       </>
     ),
   },
@@ -573,10 +593,10 @@ export const PARAM_INFO = {
     title: "Vision reaction mode",
     body: (
       <>
-        <b>Captions only</b> keeps scene notes outside the speech model. Ambient
-        react is an unsafe experiment that may speak without a user prompt: it
-        injects at most once per <b>8 s</b>, only into silence, and never in
-        the ~2 s after you finish speaking, so it cannot displace a reply.
+        <b>Captions only</b> keeps captions outside the voice model.
+        <b> Scene notes</b> silently updates a supported pinned NOTES slot.
+        <b> Ambient react</b> is an unsafe experiment that injects into quiet gaps
+        and may speak without a user prompt.
       </>
     ),
   },

@@ -25,12 +25,15 @@ WEBRTC_SAMPLE_RATE = 48_000
 FRAME_MS = 20
 FRAME_SAMPLES = WEBRTC_SAMPLE_RATE * FRAME_MS // 1000
 _SCENARIO_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
-_SUPPORTED_ACTIONS = {"context_note", "interrupt", "set_notes", "update_config"}
+_SUPPORTED_ACTIONS = {
+    "context_note", "interrupt", "set_notes", "update_config",
+    "vision_source", "vision_frame",
+}
 _SUPPORTED_EXPECTATIONS = {"event", "pause", "turn"}
 
 
 class ScenarioValidationError(ValueError):
-    """A scenario manifest or its input WAV is not runnable."""
+    """A scenario manifest or its input media is not runnable."""
 
 
 @dataclass(frozen=True)
@@ -211,6 +214,24 @@ def validate_manifest(payload: Any, *, source: str = "manifest") -> dict[str, An
             raise ScenarioValidationError(
                 f"{field}.text must be a string for set_notes (empty clears)"
             )
+        if action_type in ("vision_source", "vision_frame"):
+            generation = item.get("generation")
+            if (
+                isinstance(generation, bool)
+                or not isinstance(generation, int)
+                or generation < 0
+            ):
+                raise ScenarioValidationError(
+                    f"{field}.generation must be a non-negative integer"
+                )
+        if action_type == "vision_source" and not isinstance(item.get("active"), bool):
+            raise ScenarioValidationError(f"{field}.active must be a boolean")
+        if action_type == "vision_frame":
+            image = item.get("image")
+            if not isinstance(image, str) or not image.strip():
+                raise ScenarioValidationError(f"{field}.image must be a non-empty path")
+            if Path(image).is_absolute():
+                raise ScenarioValidationError(f"{field}.image must be manifest-relative")
         normalized_actions.append(normalized)
 
     limits = payload.get("limits", {})

@@ -53,16 +53,12 @@
     .shell { height: auto; min-height: 100vh; }
     body { overflow: auto; }
     .telem { grid-template-columns: repeat(2, 1fr); }
-    .turn-insights {
-      grid-template-columns: 1fr;
-    }
-    .turn-insight {
-      border-right: 0;
-      border-bottom: 1px solid var(--line);
-    }
-    .turn-insight:last-child {
-      border-bottom: 0;
-    }
+    .signal-levels { gap: 12px; padding-inline: 12px; }
+    .signal-detail { display: none; }
+    .transcript-body { min-height: 240px; }
+    .composer-shortcut { display: none; }
+    .viz-inject { font-size: 8px; gap: 4px; letter-spacing: 0; }
+    .viz-inject .gate { margin-left: 0; padding-left: 4px; }
     .turn-ribbon-head {
       flex-direction: column;
       gap: 3px;

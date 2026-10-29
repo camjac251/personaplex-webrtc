@@ -660,44 +660,23 @@
     font-size: 11px;
   }
   .character-field input,
-  .character-card .btn,
-  .director-notes .btn {
+  .character-card .btn {
     min-height: 36px;
   }
-  .character-card summary:focus-visible,
-  .director-notes summary:focus-visible {
+  .character-card summary:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: -2px;
   }
-  .director-notes {
-    flex: none;
-    margin: 8px 12px;
-  }
-  .director-notes[open] {
-    flex-shrink: 1;
-    min-height: 96px;
-    max-height: 45vh;
-    overflow-y: auto;
-  }
-  .director-notes-fields {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
-    gap: 16px;
-    align-items: start;
-  }
-  .director-notes-fields form {
-    display: grid;
-    gap: 8px;
-    min-width: 0;
-  }
-  .director-notes .profile-compare-actions {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
+  .opening-direction { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+  .opening-direction textarea { min-height: 56px; }
+  .character-add { display: flex; align-items: center; gap: 4px; }
   @media (pointer: coarse) {
     .character-card .btn,
-    .director-notes .btn,
     .character-card summary,
-    .director-notes summary {
+    .composer-actions .btn,
+    .composer-tabs button,
+    .notes-history button,
+    .jump-to-live {
       min-height: 44px;
     }
   }

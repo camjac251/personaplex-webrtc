@@ -62,6 +62,7 @@
   }
   .telem .cell:last-child { border-right: none; }
   .telem .l {
+    display: flex; align-items: center; gap: 4px;
     font-family: 'Geist Mono', monospace;
     font-size: 9px;
     color: var(--ink-4);
@@ -86,99 +87,29 @@
     min-height: 0;
   }
 
-  /* Meter-bridge deck: dual VU ladders + phosphor oscilloscope */
-  .deck {
+  /* Compact signal strip leaves the conversation center stage. */
+  .signal-strip {
+    display: grid;
+    grid-template-rows: minmax(0, 1fr) 24px;
+    height: 64px;
     border-bottom: 1px solid var(--line);
-    background: linear-gradient(180deg, var(--bg-2), var(--bg));
-    display: grid;
-    grid-template-columns: 84px minmax(0, 1fr) 84px;
-    gap: 0;
-    height: clamp(150px, 24vh, 240px);
+    background: var(--bg-2);
   }
-
-  /* Channel strip */
-  .chan {
-    display: grid;
-    grid-template-rows: auto 1fr auto;
-    padding: 8px 9px 7px;
-    min-width: 0;
-  }
-  .chan:first-child { border-right: 1px solid var(--line); }
-  .chan:last-child { border-left: 1px solid var(--line); }
-  .chan-h { display: flex; align-items: center; gap: 6px; justify-content: space-between; }
-  .chan-n {
-    font-family: 'Geist Mono', monospace; font-size: 8.5px;
-    letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-3);
-  }
-  .chan.hot .chan-n { color: var(--ink); }
-  .chan-led { width: 6px; height: 6px; border-radius: 50%; background: var(--ink-5); transition: background 0.1s; }
-  .chan.hot .chan-led.green { background: var(--accent); }
-  .chan.hot .chan-led.amber { background: var(--amber); }
-  .chan-body { display: flex; gap: 6px; align-items: stretch; justify-content: center; min-height: 0; padding: 8px 0; }
-  .chan-scale {
-    display: flex; flex-direction: column; justify-content: space-between;
-    font-family: 'Geist Mono', monospace; font-size: 7.5px; color: var(--ink-5);
-    text-align: right; padding: 1px 0; letter-spacing: 0.04em;
-  }
-  .chan-s {
-    text-align: center; font-size: 8.5px; letter-spacing: 0.16em;
-    color: var(--ink-4); padding-top: 5px; border-top: 1px solid var(--line);
-  }
-  .chan.hot .chan-s { color: var(--ink-2); }
-
-  /* VU ladder */
-  .vu {
-    display: flex; flex-direction: column; gap: 2px;
-    width: 16px; height: 100%;
-    justify-content: flex-end;
-  }
-  .vu-seg {
-    flex: 1; border-radius: 1px; min-height: 3px;
-    background: var(--surface-3);
-    opacity: 0.45;
-    transition: opacity 0.06s, background 0.06s;
-  }
-  .vu-seg.on { opacity: 1; }
-  .vu-seg.z-green.on { background: var(--accent); }
-  .vu-seg.z-amber.on { background: var(--amber); }
-  .vu-seg.z-red.on { background: var(--red); }
-  .vu-seg.peak { box-shadow: 0 0 0 1px rgba(255,255,255,0.25) inset; }
-
-  /* Oscilloscope screen */
-  .scope {
-    position: relative;
-    margin: 8px;
-    border: 1px solid var(--line-2);
-    border-radius: 4px;
-    background:
-      radial-gradient(120% 120% at 50% 0%, rgba(132,168,90,0.04), transparent 70%),
-      var(--scope-bg);
-    overflow: hidden;
-    box-shadow: inset 0 0 24px rgba(0,0,0,0.6), inset 0 0 0 1px rgba(255,255,255,0.02);
-  }
+  .signal-levels { display: flex; align-items: center; gap: 20px; padding: 0 16px; }
+  .signal-label { display: inline-flex; align-items: center; color: var(--ink-3); font: 9px 'Geist Mono', monospace; text-transform: uppercase; }
+  .signal-detail { margin-left: auto; color: var(--ink-3); font-size: 9px; }
+  .scope { position: relative; min-width: 0; overflow: hidden; background: var(--scope-bg); }
   .scope-screen { position: absolute; inset: 0; }
   .scope-screen canvas { width: 100%; height: 100%; display: block; }
-  .scope-corner {
-    position: absolute;
-    font-family: 'Geist Mono', monospace; font-size: 8px;
-    letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-4);
-    display: inline-flex; align-items: center; gap: 5px;
-    z-index: 2; pointer-events: none;
-  }
-  .scope-corner.tl { top: 7px; left: 9px; }
-  .scope-corner.tr { top: 7px; right: 9px; }
-  .scope-corner.bl { bottom: 7px; left: 9px; }
-  .scope-corner.br { bottom: 7px; right: 9px; }
-  .scope-corner .dot { width: 5px; height: 5px; border-radius: 50%; }
-  .scope-corner .dot.green { background: var(--accent); }
-  .scope-corner .dot.amber { background: var(--amber); }
 
   /* Inject-active banner over the scope */
   .viz-inject {
-    position: absolute; top: 8px; left: 50%; transform: translateX(-50%);
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
     z-index: 3;
     display: inline-flex; align-items: center; gap: 7px;
     padding: 4px 9px;
+    max-width: calc(100% - 16px);
+    white-space: nowrap;
     background: rgba(141, 126, 179, 0.18);
     border: 1px solid rgba(141, 126, 179, 0.4);
     border-radius: var(--r-chip);
@@ -247,14 +178,14 @@
   .viz-overlay.error .label { color: var(--red); }
   .viz-overlay .sub {
     display: block;
-    margin-top: 6px;
+    margin-top: 0;
     font-family: 'Geist Mono', monospace;
     font-size: 10px;
     color: var(--ink-3);
     letter-spacing: 0.06em;
     text-transform: none;
     line-height: 1.5;
-    max-width: 360px;
+    max-width: none;
   }
   .viz-overlay .stack {
     display: flex; flex-direction: column; align-items: center; text-align: center;
@@ -418,15 +349,15 @@
 
   /* Transcript area */
   .lower {
-    display: grid; grid-template-columns: 1fr;
+    display: grid; grid-template-columns: minmax(0, 1fr);
     min-height: 0;
-    transition: grid-template-columns 0.2s;
   }
-  .lower.with-vision { grid-template-columns: 1fr 280px; }
+  .lower.with-vision { grid-template-columns: minmax(0, 1fr) 280px; }
 
   .transcript {
     display: flex; flex-direction: column;
     min-height: 0;
+    min-width: 0;
     overflow: hidden;
   }
   .transcript-h {
@@ -447,16 +378,24 @@
     font-size: 9.5px;
     color: var(--ink-3);
   }
-  .transcript-stream {
-    flex: 1; overflow-y: auto;
-    padding: 14px 16px 20px;
+  .transcript-body { position: relative; flex: 1; min-height: 0; overflow: hidden; }
+  .transcript-stream { height: 100%; overflow-y: auto; overscroll-behavior: contain; overflow-anchor: none; padding: 16px 20px 24px; }
+  .transcript-stream:focus-visible { outline: 1px solid var(--accent); outline-offset: -2px; }
+  .jump-to-live {
+    position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%);
+    display: inline-flex; align-items: center; gap: 8px; min-height: 36px; white-space: nowrap;
+    border: 1px solid var(--accent-dim); border-radius: 999px; padding: 6px 14px;
+    background: var(--surface-2); color: var(--ink); font: 11px 'Geist Mono', monospace; cursor: pointer;
+    box-shadow: 0 4px 16px var(--sunk);
   }
+  .jump-to-live:hover { background: var(--surface-3); }
+  .jump-to-live:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .jump-count { color: var(--accent); }
   .context-note-row {
     display: flex;
     flex-wrap: wrap;
     gap: 8px;
-    padding: 8px 16px;
-    border-top: 1px solid var(--line);
+    padding: 0;
     background: var(--bg-2);
   }
   .context-note-help,
@@ -464,7 +403,7 @@
     flex-basis: 100%;
     margin: 0;
     color: var(--ink-3);
-    font-size: 14px;
+    font-size: 11px;
     line-height: 1.4;
   }
   .context-note-error { color: var(--red); }
@@ -507,35 +446,12 @@
     outline: 1px solid var(--accent);
     outline-offset: 1px;
   }
-  .turn-insights {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    border-top: 1px solid var(--line);
-    border-bottom: 1px solid var(--line);
-    background: var(--bg-2);
-  }
-  .turn-insight {
-    min-width: 0;
-    padding: 7px 16px;
-    border-right: 1px solid var(--line);
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-  }
-  .turn-insight:last-child { border-right: 0; }
-  .turn-insight .k,
   .turn-ribbon-head {
     font-family: 'Geist Mono', monospace;
     font-size: 9px;
     color: var(--ink-4);
     letter-spacing: 0.16em;
     text-transform: uppercase;
-  }
-  .turn-insight .v {
-    font-family: 'Geist Mono', monospace;
-    font-size: 11px;
-    color: var(--ink-2);
-    font-feature-settings: 'tnum';
   }
   .turn-ribbon-wrap {
     padding: 8px 16px 10px;
@@ -637,42 +553,31 @@
     display: block;
   }
   .line {
-    display: grid;
-    grid-template-columns: 42px 1fr;
-    column-gap: 12px;
-    margin-bottom: 12px;
-    align-items: baseline;
+    margin-bottom: 16px; padding: 4px 12px 8px;
+    border-left: 2px solid var(--line-2); min-width: 0;
   }
-  .line .who {
-    font-family: 'Geist Mono', monospace;
-    font-size: 9px;
-    letter-spacing: 0.14em;
-    text-transform: uppercase;
-    color: var(--ink-4);
-    padding-top: 3px;
-    border-top: 1px solid var(--line);
-  }
-  .line.ai .who { color: var(--accent); border-color: rgba(132, 168, 90, 0.35); }
-  .line.you .who { color: var(--amber); border-color: rgba(176, 145, 71, 0.35); }
-  .line.vision .who { color: var(--violet); border-color: rgba(141, 126, 179, 0.35); }
-  .line.vision .text {
-    color: var(--ink-3);
-    font-style: italic;
-    font-size: 12.5px;
-  }
-  .line .text {
-    font-size: 13.5px;
-    line-height: 1.55;
-    color: var(--ink);
-  }
-  /* User turn that produced no recognized words: a muted, italic marker
-     that the human spoke without fabricating their words. */
-  .line .text.muted {
-    color: var(--ink-4);
-    font-style: italic;
-    font-size: 12.5px;
-  }
-  .line.audio-only .who { opacity: 0.65; }
+  .line.ai { border-left-color: var(--accent-dim); }
+  .line.you { border-left-color: var(--amber); }
+  .line.live { background: var(--accent-veil); border-radius: 0 var(--r-ctrl) var(--r-ctrl) 0; }
+  .turn-heading { display: flex; align-items: baseline; gap: 10px; margin-bottom: 4px; }
+  .line .who { font: 10px 'Geist Mono', monospace; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-3); }
+  .line.ai .who, .turn-live { color: var(--accent); }
+  .line.you .who { color: var(--amber); }
+  .turn-time, .turn-live { font: 10px 'Geist Mono', monospace; font-variant-numeric: tabular-nums; }
+  .turn-time { color: var(--ink-3); }
+  .turn-live { margin-left: auto; }
+  .line .text { font-size: 14px; line-height: 1.65; color: var(--ink); overflow-wrap: anywhere; white-space: pre-wrap; }
+  .line.system { border-left-color: var(--line-2); padding-block: 4px; }
+  .line.system .text { font-size: 12px; color: var(--ink-3); }
+  .line.vision { border-left-color: var(--violet); }
+  .line.vision .who { color: var(--violet); }
+  .line .text.muted { color: var(--ink-3); font-style: italic; font-size: 13px; }
+  /* Without ASR a user turn has no words; keep it a one-line beat marker so
+     consecutive turns do not stack tall empty blocks between AI replies. */
+  .line.audio-only { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; padding-block: 2px; }
+  .line.audio-only .turn-heading { margin-bottom: 0; }
+  .line.audio-only .text.muted { font-size: 12px; }
+  .vocal-event { display: inline; padding: 1px 6px; margin-inline: 2px; border: 1px solid var(--line-2); border-radius: var(--r-chip); color: var(--accent); background: var(--accent-veil); font: 11px 'Geist Mono', monospace; white-space: nowrap; }
   .typing::after { content: "▍"; color: var(--accent); animation: blink 1s steps(2) infinite; margin-left: 1px; }
   @keyframes blink { 50% { opacity: 0; } }
 
@@ -835,18 +740,17 @@
     gap: 12px;
     min-height: 42px;
   }
-  .transport .levels { display: flex; align-items: center; gap: 16px; }
   .lvl { display: flex; align-items: center; gap: 8px; }
   .lvl .k {
     font-family: 'Geist Mono', monospace;
     font-size: 9px;
     letter-spacing: 0.18em;
-    color: var(--ink-4);
+    color: var(--ink-3);
     text-transform: uppercase;
   }
   .lvl .bars { display: flex; gap: 1.5px; }
   .lvl .bars i {
-    width: 2px; height: 11px;
+    width: 4px; height: 8px;
     background: var(--surface-3);
     border-radius: 1px;
     transition: background 0.08s;
@@ -854,3 +758,32 @@
   .lvl .bars i.on { background: var(--accent); }
   .lvl.you .bars i.on { background: var(--amber); }
   .transport .controls { display: flex; gap: 6px; flex-wrap: wrap; }
+
+  .directing-chip { display: flex; align-items: center; gap: 8px; padding: 4px 16px; min-height: 36px; border-bottom: 1px solid var(--line); background: var(--accent-veil); }
+  .directing-label { color: var(--accent); font: 10px 'Geist Mono', monospace; text-transform: uppercase; }
+  .directing-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); font-size: 12px; }
+  .directing-chip button { flex: none; width: 36px; height: 36px; border: 0; background: transparent; color: var(--ink-3); font-size: 20px; cursor: pointer; }
+  .directing-chip button:hover { color: var(--ink); }
+  .directing-chip button:disabled { opacity: 0.4; cursor: default; }
+  .director-composer { flex: none; border-top: 1px solid var(--line-2); padding: 8px 16px 12px; background: var(--bg-2); }
+  .composer-head, .composer-label, .composer-tabs, .composer-actions { display: flex; align-items: center; gap: 8px; }
+  .composer-head { margin-bottom: 8px; }
+  .composer-label { color: var(--ink-2); font-size: 11px; }
+  .composer-tabs { gap: 4px; }
+  .composer-tabs button { min-height: 36px; padding: 4px 12px; border: 1px solid transparent; border-radius: var(--r-ctrl); background: transparent; color: var(--ink-3); font: 11px 'Geist Mono', monospace; cursor: pointer; }
+  .composer-tabs button.on { border-color: var(--line-2); background: var(--surface-2); color: var(--ink); }
+  .composer-tabs button:hover { color: var(--ink); }
+  .composer-estimate { margin-left: auto; font: 11px 'Geist Mono', monospace; color: var(--ink-3); }
+  .direct-note-form { display: grid; gap: 8px; }
+  .direct-note-form textarea { display: block; width: 100%; min-height: 36px; max-height: 96px; padding: 8px 10px; resize: none; overflow-y: auto; border: 1px solid var(--line-2); border-radius: var(--r-ctrl); background: var(--sunk); color: var(--ink); font: 13px/20px 'Geist', sans-serif; }
+  .direct-note-form textarea::placeholder { color: var(--ink-3); }
+  .direct-note-form textarea:disabled { opacity: 0.55; cursor: not-allowed; }
+  .direct-note-form textarea[aria-invalid="true"] { border-color: var(--red); }
+  .composer-actions { justify-content: flex-end; }
+  .composer-actions .btn { min-height: 36px; }
+  .composer-shortcut { margin-right: auto; font-size: 10px; color: var(--ink-3); }
+  .notes-history { display: flex; align-items: center; gap: 6px; min-width: 0; overflow-x: auto; }
+  .notes-history > span { color: var(--ink-3); font-size: 10px; }
+  .notes-history button { flex: none; max-width: 160px; min-height: 36px; padding: 4px 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border: 1px solid var(--line); border-radius: var(--r-chip); background: var(--surface); color: var(--ink-2); font-size: 11px; cursor: pointer; }
+  .notes-history button:hover { border-color: var(--line-3); color: var(--ink); }
+  .directing-chip button:focus-visible, .composer-tabs button:focus-visible, .notes-history button:focus-visible, .direct-note-form textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

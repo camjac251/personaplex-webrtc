@@ -119,13 +119,34 @@ describe("session trace privacy", () => {
     const serialized = JSON.stringify(report);
     expect(report.config.requested.text_prompt).toBe(SECRET.prompt);
     expect(report.events[0].data.transcript).toBe(SECRET.transcript);
-    expect(report.events[0].data.caption).toBe(SECRET.caption);
+    expect(report.events[0].data.caption).toBeUndefined();
     expect(serialized).not.toContain(SECRET.image);
     expect(serialized).not.toContain(SECRET.audio);
     expect(serialized).not.toContain(SECRET.sdp);
     expect(serialized).not.toContain(SECRET.session);
     expect(serialized).not.toContain("uploaded-private-name.wav");
     expect(report.privacy.content_included).toBe(true);
+  });
+
+  test("scene and direction content never exports, even with content enabled", async () => {
+    const trace = createSessionTrace({ clock: deterministicClock() });
+    trace.setRequestedConfig({ vision_notes: true, notes: "private-direction-sentinel" });
+    trace.record("server.event.vision_notes", {
+      type: "event", kind: "vision_notes", text: SECRET.caption,
+      data: { status: "applied", tokens: 12, text: SECRET.caption, notes: "private-direction-sentinel" },
+    });
+    trace.record("server.vision_caption", { type: "vision_caption", text: SECRET.caption, caption: SECRET.caption });
+    trace.record("client.command", { type: "set_notes", text: "private-direction-sentinel" });
+    trace.record("server.event.context_note", { text: "private-context-sentinel", data: { status: "queued", tokens: 4 } });
+    for (const includeContent of [false, true]) {
+      const report = await trace.toReportAsync({ includeContent });
+      const serialized = JSON.stringify(report);
+      expect(serialized).not.toContain(SECRET.caption);
+      expect(serialized).not.toContain("private-direction-sentinel");
+      expect(serialized).not.toContain("private-context-sentinel");
+      expect(report.config.requested.vision_notes).toBe(true);
+      expect(report.events[0].data.data).toEqual({ status: "applied", tokens: 12 });
+    }
   });
 
   test("voice enrollment and preview private surfaces never enter exports", async () => {

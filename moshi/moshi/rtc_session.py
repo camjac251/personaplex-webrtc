@@ -864,6 +864,9 @@ class SessionConfig:
     # passive perception/UI feature unless the user explicitly allows the
     # voice model to use it.
     vision_feed_model: bool = False
+    # Live captions silently update the scene part of the pinned NOTES slot,
+    # after director notes and within its token budget. Requires notes_frames.
+    vision_notes: bool = False
     # When true, each detected user-audio turn can receive one fresh scene note
     # for the next answer. This is separate from ambient vision_feed_model and
     # does not require ASR/transcription, but it is intentionally opt-in because
@@ -961,6 +964,7 @@ def parse_session_config(payload: dict) -> SessionConfig:
         vision_feed_model=bool(
             payload.get("vision_feed_model", defaults.vision_feed_model)
         ),
+        vision_notes=bool(payload.get("vision_notes", defaults.vision_notes)),
         vision_ground_user_turns=bool(
             payload.get(
                 "vision_ground_user_turns",

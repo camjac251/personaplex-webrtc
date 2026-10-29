@@ -62,6 +62,7 @@ def _run() -> dict:
             "vision_prompt_replace": False,
             "vision_in_transcript": False,
             "vision_feed_model": False,
+            "vision_notes": False,
             "vision_ground_user_turns": False,
             "reinforce_in_silences": False,
             "seed": 42,
@@ -279,6 +280,26 @@ def test_boolean_integer_identity_drift_is_rejected() -> None:
         pass
     else:
         raise AssertionError("boolean session integer was accepted")
+
+
+def test_vision_notes_is_required_boolean_run_identity() -> None:
+    for enabled in (False, True):
+        run = _run()
+        run["applied_config"]["vision_notes"] = enabled
+        identity = canonical_run_identity(run)
+        assert identity["session_config"]["vision_notes"] is enabled
+    for value in (None, 0, 1, "true"):
+        run = _run()
+        if value is None:
+            del run["applied_config"]["vision_notes"]
+        else:
+            run["applied_config"]["vision_notes"] = value
+        try:
+            canonical_run_identity(run)
+        except QualificationError:
+            pass
+        else:
+            raise AssertionError("missing or non-boolean vision_notes was accepted")
 
 
 def test_empty_or_one_arm_missing_measurements_are_inconclusive() -> None:
@@ -504,6 +525,7 @@ if __name__ == "__main__":
         test_comparison_accepts_one_declared_change_and_reports_deltas,
         test_unknown_incomplete_or_secondary_identity_drift_fails_closed,
         test_boolean_integer_identity_drift_is_rejected,
+        test_vision_notes_is_required_boolean_run_identity,
         test_empty_or_one_arm_missing_measurements_are_inconclusive,
         test_quality_requires_an_explicit_complete_marker,
         test_failure_classes_determine_verdict_without_echoing_text,

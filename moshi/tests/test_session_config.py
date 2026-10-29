@@ -105,6 +105,7 @@ def test_defaults_are_within_clamp_bounds() -> None:
         == defaults.inject_silence_streak
     )
     assert defaults.vision_feed_model is False
+    assert defaults.vision_notes is False
     assert defaults.vision_ground_user_turns is False
     assert defaults.vision_prompt_replace is False
 
@@ -346,6 +347,14 @@ def test_initial_notes_and_long_character_card_are_preserved() -> None:
     assert cfg.turn_handling == "floor"
 
 
+def test_vision_notes_matches_neighbor_boolean_contract() -> None:
+    assert parse_session_config({}).vision_notes is False
+    for value in (False, True, 0, 1, None, ""):
+        cfg = parse_session_config({"vision_notes": value, "vision_feed_model": value})
+        assert cfg.vision_notes is bool(value)
+        assert cfg.vision_notes is cfg.vision_feed_model
+
+
 if __name__ == "__main__":
     print("test_in_range_values_pass_through ...")
     test_in_range_values_pass_through()
@@ -388,5 +397,8 @@ if __name__ == "__main__":
     print("  ok")
     print("test_initial_notes_and_long_character_card_are_preserved ...")
     test_initial_notes_and_long_character_card_are_preserved()
+    print("  ok")
+    print("test_vision_notes_matches_neighbor_boolean_contract ...")
+    test_vision_notes_matches_neighbor_boolean_contract()
     print("  ok")
     print("all session config tests passed")

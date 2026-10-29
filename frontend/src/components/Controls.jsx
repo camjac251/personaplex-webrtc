@@ -6,6 +6,7 @@ import { cls } from "../utils/format.js";
 
 export function Info({ k }) {
   const meta = PARAM_INFO[k];
+  const tipId = useId();
   const ref = useRef(null);
   const timer = useRef(null);
   const [open, setOpen] = useState(false);
@@ -46,6 +47,7 @@ export function Info({ k }) {
   const tipPanel = (
     <div
       className={cls("info-tip-portal", pos.flip && "below")}
+      id={tipId}
       role="tooltip"
       style={{
         position: "fixed",
@@ -67,6 +69,9 @@ export function Info({ k }) {
         type="button"
         className={cls("tipbtn", open && "active")}
         aria-label={`Info: ${meta.title}`}
+        aria-describedby={open ? tipId : undefined}
+        onFocus={keepOpen}
+        onBlur={closeSoon}
         onMouseEnter={keepOpen}
         onMouseLeave={closeSoon}
         onClick={(event) => {

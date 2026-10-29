@@ -1,10 +1,9 @@
 import { useEffect, useRef } from "react";
 
 import { cls } from "../utils/format.js";
+import { Info } from "./Controls.jsx";
 
-// Stable keys for the fixed-length decorative ladders, so list keys never
-// fall back to the array index.
-const VU_SEGMENTS = Array.from({ length: 16 }, (_, i) => `vu-${i}`);
+// Stable keys for the fixed-length decorative level bars.
 const LEVEL_BARS = Array.from({ length: 10 }, (_, i) => `lvl-${i}`);
 
 const prefersReducedMotion = () =>
@@ -123,24 +122,6 @@ export function Scope({ active, speaking }) {
   return <canvas ref={ref} />;
 }
 
-// 16-segment vertical VU ladder, lit bottom-up. The top segment is the red
-// zone, the next three amber, the rest green; the topmost lit segment carries
-// a peak-hold ring while the channel is speaking. `value` is 0..10.
-export function VuMeter({ value = 0, color = "green", peak = false }) {
-  const segCount = 16;
-  const lit = Math.round((Math.min(10, Math.max(0, value)) / 10) * segCount);
-  const segs = [];
-  for (let i = segCount - 1; i >= 0; i -= 1) {
-    const zone = i >= segCount - 1 ? "red" : i >= segCount - 4 ? "amber" : "green";
-    segs.push(
-      <i
-        key={VU_SEGMENTS[i]}
-        className={cls("vu-seg", `z-${zone}`, i < lit && "on", peak && i === lit - 1 && "peak")}
-      />,
-    );
-  }
-  return <div className={cls("vu", `c-${color}`)}>{segs}</div>;
-}
 
 export function RTTGraph({ samples }) {
   const ref = useRef(null);
@@ -190,10 +171,10 @@ export function Badge({ kind, label }) {
   );
 }
 
-export function TelemetryCell({ label, value, unit, fill, warn, err, violet }) {
+export function TelemetryCell({ label, info, value, unit, fill, warn, err, violet }) {
   return (
     <div className="cell">
-      <span className="l">{label}</span>
+      <span className="l">{label}{info && <Info k={info} />}</span>
       <span className="v">
         {value}
         <span className="unit">{unit}</span>

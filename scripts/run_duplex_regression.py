@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import datetime as dt
 import fractions
 import hashlib
@@ -1043,19 +1044,22 @@ def _operational_event_failures(events: list[dict[str, Any]]) -> list[str]:
 
 
 # Outgoing control type -> (acknowledging message type, event kind, event
-# data.status). A rejected note is a failure: it never reached the model.
+# data.status), or None for fire-and-forget controls. A rejected note is a failure.
 ACTION_ACKNOWLEDGEMENTS = {
     "context_note": ("event", "context_note", "queued"),
     "interrupt": ("interrupted", None, None),
     "set_notes": ("event", "notes", "applied"),
     "update_config": ("config_applied", None, None),
+    "vision_source_started": None,
+    "vision_source_stopped": None,
+    "vision_frame": None,
 }
 
 
 def _action_protocol_failures(
     manifest: dict[str, Any], events: list[dict[str, Any]]
 ) -> list[str]:
-    """Require every scheduled action to be sent and acknowledged."""
+    """Require every action to be sent, and acknowledged when the protocol supports it."""
     expected_actions = manifest["actions"]
     outgoing = [
         event
@@ -1070,9 +1074,14 @@ def _action_protocol_failures(
             f"scheduled {len(expected_actions)} action(s), sent {len(outgoing)}"
         )
     for index, (expected, observed) in enumerate(zip(expected_actions, outgoing)):
-        if observed["message"].get("type") != expected["type"]:
+        expected_type = expected["type"]
+        if expected_type == "vision_source":
+            expected_type = (
+                "vision_source_started" if expected["active"] else "vision_source_stopped"
+            )
+        if observed["message"].get("type") != expected_type:
             failures.append(
-                f"action {index} expected {expected['type']!r}, sent "
+                f"action {index} expected {expected_type!r}, sent "
                 f"{observed['message'].get('type')!r}"
             )
 
@@ -1085,7 +1094,10 @@ def _action_protocol_failures(
     for event in outgoing:
         message = event["message"]
         sent_ms = float(event.get("t_ms", 0.0))
-        expected_type, event_kind, event_status = ACTION_ACKNOWLEDGEMENTS[message["type"]]
+        acknowledgement = ACTION_ACKNOWLEDGEMENTS[message["type"]]
+        if acknowledgement is None:
+            continue
+        expected_type, event_kind, event_status = acknowledgement
         match = None
         while ack_cursor < len(acknowledgements):
             candidate = acknowledgements[ack_cursor]
@@ -1173,6 +1185,7 @@ async def _run_action(
     control,
     collector: RemoteAudioCollector,
     recorder: EventRecorder,
+    manifest_path: Path,
 ) -> None:
     loop = asyncio.get_running_loop()
     if "at_ms" in action:
@@ -1205,9 +1218,35 @@ async def _run_action(
         }
     elif action["type"] in ("context_note", "set_notes"):
         message = {"type": action["type"], "text": action["text"]}
+    elif action["type"] == "vision_source":
+        message = {
+            "type": (
+                "vision_source_started" if action["active"] else "vision_source_stopped"
+            ),
+            "source_generation": action["generation"],
+        }
+    elif action["type"] == "vision_frame":
+        # The manifest carries a JPEG path, never image contents. Read the actual
+        # fixture relative to that manifest, independent of the runner's cwd.
+        image_path = manifest_path.resolve().parent / action["image"]
+        try:
+            image = image_path.read_bytes()
+        except OSError as exc:
+            raise ScenarioValidationError("could not read vision_frame image") from exc
+        if not image.startswith(b"\xff\xd8\xff") or not image.endswith(b"\xff\xd9"):
+            raise ScenarioValidationError("vision_frame image must be a JPEG")
+        message = {
+            "type": "vision_frame",
+            "frame_id": secrets.token_hex(16),
+            "data": base64.b64encode(image).decode("ascii"),
+            "detail": False,
+            "historical_detail": False,
+            "source_generation": action["generation"],
+        }
     else:
         message = {"type": "update_config", **action["config"]}
-    recorder.record("out", message)
+    # Keep image contents out of the exported control trace.
+    recorder.record("out", {key: value for key, value in message.items() if key != "data"})
     control.send(json.dumps(message))
 
 
@@ -1384,6 +1423,7 @@ async def run_scenario(
                         control=control,
                         collector=collector,
                         recorder=recorder,
+                        manifest_path=manifest_path,
                     )
                 )
                 for action in manifest["actions"]

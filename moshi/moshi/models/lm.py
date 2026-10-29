@@ -2220,12 +2220,13 @@ class LMGen(StreamingModule[_LMGenState]):
 
     @torch.no_grad()
     def prefill_system_prompts(self, mimi) -> int:
-        """Batch forced inputs without sampling; replay/restore saved voices first.
+        """Batch stored voice embeddings and forced inputs without sampling.
 
-        NOTES adds one PAD flush call so its final input is resident before a
-        rewrite. Oversized spans use ordinary steps: a bulk ring write would
-        evict keys needed by earlier queries in that same span. Voice sidecar
-        creation keeps its original per-frame path and snapshot boundary.
+        Full voice states restore before batching. NOTES adds one PAD flush
+        call so its final input is resident before a rewrite. Oversized spans
+        use ordinary steps: a bulk ring write would evict keys needed by earlier
+        queries in that same span. Voice sidecar creation keeps its original
+        per-frame path and snapshot boundary.
         """
         state = self._streaming_state
         if state is None:
@@ -2233,7 +2234,11 @@ class LMGen(StreamingModule[_LMGenState]):
         notes_text = self._notes_text_tokens(self.notes_tokens) if self.notes_frames else None
         frames = []
         voice_frames = 0
-        if self.voice_prompt_embeddings is not None or self.save_voice_prompt_embeddings:
+        voice_embeddings = None
+        if self.voice_prompt_embeddings is not None and self.voice_prompt_full_state is None:
+            voice_embeddings = self.voice_prompt_embeddings
+            voice_frames = len(voice_embeddings)
+        elif self.voice_prompt_embeddings is not None or self.save_voice_prompt_embeddings:
             voice_frames = self._step_voice_prompt(mimi)
         elif self.voice_prompt_audio is not None:
             for codes in self._encode_voice_prompt_frames(mimi):
@@ -2248,16 +2253,20 @@ class LMGen(StreamingModule[_LMGenState]):
             for token in self.text_prompt_tokens or []
         )
         frames.extend([silence] * self.audio_silence_frame_cnt)
+        replay_frames = len(voice_embeddings) if voice_embeddings is not None else 0
+        # Unlike step(), the first step_embeddings() also consumes the empty
+        # initial-token fill before advancing its one transformer frame.
+        offset_after_voice = state.offset + replay_frames + int(state.offset == 0 and replay_frames > 0)
         notes_start = None
         if notes_text is not None:
             self.notes_start = None
-            fills = max(0, self.max_delay + 1 - state.offset - len(frames))
+            fills = max(0, self.max_delay + 1 - offset_after_voice - len(frames))
             frames.extend([silence] * fills)
-            notes_start = state.offset + len(frames)
+            notes_start = offset_after_voice + len(frames)
             frames.extend((zero, notes_text[:, index]) for index in range(self.notes_frames))
             frames.append((zero, self.lm_model.text_padding_token_id))
 
-        columns = len(frames) - int(state.offset == 0 and bool(frames))
+        columns = replay_frames + len(frames) - int(offset_after_voice == 0 and bool(frames))
         overflow = any(
             int(layer.self_attn._streaming_state.kv_cache.end_offset.item()) + columns
             > layer.self_attn._streaming_state.kv_cache.capacity
@@ -2265,18 +2274,13 @@ class LMGen(StreamingModule[_LMGenState]):
         )
         if overflow:
             logger.info("Prompt span exceeds KV capacity; using frame-by-frame prefill")
+            if voice_embeddings is not None:
+                self._step_voice_prompt(mimi)
             for audio, text in frames:
                 self.step(input_tokens=sine, moshi_tokens=audio, text_token=text)
         else:
-            inputs = []
-            for audio, text in frames:
-                prepared = self.prepare_step_input(
-                    input_tokens=sine, moshi_tokens=audio, text_token=text,
-                )
-                if prepared is None:
-                    continue
-                input_, _, _, model_input_position, target_position = prepared
-                inputs.append(input_.clone())
+            def advance_forced_frame(prepared):
+                _, _, _, model_input_position, target_position = prepared
                 state.provided[:, :, model_input_position] = False
                 if self.caption_cfg:
                     state.cache[1:2, 1:self.lm_model.dep_q + 1, target_position] = (
@@ -2286,8 +2290,46 @@ class LMGen(StreamingModule[_LMGenState]):
                     self._clear_repetition_boundary()
                 self.controls.forced_text_recent = True
                 state.offset += 1
+
+            embeddings = []
+            if voice_embeddings is not None:
+                needed_tokens = self.lm_model.num_codebooks - AUDIO_TOKENS_PER_STREAM - 1
+                dummy_user = state.initial[:, 1:1 + needed_tokens]
+                dummy_agent = state.initial[:, 1 + needed_tokens:]
+                for next_embed in voice_embeddings:
+                    # Match step_embeddings' token-ring bookkeeping without
+                    # launching the transformer or sampling for this frame.
+                    while True:
+                        prepared = self.prepare_step_input(
+                            input_tokens=dummy_user, moshi_tokens=dummy_agent,
+                            text_token=self.zero_text_code,
+                        )
+                        if prepared is not None:
+                            break
+                    advance_forced_frame(prepared)
+                    if self.caption_cfg and next_embed.shape[0] == 1:
+                        next_embed = next_embed.expand(2, -1, -1)
+                    embeddings.append(next_embed)
+                # Restore the legacy final token cache before preparing the
+                # first silence/text input. Blends have no cache to restore.
+                if self.voice_prompt_cache is not None:
+                    state.cache.copy_(self.voice_prompt_cache)
+
+            inputs = []
+            for audio, text in frames:
+                prepared = self.prepare_step_input(
+                    input_tokens=sine, moshi_tokens=audio, text_token=text,
+                )
+                if prepared is None:
+                    continue
+                inputs.append(prepared[0].clone())
+                advance_forced_frame(prepared)
             if inputs:
-                self.lm_model.transformer(self.lm_model.embed_codes(torch.cat(inputs, dim=2)))
+                embeddings.append(self.lm_model.embed_codes(torch.cat(inputs, dim=2)))
+            if embeddings:
+                self.lm_model.transformer(
+                    torch.cat(embeddings, dim=1) if len(embeddings) > 1 else embeddings[0]
+                )
         if notes_start is not None:
             self.notes_start = notes_start
         return voice_frames

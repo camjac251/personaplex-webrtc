@@ -33,6 +33,7 @@ const BOOLEAN_FIELDS = new Set([
   "processing_started",
   "ready_sent",
   "vision_feed_model",
+  "vision_notes",
   "vision_ground_user_turns",
   "vision_in_transcript",
   "vision_prompt_replace",
@@ -211,6 +212,8 @@ const HARD_PRIVATE_FIELDS = new Set([
   "base64",
   "blob",
   "candidate",
+  "caption",
+  "notes",
   "cookie",
   "credential",
   "device_id",
@@ -299,6 +302,7 @@ const CONFIG_FIELDS = new Set([
   "vision_cost_limit_usd",
   "vision_cost_per_call_usd",
   "vision_feed_model",
+  "vision_notes",
   "vision_ground_user_turns",
   "vision_in_transcript",
   "vision_prompt_chars",
@@ -580,7 +584,8 @@ function sanitizeValue(value, options, depth, mode) {
   }
   if (!value || typeof value !== "object") return undefined;
 
-  const notesMessage = value.type === "set_notes" || (value.type === "event" && value.kind === "notes");
+  const notesMessage = ["set_notes", "context_note", "vision_caption", "context_status"].includes(value.type)
+    || (value.type === "event" && ["notes", "vision_notes", "context_note"].includes(value.kind));
   const privatePrompts = options.privatePrompts || Object.hasOwn(value, "notes");
   if (notesMessage || privatePrompts) {
     options = { ...options, privatePrompts, includeContent: notesMessage ? false : options.includeContent };
@@ -842,7 +847,7 @@ export function createSessionTrace({
         level: safeToken(level, "info"),
         data: safeKind === "server.lifecycle_receipt"
           ? sanitizeLifecycleReceipt(data)
-          : sanitizeValue(data, { includeContent: safeKind !== "server.event.notes", privatePrompts }, 0, "event"),
+          : sanitizeValue(data, { includeContent: !["server.event.notes", "server.event.vision_notes", "server.event.context_note", "server.vision_caption", "server.context_status"].includes(safeKind), privatePrompts }, 0, "event"),
       };
       nextSeq += 1;
       events.push(event);

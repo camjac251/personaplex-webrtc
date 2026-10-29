@@ -6,13 +6,17 @@ Run directly: ``uv run python moshi/tests/test_duplex_scenarios.py``.
 from __future__ import annotations
 
 import asyncio
+import base64
+import fractions
 import json
 import sys
 import tempfile
 from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
+from av import CodecContext, VideoFrame
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
@@ -47,6 +51,7 @@ from scripts.run_duplex_regression import (
     _queue_health_failures,
     _record_runtime_summary_response,
     _request_final_runtime_summary,
+    _run_action,
     _runtime_metrics,
     _runtime_summary_failures,
     _scenario_exit_failure,
@@ -159,6 +164,163 @@ def test_manifest_rejects_ambiguous_action_schedule() -> None:
         assert "exactly one" in str(exc)
     else:
         raise AssertionError("ambiguous action schedule was accepted")
+
+
+def test_manifest_validates_vision_actions() -> None:
+    actions = [
+        {"type": "vision_source", "at_ms": 0, "active": True, "generation": 0},
+        {"type": "vision_frame", "at_ms": 100, "image": "images/scene.jpg", "generation": 0},
+        {"type": "vision_source", "at_ms": 200, "active": False, "generation": 1},
+    ]
+    assert validate_manifest(_manifest(actions=actions))["actions"] == actions
+
+    for action in actions:
+        for key, invalid_values in (
+            ("generation", [None, True, False, -1, 1.0, "1"]),
+            ("at_ms", [None, True, -1, float("inf"), "100"]),
+        ):
+            for value in invalid_values:
+                invalid = {**action, key: value}
+                try:
+                    validate_manifest(_manifest(actions=[invalid]))
+                except ScenarioValidationError as exc:
+                    assert f"actions[0].{key}" in str(exc)
+                else:
+                    raise AssertionError(f"invalid vision action {key} accepted")
+        missing_generation = {key: value for key, value in action.items() if key != "generation"}
+        try:
+            validate_manifest(_manifest(actions=[missing_generation]))
+        except ScenarioValidationError as exc:
+            assert "actions[0].generation" in str(exc)
+        else:
+            raise AssertionError("missing vision generation accepted")
+
+    for action, key, invalid_values in (
+        (actions[0], "active", [None, 0, 1, "true"]),
+        (actions[1], "image", [None, "", " ", 12, "/absolute/scene.jpg"]),
+    ):
+        for value in invalid_values:
+            try:
+                validate_manifest(_manifest(actions=[{**action, key: value}]))
+            except ScenarioValidationError as exc:
+                assert f"actions[0].{key}" in str(exc)
+            else:
+                raise AssertionError(f"invalid vision action {key} accepted")
+        try:
+            validate_manifest(
+                _manifest(actions=[{name: value for name, value in action.items() if name != key}])
+            )
+        except ScenarioValidationError as exc:
+            assert f"actions[0].{key}" in str(exc)
+        else:
+            raise AssertionError(f"missing vision action {key} accepted")
+
+
+async def test_runner_sends_manifest_relative_vision_images() -> None:
+    encoder = CodecContext.create("mjpeg", "w")
+    encoder.width = encoder.height = 16
+    encoder.pix_fmt = "yuvj420p"
+    encoder.time_base = fractions.Fraction(1, 1)
+    frame = VideoFrame.from_ndarray(np.zeros((16, 16, 3), dtype=np.uint8), format="rgb24")
+    image = b"".join(bytes(packet) for packet in encoder.encode(frame) + encoder.encode(None))
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw) / "manifest"
+        root.mkdir()
+        (root / "images").mkdir()
+        (root / "images" / "scene.jpg").write_bytes(image)
+        manifest_path = root / "scenario.json"
+        manifest_path.write_text(
+            json.dumps(_manifest(actions=[
+                {"type": "vision_source", "at_ms": 0, "active": True, "generation": 7},
+                {"type": "vision_frame", "at_ms": 0, "image": "images/scene.jpg", "generation": 7},
+                {"type": "vision_frame", "at_ms": 0, "image": "images/scene.jpg", "generation": 7},
+                {"type": "vision_source", "at_ms": 0, "active": False, "generation": 8},
+            ])),
+            encoding="utf-8",
+        )
+        manifest = load_manifest(manifest_path)
+        sent = []
+        control = SimpleNamespace(readyState="open", send=lambda value: sent.append(json.loads(value)))
+        recorder = EventRecorder()
+        origin = recorder.set_origin(asyncio.get_running_loop().time())
+        for action in manifest["actions"]:
+            await _run_action(
+                action, origin=origin, control=control, collector=None,
+                recorder=recorder, manifest_path=manifest_path,
+            )
+        assert sent[0] == {"type": "vision_source_started", "source_generation": 7}
+        assert sent[3] == {"type": "vision_source_stopped", "source_generation": 8}
+        assert sent[1]["frame_id"] != sent[2]["frame_id"]
+        for message in sent[1:3]:
+            assert isinstance(message["frame_id"], str) and message["frame_id"]
+            assert message == {
+                "type": "vision_frame",
+                "frame_id": message["frame_id"],
+                "data": base64.b64encode(image).decode("ascii"),
+                "detail": False,
+                "historical_detail": False,
+                "source_generation": 7,
+            }
+        trace = recorder.export()
+        assert _action_protocol_failures(manifest, trace) == []
+        assert all("data" not in event["message"] for event in trace)
+        assert base64.b64encode(image).decode("ascii") not in json.dumps(trace)
+
+        (root / "images" / "invalid.jpg").write_bytes(b"not an image")
+        for name in ("missing.jpg", "invalid.jpg"):
+            before = len(sent)
+            try:
+                await _run_action(
+                    {"type": "vision_frame", "at_ms": 0, "image": f"images/{name}", "generation": 7},
+                    origin=origin, control=control, collector=None,
+                    recorder=recorder, manifest_path=manifest_path,
+                )
+            except ScenarioValidationError as exc:
+                assert "vision_frame image" in str(exc)
+            else:
+                raise AssertionError("unreadable or invalid image was sent")
+            assert len(sent) == before
+            assert len(recorder.export()) == len(trace)
+
+
+def test_vision_fire_and_forget_preserves_acknowledged_action_requirements() -> None:
+    manifest = validate_manifest(_manifest(actions=[
+        {"type": "vision_source", "at_ms": 0, "active": True, "generation": 1},
+        {"type": "vision_frame", "at_ms": 0, "image": "scene.jpg", "generation": 1},
+        {"type": "context_note", "at_ms": 0, "text": "Synthetic fixture."},
+        {"type": "set_notes", "at_ms": 0, "text": ""},
+        {"type": "update_config", "at_ms": 0, "config": {"seed": 42}},
+        {"type": "interrupt", "at_ms": 0},
+        {"type": "vision_source", "at_ms": 0, "active": False, "generation": 2},
+    ]))
+    outgoing_types = [
+        "vision_source_started", "vision_frame", "context_note", "set_notes",
+        "update_config", "interrupt", "vision_source_stopped",
+    ]
+    outgoing = [
+        {"direction": "out", "t_ms": 0, "message": {"type": kind}}
+        for kind in outgoing_types
+    ]
+    outgoing[4]["message"]["seed"] = 42
+    incoming_messages = [
+        {"type": "event", "kind": "context_note", "data": {"status": "queued"}},
+        {"type": "event", "kind": "notes", "data": {"status": "applied"}},
+        {"type": "config_applied", "source": "update", "applied": ["seed"], "config": {"seed": 42}},
+        {"type": "interrupted"},
+    ]
+    incoming = [
+        {"direction": "in", "t_ms": 1, "message": message}
+        for message in incoming_messages
+    ]
+    assert _action_protocol_failures(manifest, outgoing + incoming) == []
+    for index, kind in enumerate(("context_note", "set_notes", "update_config", "interrupt")):
+        failures = _action_protocol_failures(manifest, outgoing + incoming[:index] + incoming[index + 1:])
+        assert any(f"{kind} action" in failure and "not acknowledged" in failure for failure in failures)
+        assert not any("vision_" in failure for failure in failures)
+    missing = _action_protocol_failures(manifest, outgoing[:-1] + incoming)
+    assert "scheduled 7 action(s), sent 6" in missing
+    outgoing[-1]["message"]["type"] = "vision_source_started"
+    assert any("vision_source_stopped" in failure for failure in _action_protocol_failures(manifest, outgoing + incoming))
 
 
 def test_manifest_rejects_non_boolean_event_required() -> None:
@@ -985,6 +1147,9 @@ if __name__ == "__main__":
         test_checked_in_manifests_validate_without_bundled_audio,
         test_long_session_soak_turns_fit_generated_wav_timeline,
         test_manifest_rejects_ambiguous_action_schedule,
+        test_manifest_validates_vision_actions,
+        test_runner_sends_manifest_relative_vision_images,
+        test_vision_fire_and_forget_preserves_acknowledged_action_requirements,
         test_manifest_rejects_non_boolean_event_required,
         test_runner_rejects_expectation_windows_past_capture_end,
         test_wav_validation_and_twenty_ms_framing,

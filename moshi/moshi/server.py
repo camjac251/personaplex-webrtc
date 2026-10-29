@@ -830,6 +830,8 @@ VISION_QUEUE_MAX = 32
 # roughly two seconds of model time. Bound model-side reaction duty cycle;
 # Gemini captions continue updating normally while injections are throttled.
 VISION_AMBIENT_MIN_INTERVAL_SEC = 8.0
+# Pinned scene updates do not enter the text stream, but still replay slot KV.
+VISION_NOTES_MIN_INTERVAL_SEC = 4.0
 
 # Necessary (not sufficient) condition for a context inject: at least this
 # many consecutive PAD text tokens. Pulled from NVIDIA/personaplex PR #69's
@@ -2057,6 +2059,9 @@ class ServerState:
         self._stop_user_audio_silence_streak: int = 0
         self._active_notes: str = ""
         self._active_notes_tokens: list[int] = []
+        self._active_vision_scene: str = ""
+        self._vision_notes_last_rewrite_at: float | None = None
+        self._vision_notes_disabled: bool = False
         self._reset_floor_tracking_locked()
         # Gemini consecutive-error counter for the auto-disable path.
         # Reset on every 2xx success and on session start. Transient
@@ -2084,6 +2089,7 @@ class ServerState:
         # drip injector. Off by default so the vision feature can caption
         # frames without making the voice spontaneously react to them.
         self._vision_feed_model: bool = False
+        self._vision_notes: bool = False
         # Per-session toggle: when true, a detected user-audio turn queues one
         # fresh visual context packet for the next answer. Unlike
         # _vision_feed_model this is not ambient, and it does not depend on ASR.
@@ -5470,10 +5476,132 @@ class ServerState:
         )
         return note, self.text_tokenizer.encode(f" {note}") if note else []
 
+    def _compose_notes(
+        self, director: str, director_tokens: list[int], scene: str,
+    ) -> tuple[str, list[int]]:
+        """Keep all director text; fit only whole scene words in the pinned slot."""
+        budget = int(self.lm_gen.notes_frames) - 1
+        words = scene.split()
+        while words:
+            combined = " ".join(part for part in (director, " ".join(words)) if part)
+            tokens = self.text_tokenizer.encode(f" {combined}")
+            if len(tokens) <= budget:
+                return combined, tokens
+            words.pop()
+        return director, director_tokens
+
+    def _schedule_vision_notes_result(self, data: dict) -> None:
+        """Publish content-free NOTES status from the inference worker."""
+        session = getattr(self, "_active_session", None)
+        loop = getattr(self, "_main_loop", None)
+        session_id = self._active_session_id
+        if session is None or loop is None:
+            return
+        status = data["status"]
+        text = {
+            "applied": "Scene notes applied silently",
+            "cleared": "Scene notes cleared",
+            "rejected": (
+                "Scene notes unavailable until a new session"
+                if data.get("reason") == "evicted" else "Scene notes not applied"
+            ),
+        }[status]
+
+        def _notify() -> None:
+            if session_id == self._active_session_id:
+                session.send_event(
+                    "vision_notes", text, "warn" if status == "rejected" else "ok", data,
+                )
+
+        loop.call_soon_threadsafe(_notify)
+
+    def _notes_rejection_locked(self, exc: NotesUnavailable) -> dict:
+        reason = "unsupported" if exc.reason == "disabled" else exc.reason
+        data = {"status": "rejected", "reason": reason}
+        if reason == "evicted" and not self._vision_notes_disabled:
+            self._vision_notes_disabled = True
+            self._schedule_vision_notes_result(data)
+        return data
+
+    def _clear_vision_scene_locked(self) -> None:
+        """Camera/flag transitions clear scene ownership even if KV was evicted."""
+        if not getattr(self, "_active_vision_scene", ""):
+            return
+        self._active_vision_scene = ""
+        if self._vision_notes_disabled:
+            return
+        try:
+            self.lm_gen.rewrite_notes(self._active_notes_tokens)
+        except NotesUnavailable as exc:
+            data = self._notes_rejection_locked(exc)
+            if exc.reason != "evicted":
+                self._schedule_vision_notes_result(data)
+        else:
+            self._schedule_vision_notes_result({
+                "status": "cleared", "tokens": len(self._active_notes_tokens),
+            })
+
+    async def _handle_vision_notes(
+        self, session_id: str, scene: str, source_generation: int,
+    ) -> None:
+        """Rewrite live scene memory, never the ambient spoken-context queue.
+
+        Director edits and camera/flag clears bypass the four-second caption
+        limit. Neither a clear nor a live flag toggle resets an eviction latch.
+        """
+        def _rewrite() -> None:
+            with self._infer_lock:
+                if (
+                    session_id != self._active_session_id
+                    or not self._vision_notes
+                    or self._vision_notes_disabled
+                    or not getattr(self.lm_gen, "notes_frames", 0)
+                    or not self._context.camera_active
+                    or source_generation != self._context.camera_generation
+                ):
+                    return
+                normalized = " ".join(scene.split())
+                if not normalized or normalized == self._active_vision_scene:
+                    return
+                now = time.monotonic()
+                last = self._vision_notes_last_rewrite_at
+                if last is not None and now - last < VISION_NOTES_MIN_INTERVAL_SEC:
+                    return
+                combined, tokens = self._compose_notes(
+                    self._active_notes, self._active_notes_tokens, normalized,
+                )
+                if combined == self._active_notes:
+                    self._schedule_vision_notes_result({
+                        "status": "rejected", "reason": "no_space",
+                    })
+                    return
+                try:
+                    self.lm_gen.rewrite_notes(tokens)
+                except NotesUnavailable as exc:
+                    data = self._notes_rejection_locked(exc)
+                    if exc.reason != "evicted":
+                        self._schedule_vision_notes_result(data)
+                    return
+                self._active_vision_scene = normalized
+                self._vision_notes_last_rewrite_at = now
+                self._schedule_vision_notes_result({
+                    "status": "applied", "tokens": len(tokens),
+                })
+
+        future = asyncio.get_running_loop().run_in_executor(self._infer_executor, _rewrite)
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError:
+            await future
+            raise
+
     def _configure_initial_notes_locked(self, text: object) -> dict | None:
         """Reset NOTES for a fresh session; never retain a rejected draft."""
         self._active_notes = ""
         self._active_notes_tokens = []
+        self._active_vision_scene = ""
+        self._vision_notes_last_rewrite_at = None
+        self._vision_notes_disabled = False
         self.lm_gen.notes_tokens = []
         frames = int(getattr(self.lm_gen, "notes_frames", 0))
         if frames <= 0:
@@ -5499,11 +5627,13 @@ class ServerState:
         """A restored KV prefix may predate the latest successful NOTES edit."""
         if not getattr(self.lm_gen, "notes_frames", 0):
             return None
+        _, tokens = self._compose_notes(
+            self._active_notes, self._active_notes_tokens, self._active_vision_scene,
+        )
         try:
-            self.lm_gen.rewrite_notes(list(self._active_notes_tokens))
+            self.lm_gen.rewrite_notes(tokens)
         except NotesUnavailable as exc:
-            reason = "unsupported" if exc.reason == "disabled" else exc.reason
-            return {"status": "rejected", "reason": reason}
+            return self._notes_rejection_locked(exc)
         return None
 
     async def _handle_set_notes(
@@ -5533,12 +5663,12 @@ class ServerState:
             with self._infer_lock:
                 if session_id != self._active_session_id:
                     return None
+                _, composed_tokens = self._compose_notes(note, tokens, self._active_vision_scene)
                 try:
-                    self.lm_gen.rewrite_notes(tokens)
+                    self.lm_gen.rewrite_notes(composed_tokens)
                 except NotesUnavailable as exc:
-                    reason = "unsupported" if exc.reason == "disabled" else exc.reason
-                    data = {"status": "rejected", "reason": reason}
-                    if reason == "too_long":
+                    data = self._notes_rejection_locked(exc)
+                    if data["reason"] == "too_long":
                         data["max_tokens"] = frames - 1
                     return data
                 self._active_notes, self._active_notes_tokens = note, list(tokens)
@@ -6134,6 +6264,10 @@ class ServerState:
                         )
                     if historical_detail:
                         return
+                    if getattr(self, "_vision_notes", False):
+                        await self._handle_vision_notes(
+                            session_id, grounding_caption, source_generation,
+                        )
                     if pending_context is not None:
                         (
                             source,
@@ -6303,6 +6437,7 @@ class ServerState:
             "vision_prompt_replace": bool(self._vision_prompt_replace),
             "vision_in_transcript": bool(self._vision_in_transcript),
             "vision_feed_model": bool(self._vision_feed_model),
+            "vision_notes": bool(self._vision_notes),
             "vision_ground_user_turns": bool(self._vision_ground_user_turns),
             "seed": self._active_seed,
             "voice_blend_mix": float(self._active_voice_blend_mix),
@@ -6386,6 +6521,7 @@ class ServerState:
                 self._latest_vision_at = 0.0
                 self._latest_vision_frame_id = ""
                 self._vision_context_after_next_caption = None
+                self._clear_vision_scene_locked()
                 # A camera change does not reset quiet-boundary accounting
                 # for an unrelated note or persona still being delivered.
                 return result
@@ -7422,6 +7558,7 @@ class ServerState:
                 self._vision_prompt_replace = bool(cfg.vision_prompt_replace)
                 self._vision_in_transcript = bool(cfg.vision_in_transcript)
                 self._vision_feed_model = bool(cfg.vision_feed_model)
+                self._vision_notes = bool(cfg.vision_notes)
                 # Retired after real GPU traces showed the context arrived
                 # only after the assistant had already answered. Keep the
                 # wire field parseable for older clients but never arm it.
@@ -7963,6 +8100,7 @@ class ServerState:
                         "vision_cost_limit_usd",
                         "vision_in_transcript",
                         "vision_feed_model",
+                        "vision_notes",
                         "vision_ground_user_turns",
                         "inject_silence_rms",
                         "inject_silence_streak",
@@ -7978,6 +8116,7 @@ class ServerState:
                     semantic_temp_cap: Optional[float] = None
                     vision_cost_limit: Optional[float] = None
                     vision_feed_model: Optional[bool] = None
+                    vision_notes: Optional[bool] = None
                     vision_ground_user_turns: Optional[bool] = None
                     inject_silence_rms: Optional[float] = None
                     inject_silence_streak: Optional[int] = None
@@ -8047,6 +8186,8 @@ class ServerState:
                             )
                         if "vision_feed_model" in msg:
                             vision_feed_model = bool(msg["vision_feed_model"])
+                        if "vision_notes" in msg:
+                            vision_notes = bool(msg["vision_notes"])
                         if "vision_ground_user_turns" in msg:
                             vision_ground_user_turns = False
                         if "inject_silence_rms" in msg:
@@ -8168,6 +8309,7 @@ class ServerState:
                         or audio_top_k is not None
                         or semantic_temp_cap is not None
                         or caption_cfg_gamma is not None
+                        or vision_notes is not None
                     ):
                         def _apply_live_config():
                             # Mutate scalars under the inference lock so the
@@ -8183,6 +8325,10 @@ class ServerState:
                                     # caption; an active decay keeps its current
                                     # trajectory.
                                     self._caption_cfg_gamma = caption_cfg_gamma
+                                if vision_notes is not None:
+                                    self._vision_notes = vision_notes
+                                    if not vision_notes:
+                                        self._clear_vision_scene_locked()
                                 sampling_updates = dict(updates)
                                 if semantic_temp_cap is not None:
                                     sampling_updates["semantic_temperature_cap"] = semantic_temp_cap
