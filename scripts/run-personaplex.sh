@@ -44,8 +44,21 @@ while true; do
   fi
   echo "[supervisor] starting moshi-server at $(date -u +%H:%M:%S)"
   started_at=$(date +%s)
+  # Optional features are CLI flags on moshi-server; map them from .env so the
+  # env file stays the single place a deployment is configured.
+  extra_args=()
+  if [[ "${PERSONAPLEX_ENABLE_ASR:-0}" == "1" ]]; then
+    extra_args+=(--enable-asr)
+    if [[ -n "${PERSONAPLEX_ASR_MODEL:-}" ]]; then
+      extra_args+=(--asr-model "$PERSONAPLEX_ASR_MODEL")
+    fi
+  fi
+  if [[ "${PERSONAPLEX_RECORD_SESSIONS:-0}" == "1" ]]; then
+    extra_args+=(--record-sessions)
+  fi
   .venv/bin/moshi-server --host 0.0.0.0 --port "$PORT" \
-    --voice-prompt-dir voices --ssl "$APP_DIR/certs" &
+    --voice-prompt-dir voices --ssl "$APP_DIR/certs" \
+    ${extra_args[@]+"${extra_args[@]}"} &
   server_pid=$!
 
   # Startup deadline: kill a launch that never starts serving.
