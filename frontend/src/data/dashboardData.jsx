@@ -324,7 +324,7 @@ export const PARAM_INFO = {
   visionMetric: { title: "Vision sent / gated", body: "Frames sent to the caption service versus total capture attempts. Gated attempts were skipped before sending." },
   signalStrip: { title: "Live signal", body: "Amber is microphone input; green is AI output. Bars show audio levels. The scope illustrates speaking activity, not the recorded waveform." },
   jumpToLive: { title: "Jump to live", body: "Return to the newest transcript line and resume auto-follow. The count includes new lines and existing turns that grew while you were reading earlier text." },
-  characterCard: { title: "Character card", body: "Build a structured startup prompt for CharacterPlex. Use card as prompt selects it for the next fresh session; editing the card does not change a live session." },
+  characterCard: { title: "Character card", body: "Build a structured startup prompt for CharacterPlex. Use card as prompt selects it for the next fresh session; editing the card does not change a live session. CharacterPlex was trained on cards: with a plain persona prompt it stayed silent for the whole test in roughly a third of sessions, while every card session in testing replied." },
   characterIdentity: { title: "Character", body: "Describe who the character is, what they want, and how they speak. Empty fields are left out of the compiled card." },
   charactertriggers: { title: "Triggers", body: "Describe situations that matter to the character and their intended emotional response." },
   characterpeople: { title: "People", body: "Add relationships and relevant context for people the character knows." },
