@@ -5765,7 +5765,7 @@ function App() {
                       </div>
                       <span className={cls("vision-reaction-note", visionReactionMode === "continuous" && "warn")}>
                         {visionReactionMode === "notes"
-                          ? "Captions update the character's notes silently; nothing is spoken into the conversation."
+                          ? "Captions silently update the character's notes instead of the spoken stream; the character may mention what it sees."
                           : visionReactionMode === "passive"
                             ? "Captions stay outside the voice model and cannot disturb speech timing."
                             : "Unsafe experiment: may speak about changing scenes without being asked."}

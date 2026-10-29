@@ -69,7 +69,7 @@ export function DirectorNotes({ notes, notesFrames, contextNote, live }) {
               <button type="button" className="btn ghost" disabled={!notes.canSend} onClick={notes.clear}>Clear</button>
               <button type="submit" className="btn primary" disabled={!notes.canSend || !draft.trim()}>{notes.pending ? "Pending…" : "Apply"}</button>
             </div>
-            <p className={notes.error ? "context-note-error" : "context-note-help"} id={`${id}-status`} role="status">{notes.status || (live ? "Replaces your pinned direction silently; the character usually acts on it within a few seconds." : "Connect and wait for warmup to apply live direction.")}</p>
+            <p className={notes.error ? "context-note-error" : "context-note-help"} id={`${id}-status`} role="status">{notes.status || (live ? "Replaces your pinned direction silently; how closely the character follows it varies." : "Connect and wait for warmup to apply live direction.")}</p>
             {notes.history.length > 0 && (
               <section className="notes-history" aria-label="Recent directions">
                 <span>Recent</span>

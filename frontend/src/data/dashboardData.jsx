@@ -332,10 +332,10 @@ export const PARAM_INFO = {
   characterScene: { title: "Scene", body: "Set the starting situation, mood, and dramatic beat. Use live Direct notes to change direction after connecting." },
   characterRoster: { title: "Roster", body: "List the other participants in the scene so the startup card identifies who is present." },
   openingDirection: { title: "Opening direction", body: "Initial pinned notes for the next fresh session, saved in this browser. Changes do not update the live slot. The server checks the actual token count." },
-  directNotes: { title: "Direct", body: "Replace the character's pinned direction without restarting. Enter applies; Shift+Enter adds a line. The note is written into the pinned slot, not the spoken stream, so it is rarely read aloud; it usually takes effect within a few seconds, even mid-reply. The server preserves the current scene notes when present." },
+  directNotes: { title: "Direct", body: "Replace the character's pinned direction without restarting. Enter applies; Shift+Enter adds a line. The note is written into the pinned slot, not the spoken stream, so it is rarely read aloud. How closely the character follows it varies: in testing it acted at least partly on most notes, sometimes within the reply already in progress. The server preserves the current scene notes when present." },
   injectNotes: { title: "Inject · experimental", body: "Queue a short context note for a quiet boundary. Unlike Direct, this feeds the conversation stream and may be repeated aloud. Limit: 180 characters and 32 model tokens." },
   visionPassive: { title: "Captions only", body: "Display scene captions without feeding them to the voice model." },
-  visionNotes: { title: "Scene notes", body: "Update the pinned scene context silently, at most once every four seconds. Director notes take priority in the shared slot. Available only on servers with a NOTES slot." },
+  visionNotes: { title: "Scene notes", body: "Update the pinned scene context silently, at most once every four seconds, instead of feeding captions into the spoken stream. The character may still mention what it sees. Director notes take priority in the shared slot. Available only on servers with a NOTES slot." },
   visionAmbient: { title: "Ambient react · unsafe", body: "Inject captions into quiet gaps in the conversation, at most once every eight seconds. This can trigger speech without a user prompt." },
   turnHandling: {
     title: "Turn handling",
@@ -530,7 +530,9 @@ export const PARAM_INFO = {
       <>
         Biases the end-of-padding token that marks the model starting to
         speak. Negative values delay onset (more patient turn-taking);
-        positive values hasten it (more eager). CharacterPlex starts at <b>+1.0</b>.
+        positive values hasten it (more eager). CharacterPlex starts at <b>+1.0</b>,
+        which cut its median reply delay by about 40% in testing but let it
+        speak a little more into your mid-sentence pauses.
         Other models default to <b>0</b> (off).
         Independent from Padding bonus, which only shortens a reply already
         underway.
