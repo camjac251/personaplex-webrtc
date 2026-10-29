@@ -65,6 +65,7 @@ from .models.lm import (
     AUDIO_TOKENS_PER_STREAM,
     DEFAULT_SEMANTIC_TEMPERATURE_CAP,
     MAX_REPETITION_CONTEXT,
+    NotesUnavailable,
     load_audio,
     normalize_audio,
     trim_boundary_silence,
@@ -125,6 +126,11 @@ def _model_identity(repo: str, revision: Optional[str]) -> dict[str, object]:
         label = "PersonaPlex 7B · Base"
         variant = "base"
         license_name = "NVIDIA OML"
+        native_duplex = False
+    elif repo == loaders.CHARACTERPLEX_REPO:
+        label = "CharacterPlex FullFT v4"
+        variant = "characterplex"
+        license_name = "NVIDIA OML; research-only, non-commercial training data"
         native_duplex = False
     else:
         label = repo.rsplit("/", 1)[-1] or repo
@@ -544,6 +550,35 @@ def _resolve_session_seed(requested: Optional[int]) -> int:
     if requested is None or requested == -1:
         return secrets.randbelow(SEED_MAX + 1)
     return int(requested)
+
+
+# Startup-receipt flags each priming phase completes. The batched phase
+# covers the four classic segments; NOTES are not part of the receipt
+# protocol, so its phase completes no flag.
+PROMPT_PHASE_RECEIPT_FIELDS = {
+    "voice_prompt": ("voice_prompt_complete",),
+    "audio_silence_a": ("audio_silence_a_complete",),
+    "text_prompt": ("text_prompt_complete",),
+    "audio_silence_b": ("audio_silence_b_complete",),
+    "notes_prompt": (),
+    "system_prompts": (
+        "voice_prompt_complete",
+        "audio_silence_a_complete",
+        "text_prompt_complete",
+        "audio_silence_b_complete",
+    ),
+}
+
+
+# CharacterPlex reserves byte-fallback ids no text ever produces for vocal
+# events and delivery labels (its trainer's special_tokens table). Render the
+# events as their names; pause markers are silences and stay out of the text.
+CHARACTERPLEX_EVENT_PIECES = {
+    15: "‹tearful›", 16: "‹whisper›", 18: "", 19: "",
+    24: "‹laugh›", 25: "‹chuckle›", 26: "‹sigh›", 27: "‹gasp›",
+    28: "‹cry›", 29: "‹sniff›", 30: "‹cough›", 31: "‹breath›",
+    32: "‹groan›", 33: "‹scream›", 34: "‹sob›",
+}
 
 
 def _new_lifecycle_receipt(*, resuming: bool) -> dict[str, bool | int | str]:
@@ -1091,6 +1126,11 @@ ASSISTED_BARGE_ASSISTANT_QUIET_STREAK = 2
 # Gentle counts 1.2 seconds of voiced overlap, bridging at most 160 ms gaps.
 GENTLE_BARGE_OVERLAP_FRAMES = 15
 GENTLE_BARGE_GAP_FRAMES = 2
+FLOOR_BACKCHANNEL_TOKENS = 3
+FLOOR_BARGE_OVERLAP_FRAMES = 6
+# CharacterPlex trained with 50-70 voice-prompt frames; the memory sink
+# reserves the upper bound so any accepted card keeps NOTES pinned.
+MEMORY_VOICE_FRAMES = 70
 # Leave the last clean recovery point intact after a detected runaway.
 AUTO_RECOVERY_STABILITY_SEC = 8.0
 # Stop uses a separate, deliberately shorter speech gate. A one- or two-word
@@ -1730,6 +1770,11 @@ class ServerState:
             0, int(snapshot_host_free_floor_bytes)
         )
         self.model_identity = _model_identity(model_repo, model_revision)
+        self._transcript_event_pieces = (
+            CHARACTERPLEX_EVENT_PIECES
+            if self.model_identity["model_variant"] == "characterplex"
+            else {}
+        )
         disabled_asr_sha256 = hashlib.sha256(b"disabled").hexdigest()
         self.asr_model_sha256 = (
             asr_model_sha256
@@ -1750,6 +1795,8 @@ class ServerState:
             "snapshot_host_budget_bytes": self._snapshot_host_budget_bytes,
             "snapshot_host_free_floor_bytes": self._snapshot_host_free_floor_bytes,
             "depformer_early_exit": int(depformer_early_exit),
+            "notes_frames": int(getattr(lm_gen, "notes_frames", 0)),
+            "batched_prefill": bool(getattr(lm_gen, "batched_prefill", False)),
         }
         # Optional user-speech recognizer (second model). None unless the
         # operator passed --enable-asr and faster-whisper imported. When
@@ -2008,6 +2055,9 @@ class ServerState:
         self._stop_user_audio_active: bool = False
         self._stop_user_audio_attack_streak: int = 0
         self._stop_user_audio_silence_streak: int = 0
+        self._active_notes: str = ""
+        self._active_notes_tokens: list[int] = []
+        self._reset_floor_tracking_locked()
         # Gemini consecutive-error counter for the auto-disable path.
         # Reset on every 2xx success and on session start. Transient
         # statuses (GEMINI_TRANSIENT_STATUSES) bypass the counter and set a
@@ -2170,6 +2220,7 @@ class ServerState:
             voice_frames
             + 2 * int(self.lm_gen.audio_silence_frame_cnt)
             + text_tokens
+            + int(getattr(self.lm_gen, "notes_frames", 0))
         )
         if prefix <= sink:
             return
@@ -2235,6 +2286,7 @@ class ServerState:
         if (
             getattr(self, "_interrupt_gate_remaining", 0) > 0
             or self.lm_gen.controls.pad_force_remaining > 0
+            or getattr(self, "_floor_held", False)
             or getattr(self, "_auto_rewind_pending", False)
         ):
             return "forced_yield"
@@ -2553,6 +2605,10 @@ class ServerState:
             self._active_turn_handling = getattr(
                 cfg, "turn_handling", "native"
             )
+            self._reset_floor_tracking_locked()
+            notes_rejection = self._configure_initial_notes_locked(
+                getattr(cfg, "notes", "")
+            )
             wrapped_text_prompt = (
                 wrap_with_system_tags(self._active_text_prompt)
                 if self._active_text_prompt
@@ -2657,11 +2713,16 @@ class ServerState:
             "text_prompt_tokens": len(self.lm_gen.text_prompt_tokens),
             "audio_top_k": self.lm_gen.top_k,
             "audio_top_k_changed": audio_top_k_changed,
+            "notes_rejection": notes_rejection,
         }
 
     def _reset_mimi_streaming_locked(self) -> None:
         with self._infer_lock:
             self.mimi.reset_streaming()
+
+    def _run_prompt_phase_locked(self, phase_fn, *phase_args):
+        with self._infer_lock:
+            return phase_fn(*phase_args)
 
     def _resolve_upload_path(self, name: str) -> Optional[str]:
         """Return an absolute path inside uploads_dir, or None if unsafe/missing.
@@ -3226,6 +3287,8 @@ class ServerState:
 
         with self._infer_lock:
             lm_controls = self.lm_gen.capture_preview_state()
+            notes_tokens = list(getattr(self.lm_gen, "notes_tokens", []))
+            notes_start = getattr(self.lm_gen, "notes_start", None)
             server_attrs = (
                 "_active_seed",
                 "_active_voice_blend_mix",
@@ -3276,6 +3339,7 @@ class ServerState:
                 self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(
                     wrap_with_system_tags(PREVIEW_SAMPLE_TEXT)
                 )
+                self.lm_gen.notes_tokens = []
                 self.lm_gen.apply_sampling(
                     use_sampling=PREVIEW_FIXED_CONTROLS["use_sampling"],
                     temp_text=PREVIEW_FIXED_CONTROLS["text_temperature"],
@@ -3347,6 +3411,10 @@ class ServerState:
                 attempt(lambda: random.setstate(python_rng))
                 attempt(lambda: np.random.set_state(numpy_rng))
                 attempt(lambda: self.lm_gen.restore_preview_state(lm_controls))
+                self.lm_gen.notes_tokens = notes_tokens
+                self.lm_gen.notes_start = notes_start
+                if not restore_errors and notes_start is not None:
+                    attempt(lambda: self.lm_gen.rewrite_notes(notes_tokens))
                 for name, value in server_values.items():
                     attempt(
                         lambda name=name, value=value: setattr(
@@ -3568,13 +3636,103 @@ class ServerState:
         self._arm_stop_response_latch_locked(reason)
         self._context.clear()
 
+    def _reset_floor_tracking_locked(self) -> None:
+        self._floor_held = False
+        self._floor_user_speaking = False
+        self._floor_reply_in_progress = False
+        self._floor_overlap_frames = 0
+        self._floor_natural_streak = 0
+        self._floor_last_non_pad = 0
+
+    def _schedule_floor_event(self, action: str, reason: str) -> None:
+        session = getattr(self, "_active_session", None)
+        loop = getattr(self, "_main_loop", None)
+        session_id = getattr(self, "_active_session_id", None)
+        if session is None or loop is None:
+            return
+
+        def _notify() -> None:
+            if session_id == self._active_session_id:
+                session.send_event(
+                    "floor",
+                    "Assistant holding for the user" if action == "hold" else "User floor released",
+                    "info",
+                    {"action": action, "reason": reason},
+                )
+
+        loop.call_soon_threadsafe(_notify)
+
+    def _release_floor_locked(self, reason: str) -> None:
+        if not getattr(self, "_floor_held", False):
+            return
+        self._floor_held = False
+        if not self._stop_response_latched and self._interrupt_gate_remaining <= 0:
+            self.lm_gen.reset_turn_cap_tracking()
+            self._prev_pad_force_remaining = 0
+            self._vision_pad_streak = 0
+            self._audio_silence_streak = 0
+        self._schedule_floor_event("release", reason)
+
+    def _hold_floor_locked(self, reason: str) -> None:
+        self._floor_held = True
+        self.lm_gen.interrupt(INTERRUPT_YIELD_FRAMES)
+        # This is deliberate yielding, never an automatic-collapse edge.
+        self._prev_pad_force_remaining = self.lm_gen.controls.pad_force_remaining
+        self._schedule_floor_event("hold", reason)
+
+    def _maybe_hold_floor_locked(self, chunk_rms: float, inbound_speaking: bool) -> None:
+        if not inbound_speaking:
+            self._release_floor_locked("user_turn_end")
+            self._reset_floor_tracking_locked()
+            return
+        controls = self.lm_gen.controls
+        count = controls.non_pad_streak
+        flags = getattr(self, "_pending_text_flags", ())
+        # The controls count the last sampled token, not the delayed token
+        # returned by step(). The newest queued flags describe that sample.
+        natural = not any(flags[-1]) if flags else True
+        if not self._floor_user_speaking:
+            self._floor_user_speaking = True
+            self._floor_last_non_pad = count
+            self._floor_reply_in_progress = (
+                natural and count > 0 and not controls.forced_text_recent
+                and self._audio_silence_streak < ASSISTED_BARGE_ASSISTANT_QUIET_STREAK
+            )
+        if self._floor_held or self._stop_response_latched or self._interrupt_gate_remaining > 0:
+            self._floor_last_non_pad = count
+            return
+        if self._floor_reply_in_progress:
+            if self._audio_silence_streak >= ASSISTED_BARGE_ASSISTANT_QUIET_STREAK:
+                self._floor_reply_in_progress = False
+                self._floor_natural_streak = 0
+                self._floor_overlap_frames = 0
+            elif chunk_rms >= USER_TURN_SPEECH_RMS:
+                self._floor_overlap_frames += 1
+                if self._floor_overlap_frames >= FLOOR_BARGE_OVERLAP_FRAMES:
+                    self._hold_floor_locked("barge_in")
+            self._floor_last_non_pad = count
+            return
+        if natural and not controls.forced_text_recent:
+            if controls.turn_pad_streak > 0:
+                self._floor_natural_streak = 0
+            else:
+                self._floor_natural_streak += max(0, count - self._floor_last_non_pad)
+        self._floor_last_non_pad = count
+        if self._user_audio_active and self._floor_natural_streak > FLOOR_BACKCHANNEL_TOKENS:
+            self._hold_floor_locked("backchannel_limit")
+
     def _maybe_yield_on_overlap_locked(self, chunk_rms: float, inbound_speaking: bool) -> None:
         """Yield only in an opted-in mode; silence hangover is not gentle evidence."""
         mode = getattr(self, "_active_turn_handling", "native")
         if mode != getattr(self, "_barge_tracking_mode", None):
+            self._release_floor_locked("mode_change")
+            self._reset_floor_tracking_locked()
             self._assisted_barge_streak = 0
             self._gentle_barge_quiet_streak = 0
             self._barge_tracking_mode = mode
+        if mode == "floor":
+            self._maybe_hold_floor_locked(chunk_rms, inbound_speaking)
+            return
         eligible = (
             mode in ("assisted", "gentle")
             and inbound_speaking
@@ -4002,7 +4160,7 @@ class ServerState:
                         self._context.persona.clear_active()
                         self._context.end_status = "complete"
                         self._context.hold_remaining = CONTEXT_SEAL_HOLD_FRAMES
-            else:
+            elif getattr(self, "_active_turn_handling", "native") != "floor":
                 # A waiting packet has emitted nothing and needs no seal.
                 # Active packets are abandoned by the preemption block above.
                 self._context.persona.clear_waiting()
@@ -4026,7 +4184,7 @@ class ServerState:
                 # drip cadence stays at one per outer call regardless of
                 # how many Mimi codes a chunk emits.
                 forced_text = None
-                if self._stop_response_latched:
+                if self._stop_response_latched or getattr(self, "_floor_held", False):
                     forced_text = self._forced_text_pad
                 elif inject_token is not None and c == 0:
                     # Row 0 carries the context token; under caption-CFG the
@@ -4154,10 +4312,15 @@ class ServerState:
                 if (
                     not emitted_forced
                     and not emitted_gated
+                    and not getattr(self, "_floor_held", False)
                     and text_token not in (0, 3)
                 ):
-                    _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
-                    text = _text.replace("▁", " ")
+                    event = getattr(self, "_transcript_event_pieces", {}).get(text_token)
+                    if event is not None:
+                        text = f" {event}" if event else None
+                    else:
+                        _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
+                        text = _text.replace("▁", " ")
                 if interrupt_gate:
                     self._interrupt_gate_remaining -= 1
                 results.append((pcm_np, text))
@@ -5130,6 +5293,8 @@ class ServerState:
 
     def _apply_restore_policy_locked(self, intent: RestoreIntent) -> None:
         """Reset abandoned-turn policy after a validated in-place restore."""
+        self._release_floor_locked("rewind")
+        self._reset_floor_tracking_locked()
         # Turn caps and collapse detectors describe the abandoned execution
         # path, not the conversation state being restored. Carrying them over
         # can manufacture an immediate forced-silence edge after rewind.
@@ -5194,6 +5359,7 @@ class ServerState:
                         return
                     restore_snapshot(self.mimi, self.lm_gen, snapshot, self.device)
                     self._apply_restore_policy_locked(intent)
+                    restored["notes_rejection"] = self._reapply_notes_locked()
                     timing["restore_ms"] = (
                         time.perf_counter() - restore_started_at
                     ) * 1000.0
@@ -5211,6 +5377,8 @@ class ServerState:
                     pass
                 raise
             if restored["ok"]:
+                if restored.get("notes_rejection") is not None:
+                    self._send_notes_result(session, restored["notes_rejection"])
                 self._last_rewind_at = time.monotonic()
                 logger.info(
                     "snapshot restore session=%s lock_wait_ms=%.1f "
@@ -5294,6 +5462,97 @@ class ServerState:
             {"status": "requested"},
         )
         clog.log("info", "speech onset requested; conversation state preserved")
+
+    def _normalize_notes(self, text: object) -> tuple[str, list[int]]:
+        note = (
+            " ".join(text.replace("<system>", " ").replace("</system>", " ").split())
+            if isinstance(text, str) else ""
+        )
+        return note, self.text_tokenizer.encode(f" {note}") if note else []
+
+    def _configure_initial_notes_locked(self, text: object) -> dict | None:
+        """Reset NOTES for a fresh session; never retain a rejected draft."""
+        self._active_notes = ""
+        self._active_notes_tokens = []
+        self.lm_gen.notes_tokens = []
+        frames = int(getattr(self.lm_gen, "notes_frames", 0))
+        if frames <= 0:
+            return None
+        note, tokens = self._normalize_notes(text)
+        if len(tokens) > frames - 1:
+            return {"status": "rejected", "reason": "too_long", "max_tokens": frames - 1}
+        self._active_notes, self._active_notes_tokens = note, tokens
+        self.lm_gen.notes_tokens = list(tokens)
+        return None
+
+    @staticmethod
+    def _send_notes_result(session: "RTCSession", data: dict) -> None:
+        applied = data["status"] == "applied"
+        session.send_event(
+            "notes",
+            "Director notes applied" if applied else "Director notes not applied; keep the draft and retry",
+            "ok" if applied else "warn",
+            data,
+        )
+
+    def _reapply_notes_locked(self) -> dict | None:
+        """A restored KV prefix may predate the latest successful NOTES edit."""
+        if not getattr(self.lm_gen, "notes_frames", 0):
+            return None
+        try:
+            self.lm_gen.rewrite_notes(list(self._active_notes_tokens))
+        except NotesUnavailable as exc:
+            reason = "unsupported" if exc.reason == "disabled" else exc.reason
+            return {"status": "rejected", "reason": reason}
+        return None
+
+    async def _handle_set_notes(
+        self,
+        session: "RTCSession",
+        session_id: str,
+        text: object,
+        clog: ColorizedLog,
+        *,
+        warming_up: bool = False,
+    ) -> None:
+        frames = int(getattr(self.lm_gen, "notes_frames", 0))
+        if frames <= 0:
+            self._send_notes_result(session, {"status": "rejected", "reason": "unsupported"})
+            return
+        if warming_up:
+            self._send_notes_result(session, {"status": "rejected", "reason": "warming_up"})
+            return
+        note, tokens = self._normalize_notes(text)
+        if len(tokens) > frames - 1:
+            self._send_notes_result(session, {
+                "status": "rejected", "reason": "too_long", "max_tokens": frames - 1,
+            })
+            return
+
+        def _rewrite() -> dict | None:
+            with self._infer_lock:
+                if session_id != self._active_session_id:
+                    return None
+                try:
+                    self.lm_gen.rewrite_notes(tokens)
+                except NotesUnavailable as exc:
+                    reason = "unsupported" if exc.reason == "disabled" else exc.reason
+                    data = {"status": "rejected", "reason": reason}
+                    if reason == "too_long":
+                        data["max_tokens"] = frames - 1
+                    return data
+                self._active_notes, self._active_notes_tokens = note, list(tokens)
+                return {"status": "applied", "tokens": len(tokens)}
+
+        future = asyncio.get_running_loop().run_in_executor(self._infer_executor, _rewrite)
+        try:
+            result = await asyncio.shield(future)
+        except asyncio.CancelledError:
+            await future
+            raise
+        if result is not None:
+            self._send_notes_result(session, result)
+            clog.log("info", f"director notes {result['status']} ({len(tokens)} tokens)")
 
     async def _handle_context_note(
         self,
@@ -7125,6 +7384,8 @@ class ServerState:
                 lifecycle_receipt["text_prompt_tokens"] = configure_result[
                     "text_prompt_tokens"
                 ]
+                if configure_result.get("notes_rejection") is not None:
+                    self._send_notes_result(session, configure_result["notes_rejection"])
                 if configure_result["voice_description"]:
                     clog.log(
                         "info",
@@ -7889,6 +8150,8 @@ class ServerState:
                                     if session_id != self._active_session_id:
                                         return
                                     if self._active_turn_handling != turn_handling_update:
+                                        self._release_floor_locked("mode_change")
+                                        self._reset_floor_tracking_locked()
                                         self._active_turn_handling = turn_handling_update
                                         self._barge_tracking_mode = None
                                         self._assisted_barge_streak = 0
@@ -8051,6 +8314,11 @@ class ServerState:
                             task,
                             live_source=not historical_detail,
                         )
+                elif mtype == "set_notes":
+                    await self._handle_set_notes(
+                        session, session_id, msg.get("text"), clog,
+                        warming_up=not warmup_done.is_set(),
+                    )
                 elif mtype == "context_note":
                     if not warmup_done.is_set():
                         session.send_event(
@@ -8286,12 +8554,17 @@ class ServerState:
                 # would wipe it.
                 warmup_done.set()
             else:
-                phases = (
-                    ("voice_prompt", self.lm_gen._step_voice_prompt, (self.mimi,)),
-                    ("audio_silence_a", self.lm_gen._step_audio_silence, ()),
-                    ("text_prompt", self.lm_gen._step_text_prompt, ()),
-                    ("audio_silence_b", self.lm_gen._step_audio_silence, ()),
-                )
+                if getattr(self.lm_gen, "batched_prefill", False):
+                    phases = (("system_prompts", self.lm_gen.prefill_system_prompts, (self.mimi,)),)
+                else:
+                    phases = (
+                        ("voice_prompt", self.lm_gen._step_voice_prompt, (self.mimi,)),
+                        ("audio_silence_a", self.lm_gen._step_audio_silence, ()),
+                        ("text_prompt", self.lm_gen._step_text_prompt, ()),
+                        ("audio_silence_b", self.lm_gen._step_audio_silence, ()),
+                    )
+                    if getattr(self.lm_gen, "notes_frames", 0):
+                        phases += (("notes_prompt", self.lm_gen._step_notes_prompt, ()),)
                 warmup_aborted = False
                 for phase_name, phase_fn, phase_args in phases:
                     if not session.is_alive():
@@ -8304,7 +8577,8 @@ class ServerState:
                     phase_started = time.monotonic()
                     in_flight = asyncio.ensure_future(
                         loop.run_in_executor(
-                            self._infer_executor, phase_fn, *phase_args
+                            self._infer_executor, self._run_prompt_phase_locked,
+                            phase_fn, *phase_args,
                         )
                     )
                     try:
@@ -8315,9 +8589,10 @@ class ServerState:
                         except BaseException:
                             pass
                         raise
-                    if phase_name == "voice_prompt":
+                    if phase_name in ("voice_prompt", "system_prompts"):
                         lifecycle_receipt["voice_prompt_frames"] = phase_result
-                    lifecycle_receipt[f"{phase_name}_complete"] = True
+                    for field in PROMPT_PHASE_RECEIPT_FIELDS[phase_name]:
+                        lifecycle_receipt[field] = True
                     clog.log(
                         "info",
                         f"timing: prompt phase {phase_name} "
@@ -8859,13 +9134,9 @@ def _get_voice_prompt_dir(
 
     # Try to download voices.tgz, but it's optional
     try:
-        voices_tgz = hf_hub_download(
-            hf_repo,
-            "voices.tgz",
-            token=hf_token,
-            revision=hf_revision,
+        voices_tgz, _, _ = loaders.download_voice_archive(
+            hf_repo, hf_revision, hf_token,
         )
-        voices_tgz = Path(voices_tgz)
         voices_dir = voices_tgz.parent / "voices"
 
         if not voices_dir.exists():
@@ -9299,6 +9570,37 @@ def main():
         )
     text_tokenizer = sentencepiece.SentencePieceProcessor(args.tokenizer)  # type: ignore
 
+    memory_spec = loaders.load_memory_spec(
+        None if local_moshi_weight is not None else args.hf_repo,
+        args.hf_revision,
+        hf_token,
+    )
+    if memory_spec is not None:
+        # Pin the largest prefix the checkpoint accepts: voice (CharacterPlex
+        # trained on 50-70 frames), two silence holds, a full card, the NOTES
+        # slot and its PAD flush frame. A NOTES slot past the sink can no
+        # longer be rewritten once the ring wraps.
+        memory_sink = (
+            MEMORY_VOICE_FRAMES
+            + 2 * memory_spec.silence_frames
+            + memory_spec.card_max_tokens
+            + memory_spec.notes_frames
+            + 1
+        )
+        if args.kv_sink_frames < memory_sink:
+            logger.info(
+                "memory conditioning raises attention sink from %d to %d frames",
+                args.kv_sink_frames,
+                memory_sink,
+            )
+            args.kv_sink_frames = memory_sink
+    audio_silence_frames = int(0.5 * mimi.frame_rate)
+    if memory_spec is not None and memory_spec.silence_frames != audio_silence_frames:
+        logger.warning(
+            "memory spec silence_frames=%d differs from runtime audio silence=%d",
+            memory_spec.silence_frames, audio_silence_frames,
+        )
+
     logger.info("loading moshi")
     if args.moshi_weight is None:
         args.moshi_weight = hf_hub_download(
@@ -9333,7 +9635,9 @@ def main():
         logger.warning(f"could not resolve text_padding_token_id: {e}")
     
     lm_gen = LMGen(lm,
-                        audio_silence_frame_cnt=int(0.5 * mimi.frame_rate),
+                        audio_silence_frame_cnt=audio_silence_frames,
+                        notes_frames=memory_spec.notes_frames if memory_spec else 0,
+                        batched_prefill=_environment_flag("PERSONAPLEX_BATCHED_PREFILL", False),
                         sample_rate=mimi.sample_rate,
                         device=args.device,
                         frame_rate=mimi.frame_rate,

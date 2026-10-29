@@ -321,14 +321,16 @@ export const PARAM_INFO = {
     title: "Turn handling",
     body: (
       <>
-        <b>Native duplex</b> is the default: the model handles yielding,
+        <b>Native duplex</b> is the RL default: the model handles yielding,
         overlap, and backchannels without automatic interruption.
         <b> Gentle yield</b> adds a server-only stop after about <b>1.2 s</b>
         of sustained user audio overlapping assistant audio. Brief pauses
         do not count toward that duration, and the browser sends no
         automatic stop in this mode. <b>Assisted</b> reacts faster to brief
-        overlap, using browser and server interruption. Choose before
-        connecting or switch live. Manual Stop remains available in all modes.
+        overlap, using browser and server interruption. <b>Floor</b> is the
+        CharacterPlex default: holds the assistant silent while you speak,
+        allowing short backchannels. Choose before connecting or switch
+        live. Manual Stop remains available in all modes.
       </>
     ),
   },

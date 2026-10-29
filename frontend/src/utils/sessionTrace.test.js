@@ -453,3 +453,34 @@ describe("session trace collapse observability", () => {
     expect(JSON.stringify(report)).not.toContain(SECRET.transcript);
   });
 });
+
+describe("CharacterPlex trace privacy", () => {
+  test("cards and notes remain private even when conversational content is included", async () => {
+    const trace = createSessionTrace();
+    const config = { text_prompt: "private-character-card", notes: "private-director-notes" };
+    trace.setRequestedConfig(config);
+    trace.record("config.sent", { config });
+    trace.setAppliedConfig({ system_prompt: "private-wrapped-character-card", text_prompt_tokens: 125 });
+    trace.record("server.config_applied", { config: { system_prompt: "private-wrapped-character-card" } });
+    trace.record("server.event.notes", {
+      type: "event", kind: "notes", text: "private-director-notes",
+      data: { status: "rejected", reason: "too_long", max_tokens: 63 },
+    });
+    const report = await trace.toReportAsync({ includeContent: true });
+    const json = JSON.stringify(report);
+    expect(json).not.toContain("private-character-card");
+    expect(json).not.toContain("private-wrapped-character-card");
+    expect(json).not.toContain("private-director-notes");
+    expect(report.config.requested.text_prompt_chars).toBe(config.text_prompt.length);
+    expect(report.config.applied.text_prompt_tokens).toBe(125);
+    expect(report.events.at(-1).data.data).toEqual({ status: "rejected", reason: "too_long", max_tokens: 63 });
+  });
+
+  test("raw notes commands never retain content and floor events keep only fixed actions", () => {
+    expect(sanitizeTraceData({ type: "set_notes", text: "private-note" }, { includeContent: true })).toEqual({});
+    expect(sanitizeTraceData({ notes: "private-note", card: "private-card", initialNotes: "private-initial-note" }, { includeContent: true })).toEqual({});
+    expect(sanitizeTraceData({ action: "hold", reason: "backchannel_limit" })).toEqual({ action: "hold", reason: "backchannel_limit" });
+    expect(sanitizeTraceData({ action: "release", reason: "user_turn_end" })).toEqual({ action: "release", reason: "user_turn_end" });
+    expect(sanitizeTraceData({ action: "private-action" })).toEqual({ action: "other" });
+  });
+});

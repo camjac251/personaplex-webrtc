@@ -32,6 +32,7 @@ from moshi.rtc_session import (
 from moshi.recovery import RestoreIntent
 from moshi.runtime_metrics import RuntimeMetrics
 from moshi.server import (
+    PROMPT_PHASE_RECEIPT_FIELDS,
     TEXT_STARVED_MIN_FRAMES,
     TEXT_STARVED_RMS_FLOOR,
     ServerState,
@@ -700,6 +701,35 @@ def test_lifecycle_receipt_starts_with_fixed_empty_priming_state() -> None:
     }
 
 
+def test_every_priming_phase_completes_a_sendable_receipt() -> None:
+    class _Control:
+        readyState = "open"
+
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        def send(self, payload: str) -> None:
+            self.sent.append(payload)
+
+    # Per-frame priming (with the NOTES phase) and batched priming must both
+    # end in a receipt RTCSession accepts with every segment complete.
+    for phases in (
+        ("voice_prompt", "audio_silence_a", "text_prompt", "audio_silence_b", "notes_prompt"),
+        ("system_prompts",),
+    ):
+        receipt = _new_lifecycle_receipt(resuming=False)
+        for phase in phases:
+            for field in PROMPT_PHASE_RECEIPT_FIELDS[phase]:
+                receipt[field] = True
+        receipt.update(text_prompt_tokens=12, voice_prompt_frames=50,
+                       processing_started=True, ready_sent=True)
+        session = RTCSession.__new__(RTCSession)
+        session._control = _Control()
+        session.send_lifecycle_receipt(**receipt)
+        assert len(session._control.sent) == 1, phases
+
+
+
 def test_lifecycle_receipt_rejects_incomplete_startup() -> None:
     class _Control:
         readyState = "open"
@@ -912,6 +942,8 @@ async def test_transport_death_without_goodbye_records_resume_grant() -> None:
     state._session_snapshots = {"session": ["snapshot"]}
     state._session_bookmarks = {"session": ["bookmark"]}
     state._schedule_resume_grant_expiry = lambda _grant: None
+    state._active_notes = "Latest instruction"
+    state._active_notes_tokens = [8, 9]
     cfg = object()
 
     recorded = state._maybe_record_resume_grant(
@@ -931,6 +963,8 @@ async def test_transport_death_without_goodbye_records_resume_grant() -> None:
     assert state._resume_grant["cfg"] is cfg
     assert state._resume_grant["snapshots"] == ["snapshot"]
     assert state._resume_grant["bookmarks"] == ["bookmark"]
+    assert state._active_notes == "Latest instruction"
+    assert state._active_notes_tokens == [8, 9]
 
 
 class _EventSession:
@@ -1037,8 +1071,184 @@ async def test_cancelled_session_lock_waiter_cannot_orphan_lock() -> None:
     assert not state.lock.locked()
 
 
+def _notes_state():
+    from types import SimpleNamespace
+    from moshi.context import ContextLifecycle
+    from moshi.models.lm import LMGen, NotesUnavailable
+    from moshi.models.lm_controls import LMControlState
+
+    state = ServerState.__new__(ServerState)
+    state._infer_lock = threading.Lock()
+    event_thread = threading.get_ident()
+
+    class NotesLM:
+        notes_frames = 4
+        notes_start = 100
+        max_delay = 1
+        cfg_gamma = cfg_gamma_floor = 1.0
+        failure = None
+        reset_turn_cap_accounting = LMGen.reset_turn_cap_accounting
+        reset_turn_cap_tracking = LMGen.reset_turn_cap_tracking
+        cancel_speech = LMGen.cancel_speech
+
+        def __init__(self):
+            self.controls = LMControlState()
+            self.notes_tokens = []
+            self.cache = []
+            self.rewrites = []
+
+        def rewrite_notes(self, tokens):
+            assert threading.get_ident() != event_thread
+            assert state._infer_lock.locked()
+            if self.failure:
+                raise NotesUnavailable(self.failure)
+            self.notes_tokens = list(tokens)
+            self.cache = list(tokens)
+            self.rewrites.append(list(tokens))
+
+        def validate_streaming_state(self, snapshot):
+            assert isinstance(snapshot["notes"], list)
+
+        def set_streaming_state_inplace(self, snapshot):
+            assert state._infer_lock.locked()
+            self.cache = list(snapshot.pop("notes"))
+
+    state.lm_gen = NotesLM()
+    state.mimi = NotesLM()
+    encoded = []
+
+    def encode(text):
+        encoded.append(text)
+        return list(range(10, 10 + len(text.split())))
+
+    state.text_tokenizer = SimpleNamespace(encode=encode)
+    state._active_session_id = "session"
+    state._active_notes = ""
+    state._active_notes_tokens = []
+    state._context = ContextLifecycle(32, 8.0)
+    state._pending_text_flags = deque()
+    state._collapse_triggers = deque()
+    state._main_loop = None
+    state._active_session = None
+    state._stop_response_latched = False
+    state._interrupt_gate_remaining = 0
+    state._reset_floor_tracking_locked()
+    state.asr = None
+    state._apply_auto_recovery_tuning_locked = lambda: None
+    state._applied_config_snapshot = lambda: {}
+    return state, encoded
+
+
+def _notes_session():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    events = []
+    session = SimpleNamespace(
+        send_event=lambda kind, text, level, data: events.append({
+            "type": "event", "kind": kind, "text": text, "level": level, "data": data,
+        }),
+        pause_and_flush_audio=AsyncMock(return_value=7),
+        resume_audio=Mock(), send_inject_status=Mock(),
+        send_context_status=Mock(), send_config_applied=Mock(),
+    )
+    return session, events
+
+
+def test_initial_notes_normalize_reject_and_reset() -> None:
+    state, encoded = _notes_state()
+    with state._infer_lock:
+        assert state._configure_initial_notes_locked(" <system> one \n two </system> ") is None
+        assert encoded[-1] == " one two"
+        assert state._active_notes == "one two"
+        assert state.lm_gen.notes_tokens == [10, 11]
+        assert state._configure_initial_notes_locked("one two three four") == {
+            "status": "rejected", "reason": "too_long", "max_tokens": 3,
+        }
+        assert state._active_notes == "" and state.lm_gen.notes_tokens == []
+        assert state._configure_initial_notes_locked("new") is None
+        assert state._configure_initial_notes_locked("") is None
+        assert state._active_notes_tokens == [] and state.lm_gen.notes_tokens == []
+        state.lm_gen.notes_frames = 0
+        before = list(encoded)
+        assert state._configure_initial_notes_locked("ignored") is None
+        assert encoded == before
+
+
+async def test_set_notes_protocol_and_executor_ownership() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    state, encoded = _notes_state()
+    session, events = _notes_session()
+    clog = _RecordingClog()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        state._infer_executor = executor
+        await state._handle_set_notes(session, "session", "<system> one  two </system>", clog)
+        assert events[-1]["data"] == {"status": "applied", "tokens": 2}
+        assert events[-1]["type"] == "event" and events[-1]["kind"] == "notes"
+        assert events[-1]["level"] == "ok"
+        assert encoded[-1] == " one two"
+        assert state._active_notes == "one two"
+        assert state.lm_gen.cache == [10, 11]
+        await state._handle_set_notes(session, "session", "one two three four", clog)
+        assert events[-1]["data"] == {"status": "rejected", "reason": "too_long", "max_tokens": 3}
+        assert events[-1]["level"] == "warn"
+        assert state._active_notes == "one two"
+        for reason in ("evicted", "not_primed", "disabled", "too_long"):
+            state.lm_gen.failure = reason
+            await state._handle_set_notes(session, "session", "replacement", clog)
+            expected = "unsupported" if reason == "disabled" else reason
+            assert events[-1]["data"]["reason"] == expected
+            assert state._active_notes == "one two"
+        state.lm_gen.failure = None
+        await state._handle_set_notes(session, "session", "replacement", clog, warming_up=True)
+        assert events[-1]["data"] == {"status": "rejected", "reason": "warming_up"}
+        await state._handle_set_notes(session, "session", "", clog)
+        assert events[-1]["data"] == {"status": "applied", "tokens": 0}
+        assert state._active_notes == "" and state.lm_gen.cache == []
+        state.lm_gen.notes_frames = 0
+        await state._handle_set_notes(session, "session", "unsupported", clog)
+        assert events[-1]["data"] == {"status": "rejected", "reason": "unsupported"}
+        assert all("one two" not in item["text"] for item in events)
+        assert all("one two" not in line for line in clog.lines)
+
+
+async def test_notes_reapply_after_manual_auto_and_voice_restores() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    import torch
+
+    state, _ = _notes_state()
+    state.device = torch.device("cpu")
+    session, events = _notes_session()
+    snapshot = {
+        "version": 2, "lm": {"notes": [99]}, "mimi": {"notes": []},
+        "rng_cpu": torch.get_rng_state().clone(), "rng_cuda": None,
+    }
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        state._infer_executor = executor
+        await state._handle_set_notes(session, "session", "latest notes", _RecordingClog())
+        for intent in RestoreIntent:
+            assert await state._restore_session_snapshot(
+                session, "session", snapshot, intent=intent,
+            )
+            assert state.lm_gen.cache == [10, 11]
+            assert state._active_notes == "latest notes"
+            assert snapshot["lm"]["notes"] == [99]
+            session.resume_audio.assert_called_with(7)
+        assert len(state.lm_gen.rewrites) == 4
+        state.lm_gen.failure = "evicted"
+        assert await state._restore_session_snapshot(
+            session, "session", snapshot, intent=RestoreIntent.MANUAL,
+        )
+        assert events[-1]["data"] == {"status": "rejected", "reason": "evicted"}
+        assert state._active_notes == "latest notes"
+
+
 if __name__ == "__main__":
     tests = [
+        test_initial_notes_normalize_reject_and_reset,
+        test_set_notes_protocol_and_executor_ownership,
+        test_notes_reapply_after_manual_auto_and_voice_restores,
         test_stale_queued_generation_is_discarded,
         test_in_flight_result_is_discarded_across_pause,
         test_stop_processing_freezes_and_drains_in_flight_model_work,

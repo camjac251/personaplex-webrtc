@@ -89,6 +89,10 @@ def apply_rope(
     return qo.view(*dims, D), ko.view(*dims, D)
 
 
+# Compiled: the sink re-rotation runs on every live step over every anchor
+# slot of every layer, and the eager float32 version's temporaries cost
+# tens of milliseconds per frame once the sink reaches ~1000 frames.
+@torch_compile_lazy
 def shift_rope(
     k: torch.Tensor,
     delta: torch.Tensor,

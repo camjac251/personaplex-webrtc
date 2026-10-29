@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { fetchIceServers, fetchVoiceList } from "./api/rtc.js";
+import { CharacterCard } from "./components/CharacterCard.jsx";
+import { DirectorNotes } from "./components/DirectorNotes.jsx";
 import { Info, Listbox, ToggleRow, MiniSlider } from "./components/Controls.jsx";
 import { PreflightModal, VisionSourceModal, FrameModal } from "./components/Modals.jsx";
 import { Badge, Flow, Level, RailColumn, Row, RTTGraph, Scope, TelemetryCell, VuMeter } from "./components/Telemetry.jsx";
@@ -30,6 +32,7 @@ import {
   VOICES,
 } from "./data/dashboardData.jsx";
 import { useContextNoteSubmission } from "./hooks/useContextNoteSubmission.js";
+import { useDirectorNotes } from "./hooks/useDirectorNotes.js";
 import { useStoredState } from "./hooks/useStoredState.js";
 import { useToast } from "./hooks/useToast.js";
 import { rmsFromAnalyser } from "./utils/audio.js";
@@ -210,15 +213,21 @@ const ASSISTED_MODEL_DEFAULTS = {
   ...DEFAULTS,
   turnHandling: "assisted",
 };
+const CHARACTERPLEX_MODEL_DEFAULTS = {
+  ...DEFAULTS,
+  turnHandling: "floor",
+};
 
 function defaultsForModel(variant, nativeDuplexRecommended = null) {
   if (variant === "base") return BASE_MODEL_DEFAULTS;
+  if (variant === "characterplex") return CHARACTERPLEX_MODEL_DEFAULTS;
   if (variant === "rl-seamless" || nativeDuplexRecommended === true) return DEFAULTS;
   if (variant) return ASSISTED_MODEL_DEFAULTS;
   return DEFAULTS;
 }
 
 function recommendedTurnHandlingForModel(variant, nativeDuplexRecommended = null) {
+  if (variant === "characterplex") return "floor";
   return variant === "rl-seamless" || nativeDuplexRecommended === true
     ? "native"
     : "assisted";
@@ -265,6 +274,11 @@ const TURN_HANDLING_MODES = [
     id: "assisted",
     label: "Assisted",
     desc: "Faster interruption: the browser or server stops the assistant after a brief overlap.",
+  },
+  {
+    id: "floor",
+    label: "Floor",
+    desc: "Holds the assistant silent while you speak, allowing short backchannels.",
   },
 ];
 
@@ -331,6 +345,9 @@ function mergeServerInfo(info, message) {
     modelVariant: typeof message.model_variant === "string" ? message.model_variant : info.modelVariant,
     modelLicense: typeof message.model_license === "string" ? message.model_license : info.modelLicense,
     visionModel: typeof message.vision_model === "string" ? message.vision_model : info.visionModel,
+    notesFrames: Number.isFinite(message.process_flags?.notes_frames)
+      ? Math.max(0, Math.floor(message.process_flags.notes_frames))
+      : info.notesFrames,
     nativeDuplexRecommended:
       typeof message.native_duplex_recommended === "boolean"
         ? message.native_duplex_recommended
@@ -538,6 +555,7 @@ function App() {
   const [customProfiles, setCustomProfiles] = useStoredState("pp_customSessionProfiles", [], parseStoredArray, JSON.stringify);
   const [pinnedTuning, setPinnedTuning] = useStoredState("pp_pinnedTuningProfile", null, parseStoredObject, JSON.stringify);
   const [textPrompt, setTextPrompt] = useStoredState("pp_textPrompt", DEFAULT_PERSONA_PRESET.prompt);
+  const [initialNotes, setInitialNotes] = useStoredState("pp_initialNotes", "");
   const [visionPrompt, setVisionPrompt] = useStoredState("pp_visionPrompt", DEFAULT_VISION_PROMPT);
   const [voice, setVoice] = useStoredState("pp_voicePrompt", "NATF1");
   const [voiceGender, setVoiceGender] = useState("F");
@@ -652,6 +670,7 @@ function App() {
     modelLicense: "",
     visionModel: "",
     nativeDuplexRecommended: null,
+    notesFrames: 0,
   });
   const modelDefaults = defaultsForModel(
     serverInfo.modelVariant,
@@ -907,6 +926,11 @@ function App() {
     onNotice: addNotice,
   });
   const { receive: receiveContextNote, disconnect: disconnectContextNote } = contextNote;
+  const directorNotes = useDirectorNotes({
+    enabled: serverInfo.notesFrames > 0 && phase === "live" && !reconnecting,
+    sendCommand: sessionLifecycleRef.current.sendCommand,
+  });
+  const { receive: receiveDirectorNotes, disconnect: disconnectDirectorNotes } = directorNotes;
 
   const recordRttSample = useCallback((rtt) => {
     if (!(rtt > 0)) return;
@@ -1192,6 +1216,7 @@ function App() {
       desc: `${PERSONA_PRESETS.find((item) => item.id === presetId)?.label || "Custom persona"} · ${uploadedVoiceFilename ? "uploaded voice" : voice}`,
       presetId,
       textPrompt,
+      initialNotes,
       voice,
       turnHandling,
       textTemp: Number(textTemp),
@@ -1238,6 +1263,7 @@ function App() {
     seed,
     seedRandom,
     textPrompt,
+    initialNotes,
     textTemp,
     textTopk,
     turnHandling,
@@ -1286,6 +1312,7 @@ function App() {
       setPresetId(preset.id);
       setTextPrompt(preset.prompt);
     }
+    setInitialNotes(typeof profile.initialNotes === "string" ? profile.initialNotes : "");
     if (uploadedVoiceFilename) {
       addNotice(
         "warn",
@@ -1394,6 +1421,7 @@ function App() {
     setSemanticTempCap,
     setTextMinP,
     setTextPrompt,
+    setInitialNotes,
     setTextTemp,
     setTextTopk,
     setTurnHandling,
@@ -1460,6 +1488,7 @@ function App() {
       // preset path ignores it.
       clone_strength: uploadedVoiceFilename ? Number(cloneStrength) / 100 : 1.0,
       text_prompt: textPrompt || "",
+      ...(serverInfo.notesFrames > 0 ? { notes: initialNotes } : {}),
       // An empty value delegates the canonical default to the server and
       // avoids appending a browser copy as additional observation focus.
       vision_prompt:
@@ -1502,6 +1531,8 @@ function App() {
     blendMix,
     cloneStrength,
     textPrompt,
+    initialNotes,
+    serverInfo.notesFrames,
     visionPrompt,
     visionPromptReplace,
     visionInTranscript,
@@ -1596,6 +1627,7 @@ function App() {
     setSessionProfileId(allSessionProfiles.some((item) => item.id === profile?.session_profile_id) ? profile.session_profile_id : "custom");
     setPresetId(preset ? preset.id : "custom");
     setTextPrompt(text);
+    if (typeof config.notes === "string") setInitialNotes(config.notes);
     if (typeof config.vision_prompt === "string") setVisionPrompt(config.vision_prompt);
     setVisionPromptReplace(!!config.vision_prompt_replace);
     setVisionInTranscript(!!config.vision_in_transcript);
@@ -1706,7 +1738,7 @@ function App() {
     const interval = readNumber(profile?.vision?.interval_ms, visionIntervalMs);
     if (interval >= 1000 && interval <= 30000) setVisionIntervalMs(interval);
     setVisionCostLimitUsd(Math.max(0, readNumber(profile?.vision?.cost_limit_usd, visionCostLimitUsd)));
-  }, [addNotice, allSessionProfiles, clearUploadedVoice, cloneStrength, textPrompt, uploadedVoiceFilename, visionCostLimitUsd, visionIntervalMs, voiceList, setAudioTemp, setTextTemp, setTextTopk, setTextMinP, setAudioTopk, setSemanticTempCap, setCaptionCfgGamma, setPersonaCfgGamma, setRepPenalty, setRepContext, setPadBonus, setTurnOnsetBias, setMaxTurn, setInjectSilenceRms, setInjectSilenceStreak, setSeedRandom, setSeed, setIdleTimeout, setTextPrompt, setVisionPrompt, setVisionPromptReplace, setVisionInTranscript, setVisionReactionMode, setReinforceInSilences, setVoice, setVoiceBlend, setVoiceB, setBlendMix, setCloneStrength, setEchoCancel, setNoiseSupp, setAutoGain, setOutputDeviceId, setTurnHandling, setVisionIntervalMs, setVisionCostLimitUsd]);
+  }, [addNotice, allSessionProfiles, clearUploadedVoice, cloneStrength, textPrompt, uploadedVoiceFilename, visionCostLimitUsd, visionIntervalMs, voiceList, setAudioTemp, setTextTemp, setTextTopk, setTextMinP, setAudioTopk, setSemanticTempCap, setCaptionCfgGamma, setPersonaCfgGamma, setRepPenalty, setRepContext, setPadBonus, setTurnOnsetBias, setMaxTurn, setInjectSilenceRms, setInjectSilenceStreak, setSeedRandom, setSeed, setIdleTimeout, setTextPrompt, setInitialNotes, setVisionPrompt, setVisionPromptReplace, setVisionInTranscript, setVisionReactionMode, setReinforceInSilences, setVoice, setVoiceBlend, setVoiceB, setBlendMix, setCloneStrength, setEchoCancel, setNoiseSupp, setAutoGain, setOutputDeviceId, setTurnHandling, setVisionIntervalMs, setVisionCostLimitUsd]);
 
   const exportConfig = useCallback(() => {
     const profile = JSON.stringify(buildConfigProfile(), null, 2);
@@ -2054,6 +2086,7 @@ function App() {
   // so a fresh-pc reconnect can rebind without losing the session.
   const teardownTransport = useCallback(() => {
     disconnectContextNote();
+    disconnectDirectorNotes();
     sessionLifecycleRef.current.disposeTransport();
     pendingCandidatesRef.current = [];
     if (aiAudioRef.current) {
@@ -2080,7 +2113,7 @@ function App() {
     // connection buffer until its answer arrives instead of being posted
     // against the dead session.
     sessionIdRef.current = null;
-  }, [disconnectContextNote]);
+  }, [disconnectContextNote, disconnectDirectorNotes]);
 
   const cleanup = useCallback(
     (options = {}) => {
@@ -2629,6 +2662,18 @@ function App() {
           const notice = receiveContextNote(message.data || {});
           if (notice) ({ text, level } = notice);
         }
+        if (message.kind === "notes") {
+          const notice = receiveDirectorNotes(message.data || {});
+          if (notice) ({ text, level } = notice);
+          else text = "Director notes status updated";
+        }
+        if (message.kind === "floor") {
+          text = message.data?.action === "hold"
+            ? "Floor held: assistant is listening"
+            : message.data?.action === "release"
+              ? "Floor released: assistant may respond"
+              : "Floor status updated";
+        }
         if (message.kind === "speak") {
           const data = message.data || {};
           if (data.status === "requested") {
@@ -2729,7 +2774,7 @@ function App() {
         setStageMessage("Session complete");
       }
     },
-    [addNotice, attachAudioGraph, cleanup, pulseInterrupt, receiveContextNote, recordRttSample, recordTrace, startRecording, stopVision, toast],
+    [addNotice, attachAudioGraph, cleanup, pulseInterrupt, receiveContextNote, receiveDirectorNotes, recordRttSample, recordTrace, startRecording, stopVision, toast],
   );
 
 
@@ -4453,7 +4498,9 @@ function App() {
     ? "RL Seamless"
     : serverInfo.modelVariant === "base"
       ? "Base"
-      : serverInfo.modelLabel || "Detecting";
+      : serverInfo.modelVariant === "characterplex"
+        ? "CharacterPlex"
+        : serverInfo.modelLabel || "Detecting";
   const gpuValue = (() => {
     if (!isLive) return "idle";
     const parts = [];
@@ -4733,11 +4780,22 @@ function App() {
                   else applyPreset(value);
                 }}
               />
+              {serverInfo.notesFrames > 0 && (
+                <CharacterCard
+                  currentPrompt={textPrompt}
+                  sessionActive={phase !== "idle"}
+                  onApply={(card) => {
+                    setTextPrompt(card);
+                    setPresetId("custom");
+                    setSessionProfileId("custom");
+                  }}
+                />
+              )}
               <div style={{ height: 8 }} />
               <textarea
                 aria-label="System prompt"
                 value={textPrompt}
-                maxLength={2000}
+                maxLength={serverInfo.notesFrames > 0 ? undefined : 2000}
                 onChange={(event) => {
                   setTextPrompt(event.target.value);
                   setPresetId("custom");
@@ -4756,9 +4814,12 @@ function App() {
                   >
                     Reset
                   </button>
-                  <span>{textPrompt.length} / 2000</span>
+                  <span>{textPrompt.length}{serverInfo.notesFrames > 0 ? ` chars · ~${Math.ceil(textPrompt.length / 4)} tok` : " / 2000"}</span>
                 </span>
               </div>
+              {serverInfo.notesFrames > 0 && textPrompt.length > 3600 && (
+                <p className="context-note-error" role="status">Above ~900 tokens. Consider shortening the startup prompt.</p>
+              )}
               <details className="prompt-preview">
                 <summary>
                   <span className="prompt-preview-copy">
@@ -5509,9 +5570,9 @@ function App() {
                 )}
                 {speaking === "both" && !visionInjecting && !interrupting && (
                   <div className="viz-inject barge">
-                    <span className="d" /> {turnHandling === "native" ? "Native overlap" : turnHandling === "gentle" ? "Gentle overlap" : "Barge-in"}{" "}
+                    <span className="d" /> {turnHandling === "native" ? "Native overlap" : turnHandling === "gentle" ? "Gentle overlap" : turnHandling === "floor" ? "Floor gate" : "Barge-in"}{" "}
                     <span className="gate">
-                      {turnHandling === "native" ? "model handling duplex" : turnHandling === "gentle" ? "server checks sustained speech" : "user took the turn"}
+                      {turnHandling === "native" ? "model handling duplex" : turnHandling === "gentle" ? "server checks sustained speech" : turnHandling === "floor" ? "server protects your turn" : "user took the turn"}
                     </span>
                   </div>
                 )}
@@ -5592,6 +5653,17 @@ function App() {
                     )
                   )}
                 </div>
+                {serverInfo.notesFrames > 0 && (
+                  <DirectorNotes
+                    notes={directorNotes}
+                    initialNotes={initialNotes}
+                    onInitialNotesChange={(value) => {
+                      setInitialNotes(value);
+                      setSessionProfileId("custom");
+                    }}
+                    notesFrames={serverInfo.notesFrames}
+                  />
+                )}
                 {isLive && (
                   <form
                     className="context-note-row"

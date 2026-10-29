@@ -34,6 +34,8 @@ REQUIRED_PROCESS_FLAGS = {
     "snapshot_host_budget_bytes": int,
     "snapshot_host_free_floor_bytes": int,
     "depformer_early_exit": int,
+    "notes_frames": int,
+    "batched_prefill": bool,
 }
 REQUIRED_MEASUREMENT_PATHS = (
     "runtime.rtf_ema_p95",

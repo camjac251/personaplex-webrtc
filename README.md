@@ -10,6 +10,7 @@ PersonaPlex is a real-time, full-duplex speech-to-speech model with persona cont
 
 - **Model and research**: NVIDIA PersonaPlex team. All credit for the core AI belongs to the original authors. See [NVIDIA/personaplex](https://github.com/NVIDIA/personaplex).
 - **Interactivity post-training**: Kyutai and Gradium. The default checkpoint is [kyutai/personaplex-rl-seamless](https://huggingface.co/kyutai/personaplex-rl-seamless), trained for pause handling, turn-taking, backchanneling, and interruption behavior.
+- **Character fine-tune (optional)**: [utkarshUY/CharacterPlex-FullFT-v4](https://huggingface.co/utkarshUY/CharacterPlex-FullFT-v4), a full fine-tune of NVIDIA PersonaPlex for character role-play with director notes. Its pinned-memory runtime is private; this repo's NOTES slot and Floor gate are reconstructions.
 - **Windows-installer fork this repo branched from**: [Suresh Pydikondala (SurAiverse)](https://www.youtube.com/@suraiverse).
 
 ## Requirements
@@ -23,7 +24,7 @@ PersonaPlex is a real-time, full-duplex speech-to-speech model with persona cont
 
 ### 1. HuggingFace token
 
-Create a **Read** token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) and accept the gated license at [kyutai/personaplex-rl-seamless](https://huggingface.co/kyutai/personaplex-rl-seamless). The RL checkpoint combines CC BY-NC 4.0 with the NVIDIA Open Model License and is non-commercial. To use the base-model rollback, also accept [nvidia/personaplex-7b-v1](https://huggingface.co/nvidia/personaplex-7b-v1).
+Create a **Read** token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) and accept the gated license at [kyutai/personaplex-rl-seamless](https://huggingface.co/kyutai/personaplex-rl-seamless). The RL checkpoint combines CC BY-NC 4.0 with the NVIDIA Open Model License and is non-commercial. To use the base-model rollback, also accept [nvidia/personaplex-7b-v1](https://huggingface.co/nvidia/personaplex-7b-v1). The optional [CharacterPlex](https://huggingface.co/utkarshUY/CharacterPlex-FullFT-v4) checkpoint is a research-only fine-tune of the NVIDIA base trained on non-commercial data; it uses the NVIDIA voice presets, so it also needs the NVIDIA license accepted.
 
 ### 2. Install and build
 
@@ -38,7 +39,7 @@ bun run frontend:build           # builds the dashboard into moshi/moshi/web_cli
 
 ### 3. Prefetch model and voice assets (optional)
 
-The server downloads the checkpoint on first launch, but prefetching makes the first session instant. The prefetch script resolves the repository and pinned revision from `PERSONAPLEX_MODEL` (`rl-seamless` default, or `base`):
+The server downloads the checkpoint on first launch, but prefetching makes the first session instant. The prefetch script resolves the repository and pinned revision from `PERSONAPLEX_MODEL` (`rl-seamless` default, `base`, or `characterplex`). A checkpoint without its own `voices.tgz` (CharacterPlex) gets the voice presets from the pinned NVIDIA base revision:
 
 ```bash
 uv run python scripts/prefetch_assets.py --voice-dir voices
@@ -59,7 +60,7 @@ First boot downloads the 16.7 GB model plus tokenizer and voice assets; expect 3
 
 When the log prints `serving static content from`, open `http://<public-ip>:8998/` in a browser. Click **Start**, allow microphone access, and speak.
 
-The dashboard reports the active repository, revision, and license. Checkpoint selection stays at startup because hot-swapping an 8B model would discard CUDA graphs, snapshots, and the live conversation. Restart with `PERSONAPLEX_MODEL=base` for A/B comparisons. On a fresh browser, the base selection also restores Assisted overlap handling, audio temperature `0.7`, and repetition penalty `1.15`; saved user tuning remains untouched.
+The dashboard reports the active repository, revision, and license. Checkpoint selection stays at startup because hot-swapping an 8B model would discard CUDA graphs, snapshots, and the live conversation. Restart with `PERSONAPLEX_MODEL=base` for A/B comparisons. On a fresh browser, the base selection also restores Assisted overlap handling, audio temperature `0.7`, and repetition penalty `1.15`, and the CharacterPlex selection restores Floor overlap handling; saved user tuning remains untouched.
 
 ### Networking
 
@@ -78,9 +79,11 @@ If you deploy behind NAT and need STUN to discover a server-reflexive candidate,
 |---|---|
 | `HF_TOKEN` | HuggingFace Read token (required to download the model) |
 | `GEMINI_API_KEY` | Google AI Studio key (optional; enables Vision) |
-| `PERSONAPLEX_MODEL` | `rl-seamless` (default) or `base` |
+| `PERSONAPLEX_MODEL` | `rl-seamless` (default), `base`, or `characterplex` |
 | `PERSONAPLEX_HF_REPO` | Custom model repository override (optional) |
 | `PERSONAPLEX_HF_REVISION` | Override the pinned model revision (optional; required with a custom repo) |
+| `PERSONAPLEX_MEMORY_JSON` | Path to a CharacterPlex-style `memory.json` for local `--moshi-weight` checkpoints (optional); hub checkpoints ship their own |
+| `PERSONAPLEX_BATCHED_PREFILL` | `0` by default; set `1` to prime the voice, persona, and NOTES frames in one transformer pass instead of one frame at a time (a ~600-token character card otherwise takes about 25 s). CPU-equivalent to the per-frame path; awaiting GPU parity qualification |
 | `PERSONAPLEX_PERIODIC_SNAPSHOTS` | `0` by default; set `1` to enable 60 s snapshot refreshes for long-session auto-rewind |
 | `PERSONAPLEX_CAPTION_CFG` | `0` by default; set `1` for two-row guidance (roughly doubles temporal-LM compute): caption guidance on injected context, and the dashboard's **Persona guidance** slider, which primes the second row without the persona and pushes text sampling toward the persona-conditioned row for the whole session (connect-time, default 1.5, off at 1.0) |
 | `PERSONAPLEX_KV_SINK_FRAMES` | `0` by default; the production profile uses `256` so the whole t=0 prefix (voice frames, two silence holds, one frame per prompt token; 73 to 193 for the shipped presets) stays pinned past the 3000-frame context. Anchor keys are re-positioned to their within-cache RoPE phase after eviction; the server warns when a session's prefix outgrows the sink. Each pinned frame comes out of the rolling window |
@@ -96,7 +99,7 @@ If you deploy behind NAT and need STUN to discover a server-reflexive candidate,
 | `SERVER_BUILD` | Optional immutable deployment identity: a full 40-64 character commit digest or `sha256:<64 hex>`; invalid labels report as `unknown` |
 | `WEBRTC_STUN_URLS` | Optional comma-separated STUN URLs for NAT'd hosts; empty means fully direct |
 
-The launcher defaults to the pinned Seamless RL checkpoint. Set `PERSONAPLEX_MODEL=base` to roll back to the pinned NVIDIA base checkpoint. Both aliases select a matching immutable revision automatically, so restarting an unchanged environment cannot silently pick up different assets. A custom `PERSONAPLEX_HF_REPO` must be paired with `PERSONAPLEX_HF_REVISION`.
+The launcher defaults to the pinned Seamless RL checkpoint. Set `PERSONAPLEX_MODEL=base` to roll back to the pinned NVIDIA base checkpoint, or `characterplex` for the character fine-tune. Every alias selects a matching immutable revision automatically, so restarting an unchanged environment cannot silently pick up different assets. A custom `PERSONAPLEX_HF_REPO` must be paired with `PERSONAPLEX_HF_REVISION`.
 
 Periodic full-state snapshots are on by default: a fresh session keeps one recent GPU-resident rolling recovery point refreshed once a minute so long-session auto-rewind stays armed after the session-start baseline ages out, and every capture defers until the same quiet boundary the context-inject gate trusts, so its roughly 416 ms frame-loop stall never lands on audible output. Each fresh session also keeps one CPU-resident baseline for manual Rewind, and confirmed bookmarks are CPU-resident as well. Those CPU captures copy the LM state into the pinned staging buffer under the inference lock and finish on a separate thread, so a bookmark delays the frame loop by the device-to-host copy time instead of blocking the inference worker for a synchronous pageable transfer; a bookmark requested while the previous one is still draining is deferred. Captures are admitted against measured tensor bytes, a retained-byte budget, and a free-memory floor; rejection is nonfatal and never replaces an existing recovery point. The measured two-row Caption-CFG state is 2.945 GiB, so bookmark storage is server-authoritative and the dashboard waits for a `stored` receipt. Set `PERSONAPLEX_PERIODIC_SNAPSHOTS=0` (or pass `--no-periodic-snapshots`) to return to baseline-only recovery.
 
@@ -104,7 +107,7 @@ Periodic full-state snapshots are on by default: a fresh session keeps one recen
 
 The dashboard includes checkpoint-aware **Balanced**, **Upstream**, **Concise**, **Expressive**, and **Clinical intake** profiles. The persona textarea is the whole system prompt: the server wraps it in the `<system>` markers and collapses line breaks to spaces (the text tokenizer has no newline piece), and nothing is appended to it. Upstream pins the NVIDIA/Kyutai reference operating point (text 0.7 / top-k 25, audio 0.8 / top-k 250 on every level, no repetition penalty) as an A/B baseline. No built-in profile enables the repetition penalty or a turn cap below the 120-token default: the penalty taxes the names and terms a task reply must repeat, and lower caps force a pause into ordinary answers. Expressive keeps text at 0.7 (the text stream decides turn timing) and takes its colour from the tested VARF4 voice and acoustic temperature 0.9; it selects Native duplex only for the aligned checkpoint, while Base and unknown checkpoints use Assisted overlap handling. The selected mode travels to the server as `turn_handling` in the session config, so the server enforces it: Native rejects any client-sourced barge-in, and Assisted arms a server-side sustained-overlap stop keyed to the shared user-speech floor rather than the browser's much higher level meter, with mid-session toggles applied live. The semantic codebook (Mimi level 0) has its own temperature slider, independent of the acoustic levels, defaulting to 0.7 where upstream samples 0.8. Raw sampling controls remain available under Advanced.
 
-**Turn handling** is live-switchable: **Native duplex** leaves overlap decisions to the RL model; **Gentle yield** adds a server-only stop after about 1.2 seconds of voiced overlap; **Assisted** keeps the faster browser/server intervention. Gentle bridges up to 160 ms of quiet gaps without counting them, so a short interjection followed by the activity detector's silence hangover does not trigger it. Native remains the default.
+**Turn handling** is live-switchable: **Native duplex** leaves overlap decisions to the RL model; **Gentle yield** adds a server-only stop after about 1.2 seconds of voiced overlap; **Assisted** keeps the faster browser/server intervention; **Floor** holds the assistant silent while you have the floor, allowing backchannels of up to three text tokens, yields a reply you talk over after about 0.5 seconds of voiced overlap, and releases when your turn ends. Gentle bridges up to 160 ms of quiet gaps without counting them, so a short interjection followed by the activity detector's silence hangover does not trigger it. Native remains the default; Floor is the CharacterPlex default.
 
 **Reply target** is sentence-aware: after the selected token target, the model may finish at sentence-ending punctuation, with at most 24 additional natural text tokens before a hard stop. Punctuation detection is approximate. Length-limit events never count as collapse, and PAD/onset pacing is preserved.
 
@@ -115,6 +118,8 @@ The diagnostics rail reports model/build identity, the seed the server drew for 
 **Speak now** requests speech from the current conversation without resetting the model, voice, or seed. It can release Stop, but rejects requests while the user or assistant is speaking or context is pending. **Voice reset** restores the whole session-start conversation state, not just the voice; later context is discarded.
 
 **Context notes** are experimental and may be repeated aloud. They are not private memory or typed user turns. Notes over 180 characters or 32 model tokens are rejected rather than clipped, and a waiting manual note cannot be overwritten. The input keeps an unsent or rejected draft and only clears an unchanged draft after the server queues it. Startup-only `<system>` wrappers are removed from live notes.
+
+**CharacterPlex** (`PERSONAPLEX_MODEL=characterplex`) plays a character from a structured card and follows live director notes. Its `memory.json` enables a pinned memory: the session prefix is voice, silence, the card (the persona prompt), silence, then a 64-frame NOTES slot, and the attention sink is raised to the largest prefix the checkpoint accepts (70 voice frames, two silence holds, a 1,000-token card, the NOTES slot and one flush frame: 1,147 frames) so the whole prefix stays attendable; the rolling window shrinks to about 150 s accordingly. A longer uploaded voice can still push the prefix past the sink, which the server reports at connect; NOTES then stop accepting updates once the context ring wraps. The dashboard's **Character card** composer compiles CharacterPlex's card format (identity, personality, wants, obstacles, triggers, people, memories, scene, roster) into the persona prompt. **Director notes** rewrite the NOTES slot in place, in one transformer pass, without touching the conversation: notes take effect for frames after the rewrite, up to 63 tokens, plain text, newest instruction last (for example `Beat: The Deflection (desperate). Ignore his question and lecture about iron.`). Notes are re-applied after rewinds and auto-recovery. An unpinned NOTES slot is refused once the context ring has wrapped, because rewriting it would attend to overwritten frames. The slot layout is reconstructed from the public CharacterPlex release (the authors' runtime is private), so director-note compliance still needs GPU qualification.
 
 Automatic recovery returns sampling and reply-length controls to checkpoint defaults while preserving your padding bonus and onset bias, so deliberate hesitant pacing is not erased.
 
@@ -257,7 +262,7 @@ bun test frontend/src/utils/sessionTrace.test.js
 
 ## License
 
-Code: MIT. The default `kyutai/personaplex-rl-seamless` checkpoint combines CC BY-NC 4.0 and the NVIDIA Open Model License and is non-commercial. The rollback `nvidia/personaplex-7b-v1` checkpoint uses the NVIDIA Open Model License. Always follow the license shown for the active model revision.
+Code: MIT. The default `kyutai/personaplex-rl-seamless` checkpoint combines CC BY-NC 4.0 and the NVIDIA Open Model License and is non-commercial. The rollback `nvidia/personaplex-7b-v1` checkpoint uses the NVIDIA Open Model License. `utkarshUY/CharacterPlex-FullFT-v4` is an NVIDIA Open Model License derivative trained on non-commercial data and published for research use only. Always follow the license shown for the active model revision.
 
 ## Citation
 

@@ -4,15 +4,25 @@ Replaces the former ``docker/model-env.sh`` shell resolver: the server and the
 prefetch script both call ``resolve_model_selection``, so rl-seamless vs base
 is selectable from ``PERSONAPLEX_MODEL`` without a shell wrapper.
 """
+import json
+import os
+from pathlib import Path
+import tempfile
+from unittest.mock import patch
 from types import SimpleNamespace
 
 import torch
+from huggingface_hub.utils import EntryNotFoundError
 from moshi.models.lm import LMModel
 from moshi.models.loaders import (
     BASE_REPO,
     BASE_REVISION,
+    CHARACTERPLEX_REPO,
+    CHARACTERPLEX_REVISION,
     DEFAULT_REPO,
     DEFAULT_REVISION,
+    MemorySpec,
+    load_memory_spec,
     _load_state_dict_complete,
     resolve_model_selection,
 )
@@ -39,6 +49,9 @@ def test_base_alias_selects_pinned_nvidia_model() -> None:
 def test_known_repo_override_gets_its_matching_pin() -> None:
     assert resolve_model_selection(repo=BASE_REPO) == (BASE_REPO, BASE_REVISION)
     assert resolve_model_selection(repo=DEFAULT_REPO) == (DEFAULT_REPO, DEFAULT_REVISION)
+    assert resolve_model_selection(repo=CHARACTERPLEX_REPO) == (
+        CHARACTERPLEX_REPO, CHARACTERPLEX_REVISION,
+    )
 
 
 def test_custom_repo_and_revision_are_forwarded() -> None:
@@ -196,6 +209,59 @@ def test_offloaded_transformer_offset_uses_execution_device() -> None:
     state = transformer._init_streaming_state(batch_size=1)
 
     assert state.offset.device.type == "cpu"
+
+
+def test_characterplex_alias_has_immutable_pin() -> None:
+    assert CHARACTERPLEX_REPO == "utkarshUY/CharacterPlex-FullFT-v4"
+    assert CHARACTERPLEX_REVISION == "b8a4472d1715eb27f7f00d7324b26a6fbce26c47"
+    assert resolve_model_selection("characterplex") == (
+        CHARACTERPLEX_REPO, CHARACTERPLEX_REVISION,
+    )
+
+
+def test_memory_spec_present_absent_and_local_override() -> None:
+    with tempfile.TemporaryDirectory() as raw, patch.dict(os.environ, {}, clear=True):
+        path = Path(raw) / "memory.json"
+        path.write_text(json.dumps({
+            "notes_frames": 64, "silence_frames": 6, "card_max_tokens": 1000,
+            "memory_trained": True, "window": None, "extra_slots": 0,
+        }))
+        expected = MemorySpec(64, 6, 1000, True)
+        with patch("moshi.models.loaders.hf_hub_download", return_value=str(path)) as download:
+            assert load_memory_spec(CHARACTERPLEX_REPO, CHARACTERPLEX_REVISION, "token") == expected
+            download.assert_called_once_with(
+                CHARACTERPLEX_REPO, "memory.json", revision=CHARACTERPLEX_REVISION, token="token",
+            )
+        with patch("moshi.models.loaders.hf_hub_download", side_effect=EntryNotFoundError("absent")):
+            assert load_memory_spec(BASE_REPO, BASE_REVISION, None) is None
+        with patch("moshi.models.loaders.hf_hub_download", side_effect=AssertionError("local must not download")):
+            assert load_memory_spec(None, None, None) is None
+            with patch.dict(os.environ, {"PERSONAPLEX_MEMORY_JSON": str(path)}):
+                assert load_memory_spec(None, None, None) == expected
+
+
+def test_memory_spec_rejects_malformed_metadata_and_network_errors() -> None:
+    with tempfile.TemporaryDirectory() as raw, patch.dict(os.environ, {}, clear=True):
+        path = Path(raw) / "memory.json"
+        for field, value in (("notes_frames", -1), ("silence_frames", True),
+                             ("card_max_tokens", "1000"), ("memory_trained", 1)):
+            payload = dict(notes_frames=64, silence_frames=6, card_max_tokens=1000, memory_trained=True)
+            payload[field] = value
+            path.write_text(json.dumps(payload))
+            with patch.dict(os.environ, {"PERSONAPLEX_MEMORY_JSON": str(path)}):
+                try:
+                    load_memory_spec(None, None, None)
+                except ValueError as exc:
+                    assert field in str(exc)
+                else:
+                    raise AssertionError("malformed memory spec accepted")
+        with patch("moshi.models.loaders.hf_hub_download", side_effect=ConnectionError("offline")):
+            try:
+                load_memory_spec(CHARACTERPLEX_REPO, CHARACTERPLEX_REVISION, None)
+            except ConnectionError:
+                pass
+            else:
+                raise AssertionError("network failure must not disable memory silently")
 
 
 if __name__ == "__main__":

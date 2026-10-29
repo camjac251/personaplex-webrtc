@@ -25,7 +25,7 @@ WEBRTC_SAMPLE_RATE = 48_000
 FRAME_MS = 20
 FRAME_SAMPLES = WEBRTC_SAMPLE_RATE * FRAME_MS // 1000
 _SCENARIO_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
-_SUPPORTED_ACTIONS = {"interrupt", "update_config"}
+_SUPPORTED_ACTIONS = {"context_note", "interrupt", "set_notes", "update_config"}
 _SUPPORTED_EXPECTATIONS = {"event", "pause", "turn"}
 
 
@@ -200,6 +200,16 @@ def validate_manifest(payload: Any, *, source: str = "manifest") -> dict[str, An
         ):
             raise ScenarioValidationError(
                 f"{field}.config must be an object for update_config"
+            )
+        if action_type == "context_note" and not (
+            isinstance(item.get("text"), str) and item["text"].strip()
+        ):
+            raise ScenarioValidationError(
+                f"{field}.text must be a non-empty string for context_note"
+            )
+        if action_type == "set_notes" and not isinstance(item.get("text"), str):
+            raise ScenarioValidationError(
+                f"{field}.text must be a string for set_notes (empty clears)"
             )
         normalized_actions.append(normalized)
 

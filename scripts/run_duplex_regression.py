@@ -63,6 +63,7 @@ from duplex_harness import (
     sha256_file,
     write_artifacts,
 )
+from moshi.qualification import REQUIRED_PROCESS_FLAGS
 from moshi.rtc_session import SessionConfig, parse_session_config
 from moshi.runtime_metrics import (
     LIFECYCLE_METRICS,
@@ -145,20 +146,6 @@ PROCESS_IDENTITY_KEYS = (
     "vision_model",
     "process_flags",
 )
-REQUIRED_PROCESS_FLAGS = {
-    "caption_cfg": bool,
-    "cpu_offload": bool,
-    "kv_sink_frames": int,
-    "periodic_snapshots": bool,
-    "asr_available": bool,
-    "voice_picker_available": bool,
-    "snapshot_cpu_tiering": bool,
-    "snapshot_gpu_budget_bytes": int,
-    "snapshot_gpu_free_floor_bytes": int,
-    "snapshot_host_budget_bytes": int,
-    "snapshot_host_free_floor_bytes": int,
-    "depformer_early_exit": int,
-}
 IMMUTABLE_BUILD_RE = re.compile(
     r"(?:[0-9a-f]{40,64}|sha256:[0-9a-f]{64})"
 )
@@ -1055,6 +1042,16 @@ def _operational_event_failures(events: list[dict[str, Any]]) -> list[str]:
     return failures
 
 
+# Outgoing control type -> (acknowledging message type, event kind, event
+# data.status). A rejected note is a failure: it never reached the model.
+ACTION_ACKNOWLEDGEMENTS = {
+    "context_note": ("event", "context_note", "queued"),
+    "interrupt": ("interrupted", None, None),
+    "set_notes": ("event", "notes", "applied"),
+    "update_config": ("config_applied", None, None),
+}
+
+
 def _action_protocol_failures(
     manifest: dict[str, Any], events: list[dict[str, Any]]
 ) -> list[str]:
@@ -1065,7 +1062,7 @@ def _action_protocol_failures(
         for event in events
         if event.get("direction") == "out"
         and isinstance(event.get("message"), dict)
-        and event["message"].get("type") in {"interrupt", "update_config"}
+        and event["message"].get("type") in ACTION_ACKNOWLEDGEMENTS
     ]
     failures = []
     if len(outgoing) != len(expected_actions):
@@ -1088,9 +1085,7 @@ def _action_protocol_failures(
     for event in outgoing:
         message = event["message"]
         sent_ms = float(event.get("t_ms", 0.0))
-        expected_type = (
-            "interrupted" if message["type"] == "interrupt" else "config_applied"
-        )
+        expected_type, event_kind, event_status = ACTION_ACKNOWLEDGEMENTS[message["type"]]
         match = None
         while ack_cursor < len(acknowledgements):
             candidate = acknowledgements[ack_cursor]
@@ -1103,6 +1098,11 @@ def _action_protocol_failures(
             if expected_type == "config_applied" and candidate_message.get(
                 "source"
             ) != "update":
+                continue
+            if expected_type == "event" and (
+                candidate_message.get("kind") != event_kind
+                or (candidate_message.get("data") or {}).get("status") != event_status
+            ):
                 continue
             match = candidate
             break
@@ -1203,6 +1203,8 @@ async def _run_action(
             "type": "interrupt",
             "reason": str(action.get("reason") or "regression")[:64],
         }
+    elif action["type"] in ("context_note", "set_notes"):
+        message = {"type": action["type"], "text": action["text"]}
     else:
         message = {"type": "update_config", **action["config"]}
     recorder.record("out", message)

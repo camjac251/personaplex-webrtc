@@ -48,6 +48,8 @@ def _run() -> dict:
                 "snapshot_host_budget_bytes": 24 * 1024**3,
                 "snapshot_host_free_floor_bytes": 4 * 1024**3,
                 "depformer_early_exit": 0,
+                "notes_frames": 0,
+                "batched_prefill": False,
             },
         },
         "manifest_sha256": "c" * 64,

@@ -326,7 +326,7 @@ def test_parse_session_config_preserves_valid_wire_values() -> None:
 
 def test_turn_handling_contract() -> None:
     assert parse_session_config({}).turn_handling == "native"
-    for mode in ("native", "gentle", "assisted"):
+    for mode in ("native", "gentle", "assisted", "floor"):
         assert parse_session_config({"turn_handling": mode}).turn_handling == mode
     for bad in ("auto", "", "NATIVE", None, 1):
         try:
@@ -334,6 +334,16 @@ def test_turn_handling_contract() -> None:
         except ValueError:
             continue
         raise AssertionError(f"expected ValueError for {bad!r}")
+
+
+def test_initial_notes_and_long_character_card_are_preserved() -> None:
+    assert parse_session_config({}).notes == ""
+    card = "Character memory. " * 200
+    notes = "Stay in character."
+    cfg = parse_session_config({"text_prompt": card, "notes": notes, "turn_handling": "floor"})
+    assert cfg.text_prompt == card
+    assert cfg.notes == notes
+    assert cfg.turn_handling == "floor"
 
 
 if __name__ == "__main__":
@@ -375,5 +385,8 @@ if __name__ == "__main__":
     print("  ok")
     print("test_turn_handling_contract ...")
     test_turn_handling_contract()
+    print("  ok")
+    print("test_initial_notes_and_long_character_card_are_preserved ...")
+    test_initial_notes_and_long_character_card_are_preserved()
     print("  ok")
     print("all session config tests passed")

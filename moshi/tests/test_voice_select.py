@@ -313,6 +313,7 @@ def test_voice_prompt_count_is_zero_without_a_prompt() -> None:
 
 def test_voice_prompt_count_is_zero_for_full_state_restore() -> None:
     lm_gen = LMGen.__new__(LMGen)
+    lm_gen.caption_cfg = False
     lm_gen.voice_prompt_embeddings = [object()]
     lm_gen.voice_prompt_full_state = {"cache": object()}
     restored: list[dict[str, object]] = []

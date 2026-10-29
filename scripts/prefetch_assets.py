@@ -9,10 +9,8 @@ import tarfile
 import tempfile
 from pathlib import Path
 
-from huggingface_hub import hf_hub_download, snapshot_download
-
-from moshi.models.loaders import resolve_model_selection
-
+from huggingface_hub import snapshot_download
+from moshi.models.loaders import download_voice_archive, resolve_model_selection
 
 VOICE_REVISION_MARKER = ".personaplex-hf-revision"
 
@@ -111,16 +109,9 @@ def ensure_voices(
         return
 
     print(f"[assets] downloading voices.tgz into HF cache for {voice_dir}", flush=True)
-    archive = Path(
-        hf_hub_download(
-            repo,
-            "voices.tgz",
-            token=token,
-            revision=revision,
-        )
-    )
-    resolved_revision = _resolved_cache_revision(archive, revision)
-    resolved_asset_id = f"{repo}@{resolved_revision}"
+    archive, voice_repo, voice_revision = download_voice_archive(repo, revision, token)
+    resolved_revision = _resolved_cache_revision(archive, voice_revision or "main")
+    resolved_asset_id = f"{voice_repo}@{resolved_revision}"
     if (
         has_voice_files(voice_dir)
         and installed_asset_id == resolved_asset_id

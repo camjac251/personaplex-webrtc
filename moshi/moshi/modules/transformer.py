@@ -350,15 +350,24 @@ class RingKVCache:
             # Frames below `sink` also land in the pristine sink buffer; every
             # other sink slot keeps its value, so the buffer freezes without a
             # branch and without duplicate scatter indices.
-            slots = torch.arange(
-                self.sink, device=self.end_offset.device, dtype=torch.long
-            )
-            batch_index = slots - self.end_offset
-            written = (batch_index >= 0) & (batch_index < T)
-            incoming = k.index_select(2, batch_index.clamp(0, T - 1))
-            self.sink_keys.copy_(
-                torch.where(written.view(1, 1, -1, 1), incoming, self.sink_keys)
-            )
+            if T == 1:
+                # Live frames touch one slot; the full-buffer select below
+                # would read and rewrite every anchor on every step.
+                slot = positions_written.clamp(max=self.sink - 1)
+                kept = self.sink_keys.index_select(2, slot)
+                self.sink_keys.index_copy_(
+                    2, slot, torch.where(positions_written < self.sink, k, kept)
+                )
+            else:
+                slots = torch.arange(
+                    self.sink, device=self.end_offset.device, dtype=torch.long
+                )
+                batch_index = slots - self.end_offset
+                written = (batch_index >= 0) & (batch_index < T)
+                incoming = k.index_select(2, batch_index.clamp(0, T - 1))
+                self.sink_keys.copy_(
+                    torch.where(written.view(1, 1, -1, 1), incoming, self.sink_keys)
+                )
         self.cache[0].index_copy_(2, indexes, k)
         self.cache[1].index_copy_(2, indexes, v)
         self.end_offset.add_(T)

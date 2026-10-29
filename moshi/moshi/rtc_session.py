@@ -477,9 +477,9 @@ TURN_ONSET_BIAS_MAX = 4.0
 # Who owns overlap handling. "native" leaves barge-in to the model.
 # "gentle" adds a server-owned sustained user-audio overlap detector;
 # "assisted" uses faster server detection and accepts browser barge_in.
-# Native and Gentle reject client-sourced barge_in interrupts so stale
-# or modified clients cannot bypass the selected mode.
-TURN_HANDLING_MODES = ("native", "gentle", "assisted")
+# "floor" permits short backchannels, then holds until the user's turn ends.
+# Only Assisted accepts client-sourced barge_in interrupts.
+TURN_HANDLING_MODES = ("native", "gentle", "assisted", "floor")
 # Reply-length target in natural text tokens. LMGen stops at sentence-ending
 # punctuation once the target is reached, or after at most 24 extra tokens.
 # The 40-token floor leaves room for ordinary replies. This is a length
@@ -851,6 +851,7 @@ class SessionConfig:
     # voice prefix and never updated live.
     clone_strength: float = 1.0
     text_prompt: str = ""
+    notes: str = ""
     vision_prompt: str = ""
     # When true, a non-empty vision_prompt fully replaces the default vision
     # system instruction instead of appending as an extra observation focus.
@@ -930,6 +931,7 @@ class SessionConfig:
     persona_cfg_gamma: float = 1.5
     # Native leaves overlap to the model; Gentle adds server-only sustained
     # yielding, while Assisted permits faster browser/server interruption.
+    # Floor permits short backchannels and holds longer speech until turn end.
     turn_handling: str = "native"
 
 
@@ -946,6 +948,7 @@ def parse_session_config(payload: dict) -> SessionConfig:
             payload.get("clone_strength", defaults.clone_strength)
         ),
         text_prompt=str(payload.get("text_prompt", defaults.text_prompt)),
+        notes=str(payload.get("notes", defaults.notes)),
         vision_prompt=str(payload.get("vision_prompt", defaults.vision_prompt)),
         vision_prompt_replace=bool(
             payload.get(

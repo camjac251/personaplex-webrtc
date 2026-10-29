@@ -41,7 +41,6 @@ keep parity with voice-prompt feeding logic in the server.
 
 import argparse
 import os
-from pathlib import Path
 import json
 from typing import Optional, List
 
@@ -139,13 +138,9 @@ def _get_voice_prompt_dir(
         return voice_prompt_dir
 
     log("info", "retrieving voice prompts")
-    voices_tgz = hf_hub_download(
-        hf_repo,
-        "voices.tgz",
-        token=os.environ.get("HF_TOKEN") or None,
-        revision=hf_revision,
+    voices_tgz, _, _ = loaders.download_voice_archive(
+        hf_repo, hf_revision, os.environ.get("HF_TOKEN") or None,
     )
-    voices_tgz = Path(voices_tgz)
     voices_dir = voices_tgz.parent / "voices"
 
     if not voices_dir.exists():
@@ -374,7 +369,7 @@ def main():
     parser.add_argument(
         "--hf-repo",
         type=str,
-        default=loaders.DEFAULT_REPO,
+        default=None,
         help="HF repo to look into (defaults to pre-trained model repo)",
     )
     parser.add_argument(
@@ -412,13 +407,14 @@ def main():
     parser.add_argument("--seed", type=int, default=-1, help="Seed for reproducibility (-1 disables)")
 
     args = parser.parse_args()
-    if args.hf_revision is None:
-        if args.hf_repo == loaders.DEFAULT_REPO:
-            args.hf_revision = loaders.DEFAULT_REVISION
-        elif args.hf_repo == loaders.BASE_REPO:
-            args.hf_revision = loaders.BASE_REVISION
-        else:
-            parser.error("custom --hf-repo requires --hf-revision")
+    try:
+        args.hf_repo, args.hf_revision = loaders.resolve_model_selection(
+            flavor=os.environ.get("PERSONAPLEX_MODEL") or None,
+            repo=args.hf_repo or os.environ.get("PERSONAPLEX_HF_REPO") or None,
+            revision=args.hf_revision or os.environ.get("PERSONAPLEX_HF_REVISION") or None,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # If --voice-prompt-dir is omitted, voices.tgz is downloaded from HF and extracted.
     voice_prompt_dir = _get_voice_prompt_dir(

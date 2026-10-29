@@ -788,6 +788,14 @@ def create_loss_report(
     return report
 
 
+class NotesUnavailable(ValueError):
+    """The pinned NOTES slot cannot accept this update."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
 class LMGen(StreamingModule[_LMGenState]):
     def __init__(
         self,
@@ -814,9 +822,13 @@ class LMGen(StreamingModule[_LMGenState]):
         semantic_temperature_cap: float = DEFAULT_SEMANTIC_TEMPERATURE_CAP,
         caption_cfg: bool = False,
         depformer_early_exit: int | None = None,
+        notes_frames: int = 0,
+        batched_prefill: bool = False,
     ):
         assert not lm_model.training, "generation shouldn't be used in training mode."
         super().__init__()
+        if notes_frames < 0:
+            raise ValueError("notes_frames must be nonnegative")
 
         self.lm_model = lm_model
         self.use_sampling = use_sampling
@@ -882,6 +894,10 @@ class LMGen(StreamingModule[_LMGenState]):
             torch.cuda.Event() if turn_cap_on_cuda else None
         )
         self.text_prompt_tokens = text_prompt_tokens
+        self.notes_frames = notes_frames
+        self.batched_prefill = bool(batched_prefill)
+        self.notes_tokens: list[int] = []
+        self.notes_start: int | None = None
         self.audio_silence_frame_cnt = audio_silence_frame_cnt
         self.voice_prompt = None
         self.zero_text_code = 3
@@ -963,7 +979,12 @@ class LMGen(StreamingModule[_LMGenState]):
         # set_streaming_state_inplace, and saving mimi.get_streaming_state()
         # at the end of _step_voice_prompt_core before save_streaming_state.
 
+    def reset_streaming(self):
+        super().reset_streaming()
+        self.notes_start = None
+
     def _init_streaming_state(self, batch_size: int) -> _LMGenState:
+        self.notes_start = None
         lm_model = self.lm_model
         initial = lm_model._get_initial_token()
         cache = torch.full(
@@ -1375,10 +1396,8 @@ class LMGen(StreamingModule[_LMGenState]):
         meta_path = base_path + ".json"
         
         if exists(state_path) and exists(meta_path):
-            # Single-row sidecars restore into a two-row caption-CFG stream
-            # as well: the tensor restore copies via Tensor.copy_, which
-            # broadcasts (1, ...) into (2, ...), priming both rows
-            # identically.
+            # Priming expands single-row KV sidecars along their batch axis;
+            # ordinary state tensors broadcast through the validated copy.
             logger.info("loading voice prompt state kind=full")
             full_state = load_streaming_state(state_path, meta_path, device=self.lm_model.device)
             self._migrate_legacy_full_state(full_state)
@@ -1932,7 +1951,19 @@ class LMGen(StreamingModule[_LMGenState]):
                 # set_streaming_state_inplace pops entries from the dict it
                 # is given; pass a fresh shallow copy so the next priming
                 # can apply the same state again.
-                self.set_streaming_state_inplace(dict(self.voice_prompt_full_state))
+                full_state = dict(self.voice_prompt_full_state)
+                if self.caption_cfg:
+                    # KV stores K/V on dim 0 and batch on dim 1; the generic
+                    # restore only broadcasts dim 0 for ordinary state tensors.
+                    for name, value in full_state.items():
+                        if (
+                            name.endswith(".kv_cache.cache")
+                            and isinstance(value, torch.Tensor)
+                            and value.ndim == 5
+                            and value.shape[1] == 1
+                        ):
+                            full_state[name] = value.expand(-1, 2, -1, -1, -1)
+                self.set_streaming_state_inplace(full_state)
                 return
 
             # Replay stored voice prompt embeddings
@@ -2049,17 +2080,238 @@ class LMGen(StreamingModule[_LMGenState]):
             if is_alive is not None and not await is_alive():
                 break
 
+    def _notes_text_tokens(self, tokens: list[int]) -> torch.Tensor:
+        if len(tokens) >= self.notes_frames:
+            raise NotesUnavailable("too_long")
+        state = self._streaming_state
+        if state is None:
+            raise NotesUnavailable("not_primed")
+        text = torch.full(
+            (state.cache.shape[0], self.notes_frames),
+            self.lm_model.text_padding_token_id,
+            dtype=torch.long,
+            device=self.lm_model.device,
+        )
+        if tokens:
+            values = torch.tensor(tokens, dtype=torch.long, device=text.device)
+            if self.caption_cfg:
+                text[0, :len(tokens)] = values
+            else:
+                text[:, :len(tokens)] = values
+        return text
+
+    def _step_notes_prompt_core(self) -> Iterator[None]:
+        """Prime the slot, then flush its last PAD through the one-frame pipeline."""
+        if not self.notes_frames:
+            return
+        self.notes_start = None
+        text = self._notes_text_tokens(self.notes_tokens)
+        state = self._streaming_state
+        # Initial fills must finish before the slot's constant audio inputs.
+        while state.offset <= self.max_delay:
+            yield
+            self.step(
+                input_tokens=self._encode_sine_frame(),
+                moshi_tokens=self._encode_zero_frame(),
+                text_token=self.lm_model.text_padding_token_id,
+            )
+        start = state.offset
+        for index in range(self.notes_frames + 1):
+            yield
+            self.step(
+                input_tokens=self._encode_sine_frame(),
+                moshi_tokens=self._encode_zero_frame(),
+                text_token=(
+                    text[:, index] if index < self.notes_frames
+                    else self.lm_model.text_padding_token_id
+                ),
+            )
+        self.notes_start = start
+
+    def _step_notes_prompt(self):
+        for _ in self._step_notes_prompt_core():
+            pass
+
+    async def _step_notes_prompt_async(self, is_alive: Callable | None = None):
+        for _ in self._step_notes_prompt_core():
+            if is_alive is not None and not await is_alive():
+                break
+
+    def notes_resident(self) -> bool:
+        """Whether NOTES and its complete conditioning prefix remain replayable."""
+        if not self.notes_frames or self.notes_start is None:
+            return False
+        transformer = self.lm_model.transformer
+        if self._streaming_state is None or transformer._streaming_state is None:
+            return False
+        end = self.notes_start + self.notes_frames
+        for layer in transformer.layers:
+            if layer.skip_self_attn:
+                continue
+            state = layer.self_attn._streaming_state
+            if state is None:
+                return False
+            cache = state.kv_cache
+            current_end = int(cache.end_offset.item())
+            if current_end < end:
+                return False
+            # Rewinding a wrapped ring would relabel newer conversation KV as
+            # prefix positions. The entire prefix must be pinned or unwrapped.
+            if end > cache.sink and current_end > cache.capacity:
+                return False
+        return True
+
+    @torch.no_grad()
+    def rewrite_notes(self, tokens: list[int]) -> None:
+        """Rewrite only the slot's KV; callers serialize this with live inference."""
+        if not self.notes_frames:
+            raise NotesUnavailable("disabled")
+        if self.notes_start is None:
+            raise NotesUnavailable("not_primed")
+        text = self._notes_text_tokens(tokens)
+        if not self.notes_resident():
+            raise NotesUnavailable("evicted")
+        batch_size = text.shape[0]
+        codes = torch.cat(
+            (
+                text[:, None],
+                self._encode_zero_frame().expand(batch_size, -1, self.notes_frames),
+                self._encode_sine_frame().expand(batch_size, -1, self.notes_frames),
+            ),
+            dim=1,
+        )
+        transformer = self.lm_model.transformer
+        offsets = [(transformer._streaming_state.offset, transformer._streaming_state.offset.clone())]
+        cpu_offsets = []
+        other_anchors = []
+        end = self.notes_start + self.notes_frames
+        for layer in transformer.layers:
+            cpu_offsets.append((layer._streaming_state, layer._streaming_state.offset_cpu))
+            if layer.skip_self_attn:
+                continue
+            state = layer.self_attn._streaming_state
+            cache = state.kv_cache
+            offsets.extend(
+                ((state.offset, state.offset.clone()),
+                 (cache.end_offset, cache.end_offset.clone()))
+            )
+            cpu_offsets.append((state, state.offset_cpu))
+            if cache.sink_keys is not None:
+                # complete() unshifts every anchor while replaying old positions.
+                # Preserve the live rotation of anchors outside this slot.
+                for first, last in ((0, min(self.notes_start, cache.sink)), (end, cache.sink)):
+                    if first < last:
+                        view = cache.cache[0, :, :, first:last]
+                        other_anchors.append((view, view.clone()))
+        try:
+            for offset, _ in offsets:
+                offset.fill_(self.notes_start)
+            for state, _ in cpu_offsets:
+                state.offset_cpu = self.notes_start
+            transformer(self.lm_model.embed_codes(codes))
+        finally:
+            for offset, saved in offsets:
+                offset.copy_(saved)
+            for state, saved in cpu_offsets:
+                state.offset_cpu = saved
+            for view, saved in other_anchors:
+                view.copy_(saved)
+        self.notes_tokens = list(tokens)
+
+    @torch.no_grad()
+    def prefill_system_prompts(self, mimi) -> int:
+        """Batch forced inputs without sampling; replay/restore saved voices first.
+
+        NOTES adds one PAD flush call so its final input is resident before a
+        rewrite. Oversized spans use ordinary steps: a bulk ring write would
+        evict keys needed by earlier queries in that same span. Voice sidecar
+        creation keeps its original per-frame path and snapshot boundary.
+        """
+        state = self._streaming_state
+        if state is None:
+            raise RuntimeError("System prompts require streaming mode.")
+        notes_text = self._notes_text_tokens(self.notes_tokens) if self.notes_frames else None
+        frames = []
+        voice_frames = 0
+        if self.voice_prompt_embeddings is not None or self.save_voice_prompt_embeddings:
+            voice_frames = self._step_voice_prompt(mimi)
+        elif self.voice_prompt_audio is not None:
+            for codes in self._encode_voice_prompt_frames(mimi):
+                frames.append((codes, self.zero_text_code))
+                voice_frames += 1
+        zero = self._encode_zero_frame()
+        sine = self._encode_sine_frame()
+        silence = (zero, self.zero_text_code)
+        frames.extend([silence] * self.audio_silence_frame_cnt)
+        frames.extend(
+            (zero, self._prompt_text_token(token))
+            for token in self.text_prompt_tokens or []
+        )
+        frames.extend([silence] * self.audio_silence_frame_cnt)
+        notes_start = None
+        if notes_text is not None:
+            self.notes_start = None
+            fills = max(0, self.max_delay + 1 - state.offset - len(frames))
+            frames.extend([silence] * fills)
+            notes_start = state.offset + len(frames)
+            frames.extend((zero, notes_text[:, index]) for index in range(self.notes_frames))
+            frames.append((zero, self.lm_model.text_padding_token_id))
+
+        columns = len(frames) - int(state.offset == 0 and bool(frames))
+        overflow = any(
+            int(layer.self_attn._streaming_state.kv_cache.end_offset.item()) + columns
+            > layer.self_attn._streaming_state.kv_cache.capacity
+            for layer in self.lm_model.transformer.layers if not layer.skip_self_attn
+        )
+        if overflow:
+            logger.info("Prompt span exceeds KV capacity; using frame-by-frame prefill")
+            for audio, text in frames:
+                self.step(input_tokens=sine, moshi_tokens=audio, text_token=text)
+        else:
+            inputs = []
+            for audio, text in frames:
+                prepared = self.prepare_step_input(
+                    input_tokens=sine, moshi_tokens=audio, text_token=text,
+                )
+                if prepared is None:
+                    continue
+                input_, _, _, model_input_position, target_position = prepared
+                inputs.append(input_.clone())
+                state.provided[:, :, model_input_position] = False
+                if self.caption_cfg:
+                    state.cache[1:2, 1:self.lm_model.dep_q + 1, target_position] = (
+                        state.cache[0:1, 1:self.lm_model.dep_q + 1, target_position]
+                    )
+                if self.repetition_penalty > 1.0 and self.repetition_penalty_context > 0:
+                    self._clear_repetition_boundary()
+                self.controls.forced_text_recent = True
+                state.offset += 1
+            if inputs:
+                self.lm_model.transformer(self.lm_model.embed_codes(torch.cat(inputs, dim=2)))
+        if notes_start is not None:
+            self.notes_start = notes_start
+        return voice_frames
+
     async def step_system_prompts_async(self, mimi, is_alive: Optional[Callable]=None):
+        if self.batched_prefill:
+            if is_alive is None or await is_alive():
+                self.prefill_system_prompts(mimi)
+            return
         await self._step_voice_prompt_async(mimi, is_alive)
         await self._step_audio_silence_async(is_alive)
         await self._step_text_prompt_async(is_alive)
         await self._step_audio_silence_async(is_alive)
+        await self._step_notes_prompt_async(is_alive)
 
     def step_system_prompts(self, mimi):
+        if self.batched_prefill:
+            self.prefill_system_prompts(mimi)
+            return
         self._step_voice_prompt(mimi)
         self._step_audio_silence()
         self._step_text_prompt()
         self._step_audio_silence()
+        self._step_notes_prompt()
 
     def depformer_step(
         self,

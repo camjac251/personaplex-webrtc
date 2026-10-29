@@ -1524,8 +1524,177 @@ def test_periodic_recovery_rejects_stop_yield_and_recent_runaway() -> None:
         assert manual["auto_recovery_eligible"] is False
 
 
+def test_characterplex_identity_and_process_flags() -> None:
+    from unittest.mock import Mock
+    from moshi.models import loaders
+
+    lm = types.SimpleNamespace(
+        notes_frames=64, batched_prefill=True, max_delay=1,
+        lm_model=types.SimpleNamespace(text_padding_token_id=3),
+        set_sentence_end_tokens=Mock(), streaming_forever=Mock(),
+    )
+    mimi = types.SimpleNamespace(sample_rate=24000, frame_rate=12.5, streaming_forever=Mock())
+    tokenizer = types.SimpleNamespace(
+        get_piece_size=lambda: 4, id_to_piece=lambda token: ".",
+        encode=lambda text: [7],
+    )
+    with patch.dict(os.environ, {}, clear=True), patch.object(
+        threading.Thread, "start"
+    ), patch.object(ServerState, "_allocate_snapshot_staging", return_value=None), patch(
+        "moshi.server._resolve_server_build", return_value="unknown",
+    ):
+        state = ServerState(
+            mimi, lm, tokenizer, torch.device("cpu"),
+            model_repo=loaders.CHARACTERPLEX_REPO,
+            model_revision=loaders.CHARACTERPLEX_REVISION,
+            kv_sink_frames=1024,
+        )
+    try:
+        payload = json.loads(asyncio.run(state.handle_server_info(None)).text)
+        assert payload["model_variant"] == "characterplex"
+        assert payload["model_label"] == "CharacterPlex FullFT v4"
+        assert payload["model_license"] == "NVIDIA OML; research-only, non-commercial training data"
+        assert payload["native_duplex_recommended"] is False
+        assert payload["process_flags"]["notes_frames"] == 64
+        assert payload["process_flags"]["batched_prefill"] is True
+        assert payload["process_flags"]["kv_sink_frames"] == 1024
+    finally:
+        state._infer_executor.shutdown()
+        state._snapshot_executor.shutdown()
+        state._voice_executor.shutdown()
+
+
+def _floor_events(state: ServerState) -> list:
+    events = []
+    state._active_session = types.SimpleNamespace(
+        send_event=lambda kind, text, level, data: events.append((kind, data)),
+    )
+    state._active_session_id = "session"
+    state._main_loop = types.SimpleNamespace(call_soon_threadsafe=lambda fn, *args: fn(*args))
+    return events
+
+
+def test_floor_short_backchannels_and_natural_pause_reset() -> None:
+    state = _yield_policy_state("floor")
+    state._pending_text_flags = deque([(False, False)])
+    events = _floor_events(state)
+    state._maybe_yield_on_overlap_locked(0.1, True)
+    for count in (1, 2, 3):
+        state.lm_gen.controls.non_pad_streak = count
+        state._maybe_yield_on_overlap_locked(0.1, True)
+        assert not state._floor_held
+    state.lm_gen.controls.turn_pad_streak = 1
+    state._maybe_yield_on_overlap_locked(0.1, True)
+    state.lm_gen.controls.turn_pad_streak = 0
+    for count in (4, 5, 6):
+        state.lm_gen.controls.non_pad_streak = count
+        state._maybe_yield_on_overlap_locked(0.1, True)
+        assert not state._floor_held
+    assert events == []
+    # Forced samples never extend the natural streak despite stale controls.
+    state._pending_text_flags = deque([(True, False)])
+    state.lm_gen.controls.non_pad_streak = 7
+    state._maybe_yield_on_overlap_locked(0.1, True)
+    assert not state._floor_held
+    state._pending_text_flags = deque([(False, False)])
+    state.lm_gen.controls.non_pad_streak = 8
+    state._maybe_yield_on_overlap_locked(0.1, True)
+    assert events == [("floor", {"action": "hold", "reason": "backchannel_limit"})]
+    state._active_turn_handling = "native"
+    state._maybe_yield_on_overlap_locked(0.1, True)
+    assert not state._floor_held
+    assert events[-1] == ("floor", {"action": "release", "reason": "mode_change"})
+
+
+def test_floor_barge_yields_after_six_voiced_frames_without_context_clear() -> None:
+    state = _yield_policy_state("floor")
+    events = _floor_events(state)
+    state.lm_gen.controls.non_pad_streak = 20
+    state._context.notes.waiting.tokens.extend([11, 12])
+    state._context.persona.waiting.tokens.extend([13])
+    for _ in range(5):
+        state._maybe_yield_on_overlap_locked(0.1, True)
+        assert not state._floor_held
+    for _ in range(10):
+        state._maybe_yield_on_overlap_locked(0.0, True)
+        assert not state._floor_held
+    state._maybe_yield_on_overlap_locked(0.1, True)
+    assert state._floor_held and not state._stop_response_latched
+    assert list(state._context.notes.waiting.tokens) == [11, 12]
+    assert list(state._context.persona.waiting.tokens) == [13]
+    assert state.lm_gen.controls.pad_force_reason == ""
+    assert state._prev_pad_force_remaining == state.lm_gen.controls.pad_force_remaining
+    assert events == [("floor", {"action": "hold", "reason": "barge_in"})]
+
+
+def test_floor_frame_pipeline_holds_until_turn_end_without_collapse() -> None:
+    from test_inject_ritual import FRAME_SAMPLES, MIC_MARK, PAD_ID, _pipeline_state
+
+    state, lm = _pipeline_state()
+    state._text_starved_streak = 0
+    state._text_starved_frames = 0
+    state._text_starved_episodes = 0
+    state._active_turn_handling = "floor"
+    events = _floor_events(state)
+    state.mimi.decode = lambda tokens: torch.ones(1, 1, FRAME_SAMPLES) * 0.1
+    original_step = lm.step
+    lm.max_turn_text_tokens = 240
+    lm._sentence_end_tokens = frozenset()
+    lm._read_turn_cap_token = lambda token: int(token[0])
+    lm._arm_pad_force = types.MethodType(LMGen._arm_pad_force, lm)
+
+    def step(*args, **kwargs):
+        result = original_step(*args, **kwargs)
+        LMGen._update_turn_cap(
+            lm, torch.tensor([lm.pending_text]), PAD_ID,
+            text_was_forced=kwargs.get("text_token") is not None,
+            turn_pad_forced=lm.controls.pad_force_remaining > 0,
+        )
+        return result
+
+    lm.step = step
+    voice = np.full(FRAME_SAMPLES, 0.1, dtype=np.float32)
+    silence = np.zeros(FRAME_SAMPLES, dtype=np.float32)
+    for _ in range(3):
+        state._process_audio_frame(voice)
+    assert state._user_audio_active
+    state._context.notes.waiting.tokens.extend([21, 22])
+    state._context.persona.waiting.tokens.extend([23])
+    lm.natural_text_token = 17
+    emitted = []
+    for _ in range(4):
+        emitted.extend(state._process_audio_frame(voice))
+        assert not state._floor_held
+    assert sum(text is not None for _, text in emitted) == 3
+    first_hold = state._process_audio_frame(voice)[0]
+    assert state._floor_held and first_hold[1] is None
+    assert np.all(first_hold[0][240:] == 0.0)
+    assert lm.steps[-1]["forced_text"] == PAD_ID
+    assert lm.steps[-1]["input_mark"] == MIC_MARK
+    assert lm.steps[-1]["agent_silenced"] is True
+    for _ in range(20):
+        output = state._process_audio_frame(voice)[0]
+        assert np.all(output[0] == 0.0) and output[1] is None
+    for _ in range(6):
+        state._process_audio_frame(silence)
+        assert state._floor_held
+    state._process_audio_frame(silence)
+    assert not state._floor_held and state._user_turn_ends == 1
+    assert list(state._context.notes.waiting.tokens) == [21, 22]
+    assert list(state._context.persona.waiting.tokens) == [23]
+    assert not state._collapse_triggers
+    assert events == [
+        ("floor", {"action": "hold", "reason": "backchannel_limit"}),
+        ("floor", {"action": "release", "reason": "user_turn_end"}),
+    ]
+
+
 if __name__ == "__main__":
     tests = [
+        test_characterplex_identity_and_process_flags,
+        test_floor_short_backchannels_and_natural_pause_reset,
+        test_floor_barge_yields_after_six_voiced_frames_without_context_clear,
+        test_floor_frame_pipeline_holds_until_turn_end_without_collapse,
         test_gentle_yield_ignores_backchannel_hangover,
         test_gentle_yield_bridges_short_gaps_and_resets_on_mode_change,
         test_recovery_selection_skips_ineligible_and_expired_points,

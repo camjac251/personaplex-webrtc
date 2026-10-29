@@ -23,16 +23,21 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 """Retrieves the pretrained models for Moshi and Mimi."""
-from pathlib import Path
+import json
 import logging
+import os
+from dataclasses import dataclass
+from pathlib import Path
 
-from safetensors.torch import load_model, load_file
 import torch
+from huggingface_hub import hf_hub_download
+from huggingface_hub.utils import EntryNotFoundError, LocalEntryNotFoundError
+from safetensors.torch import load_file, load_model
 
+from ..modules import SEANetDecoder, SEANetEncoder, transformer
+from ..quantization import SplitResidualVectorQuantizer
 from .compression import MimiModel
 from .lm import LMModel
-from ..modules import SEANetEncoder, SEANetDecoder, transformer
-from ..quantization import SplitResidualVectorQuantizer
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +51,8 @@ DEFAULT_REPO = 'kyutai/personaplex-rl-seamless'
 DEFAULT_REVISION = '3fa800309a4b743a8a6d764253eb45def0334afc'
 BASE_REPO = 'nvidia/personaplex-7b-v1'
 BASE_REVISION = 'fdaf4090a61cb315c138a1faee287ffd6c716309'
+CHARACTERPLEX_REPO = 'utkarshUY/CharacterPlex-FullFT-v4'
+CHARACTERPLEX_REVISION = 'b8a4472d1715eb27f7f00d7324b26a6fbce26c47'
 
 
 def resolve_model_selection(
@@ -55,7 +62,7 @@ def resolve_model_selection(
 ) -> tuple[str, str]:
     """Resolve ``(hf_repo, hf_revision)`` for the requested checkpoint.
 
-    ``flavor`` picks a built-in alias (``rl-seamless`` default, or ``base``).
+    ``flavor`` picks ``rl-seamless`` (default), ``base``, or ``characterplex``.
     ``repo`` overrides it with a custom repository, which then requires an
     explicit ``revision``; known aliases resolve to a pinned immutable
     revision automatically. Callers pass the ``PERSONAPLEX_MODEL`` /
@@ -67,8 +74,12 @@ def resolve_model_selection(
         default_repo = DEFAULT_REPO
     elif flavor == "base":
         default_repo = BASE_REPO
+    elif flavor == "characterplex":
+        default_repo = CHARACTERPLEX_REPO
     else:
-        raise ValueError(f"unknown model {flavor!r}; use 'rl-seamless' or 'base'")
+        raise ValueError(
+            f"unknown model {flavor!r}; use 'rl-seamless', 'base', or 'characterplex'"
+        )
     selected_repo = repo or default_repo
     if revision:
         selected_revision = revision
@@ -76,9 +87,72 @@ def resolve_model_selection(
         selected_revision = DEFAULT_REVISION
     elif selected_repo == BASE_REPO:
         selected_revision = BASE_REVISION
+    elif selected_repo == CHARACTERPLEX_REPO:
+        selected_revision = CHARACTERPLEX_REVISION
     else:
         raise ValueError("a custom model repository requires an explicit revision")
     return selected_repo, selected_revision
+
+
+@dataclass(frozen=True)
+class MemorySpec:
+    notes_frames: int
+    silence_frames: int
+    card_max_tokens: int
+    memory_trained: bool
+
+
+def load_memory_spec(
+    repo: str | None, revision: str | None, token: str | None,
+) -> MemorySpec | None:
+    """Load memory metadata; ``repo=None`` denotes local model weights."""
+    path = os.environ.get("PERSONAPLEX_MEMORY_JSON")
+    if not path:
+        if repo is None:
+            return None
+        try:
+            path = hf_hub_download(
+                repo, "memory.json", revision=revision, token=token,
+            )
+        except EntryNotFoundError as exc:
+            if isinstance(exc, LocalEntryNotFoundError):
+                raise
+            return None
+    with Path(path).expanduser().open(encoding="utf-8") as source:
+        payload = json.load(source)
+    if not isinstance(payload, dict):
+        raise TypeError("memory.json must be an object")
+    for field in ("notes_frames", "silence_frames", "card_max_tokens"):
+        value = payload.get(field)
+        if type(value) is not int or value < 0:
+            raise ValueError(f"memory.json {field} must be a non-negative integer")
+    if type(payload.get("memory_trained")) is not bool:
+        raise ValueError("memory.json memory_trained must be a boolean")
+    return MemorySpec(
+        notes_frames=payload["notes_frames"],
+        silence_frames=payload["silence_frames"],
+        card_max_tokens=payload["card_max_tokens"],
+        memory_trained=payload["memory_trained"],
+    )
+
+
+def download_voice_archive(
+    repo: str, revision: str | None, token: str | None,
+) -> tuple[Path, str, str | None]:
+    """Return the archive and its source identity, falling back only if absent."""
+    try:
+        archive = hf_hub_download(
+            repo, "voices.tgz", revision=revision, token=token,
+        )
+    except EntryNotFoundError as exc:
+        if isinstance(exc, LocalEntryNotFoundError) or repo == BASE_REPO:
+            raise
+        repo, revision = BASE_REPO, BASE_REVISION
+        logger.info("model has no voices.tgz; using %s@%s", repo, revision)
+        archive = hf_hub_download(
+            repo, "voices.tgz", revision=revision, token=token,
+        )
+    return Path(archive), repo, revision
 
 
 _seanet_kwargs = {

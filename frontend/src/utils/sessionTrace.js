@@ -74,6 +74,7 @@ const NUMBER_FIELDS = new Set([
   "max",
   "max_gpu_util",
   "max_rtf",
+  "max_tokens",
   "max_turn_text_tokens",
   "max_vram_used",
   "mimi_encode_frames",
@@ -145,6 +146,7 @@ const NUMBER_FIELDS = new Set([
 ]);
 
 const CONTROLLED_STRING_FIELDS = new Set([
+  "action",
   "browser_family",
   "candidate_type",
   "end_reason",
@@ -164,6 +166,7 @@ const CONTROLLED_STRING_FIELDS = new Set([
 const SAFE_REASON_VALUES = new Set([
   "action_timeout",
   "assistant_speaking",
+  "backchannel_limit",
   "barge_in",
   "busy",
   "cadence",
@@ -172,11 +175,15 @@ const SAFE_REASON_VALUES = new Set([
   "context_busy",
   "control_closed",
   "empty",
+  "evicted",
   "hold_ceiling",
   "manual",
+  "mode_change",
   "no_snapshot",
+  "not_primed",
   "regression",
   "regression_stop",
+  "rewind",
   "screen_refresh",
   "session_ended",
   "silence",
@@ -184,8 +191,10 @@ const SAFE_REASON_VALUES = new Set([
   "stale_snapshot",
   "too_long",
   "typed_note",
+  "unsupported",
   "user_speaking",
   "user_turn",
+  "user_turn_end",
   "warming_up",
 ]);
 
@@ -215,6 +224,10 @@ const HARD_PRIVATE_FIELDS = new Set([
   "image",
   "media_stream",
   "microphone_audio",
+  "notes",
+  "initial_notes",
+  "card",
+  "character_card",
   "offer",
   "output_device_id",
   "password",
@@ -352,6 +365,8 @@ const SUMMARY_FIELDS = new Set([
 
 const EVENT_FIELDS = new Set([
   ...CONFIG_FIELDS,
+  "max_tokens",
+  "action",
   "active",
   "age_ms",
   "age_sec",
@@ -565,6 +580,11 @@ function sanitizeValue(value, options, depth, mode) {
   }
   if (!value || typeof value !== "object") return undefined;
 
+  const notesMessage = value.type === "set_notes" || (value.type === "event" && value.kind === "notes");
+  const privatePrompts = options.privatePrompts || Object.hasOwn(value, "notes");
+  if (notesMessage || privatePrompts) {
+    options = { ...options, privatePrompts, includeContent: notesMessage ? false : options.includeContent };
+  }
   const out = {};
   const allowed = allowedFieldsForMode(mode);
   for (const [rawKey, rawValue] of Object.entries(value).slice(0, MAX_KEYS)) {
@@ -573,6 +593,10 @@ function sanitizeValue(value, options, depth, mode) {
 
     const isContent = CONTENT_FIELDS.has(key) || PROMPT_FIELDS.has(key);
     if (isContent) {
+      if (options.privatePrompts && PROMPT_FIELDS.has(key)) {
+        if (typeof rawValue === "string") out[`${key}_chars`] = rawValue.length;
+        continue;
+      }
       if (!options.includeContent || typeof rawValue !== "string") continue;
       out[key] = scrubString(rawValue, MAX_CONTENT_STRING);
       continue;
@@ -598,6 +622,10 @@ function sanitizeValue(value, options, depth, mode) {
     if (CONTROLLED_STRING_FIELDS.has(key)) {
       if (typeof rawValue === "string") {
         const token = safeToken(rawValue, "other");
+        if (key === "action") {
+          out[key] = token === "hold" || token === "release" ? token : "other";
+          continue;
+        }
         out[key] = key === "reason" && !SAFE_REASON_VALUES.has(token)
           ? "other"
           : token;
@@ -792,6 +820,7 @@ export function createSessionTrace({
   let summary = {};
   let requestedPromptHashes = Promise.resolve({});
   let appliedPromptHashes = Promise.resolve({});
+  let privatePrompts = false;
   const events = [];
 
   const boundEvents = () => {
@@ -813,7 +842,7 @@ export function createSessionTrace({
         level: safeToken(level, "info"),
         data: safeKind === "server.lifecycle_receipt"
           ? sanitizeLifecycleReceipt(data)
-          : sanitizeTraceData(data, { includeContent: true }),
+          : sanitizeValue(data, { includeContent: safeKind !== "server.event.notes", privatePrompts }, 0, "event"),
       };
       nextSeq += 1;
       events.push(event);
@@ -834,13 +863,14 @@ export function createSessionTrace({
     },
 
     setRequestedConfig(value) {
-      requestedPromptHashes = hashTracePrompts(value);
-      requestedConfig = sanitizeTraceConfig(value, { includeContent: true });
+      privatePrompts ||= Object.hasOwn(value || {}, "notes");
+      requestedPromptHashes = privatePrompts ? Promise.resolve({}) : hashTracePrompts(value);
+      requestedConfig = sanitizeValue(value, { includeContent: true, privatePrompts }, 0, "config") ?? {};
     },
 
     setAppliedConfig(value) {
-      appliedPromptHashes = hashTracePrompts(value);
-      appliedConfig = sanitizeTraceConfig(value, { includeContent: true });
+      appliedPromptHashes = privatePrompts ? Promise.resolve({}) : hashTracePrompts(value);
+      appliedConfig = sanitizeValue(value, { includeContent: true, privatePrompts }, 0, "config") ?? {};
     },
 
     setSummary(value) {
