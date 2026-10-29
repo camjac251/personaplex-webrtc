@@ -175,7 +175,7 @@ These local previews validate the enrollment transaction, not spoken quality. An
 
 ## Vision (optional)
 
-Adds situational awareness from a screen share or virtual camera. Frames are sent to **Gemini 3.8 Flash** via the Interactions API. Captions stay outside PersonaPlex by default; reaction modes can drip a compact scene fact into its text channel during natural silence windows. Routine/detail generation budgets are 1,024/2,048 tokens, including thinking, while the prompts keep the visible captions short.
+Adds situational awareness from a screen share or virtual camera. Frames are sent to **Gemini 3.8 Flash** via the Interactions API. Captions stay outside PersonaPlex by default, except on NOTES-capable checkpoints (CharacterPlex), where the default Scene notes mode updates the pinned notes silently; reaction modes can drip a compact scene fact into its text channel during natural silence windows. Routine/detail generation budgets are 1,024/2,048 tokens, including thinking, while the prompts keep the visible captions short.
 
 Enable it by providing `GEMINI_API_KEY` and clicking **Add Vision** in the UI. Without the key the button stays disabled and a toast explains why.
 
