@@ -167,36 +167,15 @@ Pre-packaged voice embeddings:
 - **Variety (female)**: VARF0 through VARF4
 - **Variety (male)**: VARM0 through VARM4
 
-You can also upload up to 60 s of audio for a speaker via the **Clone a voice**
-panel. The server decodes and downmixes the reference, rejects only structural
-problems (undecodable, empty, non-finite, silent, unsupported-channel,
-oversized, or overlong), and reports quality concerns as overridable warnings.
-Conditioned Tail and Representative previews use the same fixed conditioning
-prompt, seed, sampling controls, clone strength, checkpoint, and reference.
-The representative interval is used only when selection completed without a
-fallback; otherwise both enrollment and the UI identify the deterministic tail
-fallback. This interval is a conditioning-window choice, not identity
-confidence or multi-speaker verification. Previews are ephemeral unless the
-request explicitly opts into retention, and **Remove clone** first deletes the
-clone's previews, then its enrollment artifacts. A failed deletion remains
-retryable. The browser stores only the validated opaque handle needed to keep
-that removal action available after reload; the source filename, decoded
-signal report, and live handle are excluded from exported config files.
+You can also upload up to 60 s of audio for a speaker via the **Clone a voice** panel. The server decodes and downmixes the reference, rejects only structural problems (undecodable, empty, non-finite, silent, unsupported-channel, oversized, or overlong), and reports quality concerns as overridable warnings. Conditioned Tail and Representative previews use the same fixed conditioning prompt, seed, sampling controls, clone strength, checkpoint, and reference. The representative interval is used only when selection completed without a fallback; otherwise both enrollment and the UI identify the deterministic tail fallback. This interval is a conditioning-window choice, not identity confidence or multi-speaker verification. Previews are ephemeral unless the request explicitly opts into retention, and **Remove clone** first deletes the clone's previews, then its enrollment artifacts. A failed deletion remains retryable. The browser stores only the validated opaque handle needed to keep that removal action available after reload; the source filename, decoded signal report, and live handle are excluded from exported config files.
 
-Representative selection is optional and CPU-only. Install it with
-`uv sync --extra voice-selection`, then set `PERSONAPLEX_VOICE_PICKER=1`.
-The WavLM model loads lazily only on the dedicated enrollment worker, is
-explicitly unloaded at shutdown, and never uses the PersonaPlex CUDA device.
-Without the extra or flag, enrollment and conditioning fall back
-deterministically to the frame-aligned tail window.
+Representative selection is optional and CPU-only. The extra belongs to the `moshi-personaplex` workspace member, not the root project, so install it into the synced environment with `uv pip install "transformers>=4.43,<4.44"`, then set `PERSONAPLEX_VOICE_PICKER=1`. The WavLM model loads lazily only on the dedicated enrollment worker, is explicitly unloaded at shutdown, and never uses the PersonaPlex CUDA device. Without the extra or flag, enrollment and conditioning fall back deterministically to the frame-aligned tail window.
 
-These local previews validate the enrollment transaction, not spoken quality.
-Any claim about voice similarity or behavior on Spheron requires a separate,
-recorded target-GPU qualification run.
+These local previews validate the enrollment transaction, not spoken quality. Any claim about voice similarity or behavior on Spheron requires a separate, recorded target-GPU qualification run.
 
 ## Vision (optional)
 
-Adds situational awareness from a screen share or virtual camera. Frames are sent to **Gemini 3.5 Flash** via the Interactions API. Captions stay outside PersonaPlex by default; reaction modes can drip a compact scene fact into its text channel during natural silence windows.
+Adds situational awareness from a screen share or virtual camera. Frames are sent to **Gemini 3.8 Flash** via the Interactions API. Captions stay outside PersonaPlex by default; reaction modes can drip a compact scene fact into its text channel during natural silence windows. Routine/detail generation budgets are 1,024/2,048 tokens, including thinking, while the prompts keep the visible captions short.
 
 Enable it by providing `GEMINI_API_KEY` and clicking **Add Vision** in the UI. Without the key the button stays disabled and a toast explains why.
 
