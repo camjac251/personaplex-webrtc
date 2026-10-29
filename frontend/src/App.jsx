@@ -219,7 +219,7 @@ const ASSISTED_MODEL_DEFAULTS = {
 const CHARACTERPLEX_MODEL_DEFAULTS = {
   ...DEFAULTS,
   turnOnsetBias: 1.0,
-  turnHandling: "native",
+  turnHandling: "floor",
 };
 
 function defaultsForModel(variant, nativeDuplexRecommended = null) {
@@ -231,7 +231,7 @@ function defaultsForModel(variant, nativeDuplexRecommended = null) {
 }
 
 function recommendedTurnHandlingForModel(variant, nativeDuplexRecommended = null) {
-  if (variant === "characterplex") return "native";
+  if (variant === "characterplex") return "floor";
   return variant === "rl-seamless" || nativeDuplexRecommended === true
     ? "native"
     : "assisted";
